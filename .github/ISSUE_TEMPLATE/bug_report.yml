@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible WhisezOS preview or Whisez Guard problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve WhisezOS. Do not include passwords, private
+        files, security tokens, or other personal information.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - UEFI preview
+        - Whisez Guard
+        - Build tooling
+        - Verification harness
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows version, QEMU version, and command used.
+      placeholder: Windows 11, QEMU 11, cargo xtask run
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove usernames, local paths, and other personal data first.
+      render: shell

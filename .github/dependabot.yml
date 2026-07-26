@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /verify
+    schedule:
+      interval: weekly
+    groups:
+      verification-dependencies:
+        patterns:
+          - "*"

@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+default-members = [
+    "userland/whisez-guard",
+    "xtask",
+]
 members = [
     "boot/spectre-boot",
     "kernel/spectre-kernel",
@@ -16,6 +20,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 authors = ["WhisezOS Contributors"]
+repository = "https://github.com/whisez/WhisezOS"
+homepage = "https://github.com/whisez/WhisezOS"
 
 # Every workspace member that touches userland is built PIE + full RELRO.
 # See BUILD.md §4 for the linker flags that enforce this.

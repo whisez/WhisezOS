@@ -7,6 +7,10 @@ around a capability-secured Rust microkernel design. The repository now has a
 real bootable UEFI visual preview, a local defensive security tool, and a
 packaged 4K desktop wallpaper.
 
+> [!IMPORTANT]
+> WhisezOS is a developer preview, not a finished operating system. Run it in
+> QEMU only; do not install it on real hardware.
+
 ![WhisezOS UEFI boot preview](docs/whisezos-boot-preview.png)
 
 ![WhisezOS desktop preview with mouse cursor](docs/whisezos-mouse-preview.png)
@@ -31,17 +35,26 @@ without pretending the full operating system is ready.
 
 ## Quick start on Windows
 
-Requirements: Rustup and QEMU. QEMU can be installed with:
+Install Git, Rustup, and QEMU:
 
 ```powershell
+winget install --id Git.Git --exact
+winget install --id Rustlang.Rustup --exact
 winget install --id SoftwareFreedomConservancy.QEMU --exact
 ```
 
-Build and open the WhisezOS UEFI preview:
+Clone, prepare, and open the WhisezOS UEFI preview:
 
 ```powershell
+git clone https://github.com/whisez/WhisezOS.git
+Set-Location WhisezOS
+cargo xtask setup
 cargo xtask run
 ```
+
+This runs the preview inside QEMU and does not modify the host bootloader or a
+physical disk. See [INSTALL.md](INSTALL.md) for the full installation guide,
+build-only commands, bundle layout, and troubleshooting.
 
 Desktop controls:
 
@@ -87,15 +100,12 @@ Use `--json` with `audit`, `scan`, or `verify` for automation.
 ## Verification
 
 ```powershell
-cargo test -p whisez-guard
-Push-Location verify
-cargo test
-Pop-Location
-cargo xtask demo
+cargo xtask test
 ```
 
-The QEMU boot path and real mouse input were visually verified at 1920x1080
-with the installed EDK2/OVMF firmware. The captured result is the image above.
+This runs 234 supported tests, Clippy for runnable host tools, and a release
+build of the UEFI preview. The QEMU boot path and real mouse input were visually
+verified at 1920x1080 with EDK2/OVMF firmware.
 
 ## Repository layout
 
@@ -123,6 +133,12 @@ network service isolation, and desktop handoff remain development work.
 
 Please report suspected vulnerabilities privately as described in
 [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Bug and
+feature forms are available in GitHub Issues; suspected vulnerabilities must
+use private vulnerability reporting.
 
 ## License
 
