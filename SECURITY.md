@@ -1,18 +1,37 @@
-# Security policy
+# Güvenlik politikası
 
-WhisezOS is experimental software. It is not ready for installation on real
-hardware and must not be treated as a production security boundary.
+WhisezOS deneysel bir yazılımdır. Gerçek donanıma kurulmaya veya üretim
+ortamında güvenlik sınırı olarak kullanılmaya hazır değildir.
 
-## Supported versions
+## Desteklenen sürümler
 
-Security fixes are applied to the latest commit on `main`. There is currently
-no supported stable release.
+Güvenlik düzeltmeleri `main` dalındaki en yeni commit üzerine uygulanır. Şu an
+desteklenen kararlı bir sürüm yoktur; `v0.1.0` yalnızca geliştirici
+önizlemesidir.
 
-## Reporting a vulnerability
+## Güvenlik açığı bildirme
 
-Please use GitHub's private vulnerability reporting feature from the
-repository's **Security** tab. Do not publish exploit details in a public issue.
+Lütfen deponun **Security** sekmesindeki özel güvenlik bildirimi özelliğini
+kullanın:
 
-Include the affected component, reproduction steps, expected impact, and any
-suggested mitigation. Reports concerning Whisez Guard should also state whether
-the issue could cause inspected content to execute or leave the local machine.
+https://github.com/whisez/WhisezOS/security/advisories/new
+
+Exploit ayrıntılarını herkese açık issue, discussion veya pull request içinde
+paylaşmayın.
+
+Bildirimde şunlara yer verin:
+
+- Etkilenen bileşen ve sürüm/commit
+- Sorunu tekrar oluşturma adımları
+- Beklenen güvenlik etkisi
+- Varsa önerilen azaltma veya düzeltme
+
+Whisez Guard bildirimi; sorunun incelenen içeriğin çalışmasına, verinin yerel
+makineden çıkmasına veya istenmeyen dosya değişikliğine yol açıp açmadığını da
+belirtmelidir.
+
+## Kişisel bilgi paylaşmayın
+
+Rapora parola, erişim anahtarı, kişisel e-posta, gerçek kullanıcı klasörü,
+özel belge veya taranan dosyanın tamamını eklemeyin. Gerekli örneği mümkün olan
+en küçük ve anonim biçimde hazırlayın.

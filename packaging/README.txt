@@ -1,43 +1,43 @@
-WhisezOS Developer Preview
-==========================
+WhisezOS Geliştirici Önizlemesi
+==============================
 
-This bundle contains:
+Bu paket aşağıdaki dosyaları içerir:
 
   EFI/BOOT/BOOTX64.EFI
-      Bootable UEFI preview with the animated WhisezOS dragon and desktop.
+      Animasyonlu WhisezOS ejderhası ve masaüstünü gösteren UEFI önizlemesi.
 
   Tools/whisez-guard.exe
-      Defensive Windows posture, offline scan, and SHA3-256 integrity tool.
+      Windows güvenlik denetimi, çevrimdışı tarama ve SHA3-256 bütünlük aracı.
 
   Wallpapers/whisezos-dragon-4k.png
-      3840x2160 WhisezOS desktop wallpaper.
+      3840x2160 WhisezOS masaüstü duvar kâğıdı.
 
-Whisez Guard quick start (PowerShell)
--------------------------------------
+Whisez Guard hızlı başlangıç (PowerShell)
+-----------------------------------------
 
   .\Tools\whisez-guard.exe audit
-  .\Tools\whisez-guard.exe scan C:\path\to\inspect
-  .\Tools\whisez-guard.exe baseline C:\important --output baseline.json
+  .\Tools\whisez-guard.exe scan C:\incelenecek-klasor
+  .\Tools\whisez-guard.exe baseline C:\onemli --output baseline.json
   .\Tools\whisez-guard.exe verify baseline.json
   .\Tools\whisez-guard.exe monitor baseline.json --interval 5
 
-The scanner is local-only: it does not execute scanned files, upload data,
-delete files, or quarantine anything automatically.
+Tarayıcı yalnızca yerel çalışır. İncelediği dosyaları çalıştırmaz, internete
+yüklemez, silmez ve otomatik karantinaya almaz.
 
-UEFI desktop controls
----------------------
+UEFI masaüstü kontrolleri
+-------------------------
 
-  Mouse move           Move the visible cursor and select cards
-  Left click           Open a card or activate the on-screen back button
-  Right click          Return to the desktop
-  Up / Down or W / S   Select Guard, Terminal, or Files
-  Enter                Open the selected screen
-  1 / 2 / 3            Open a screen directly
-  Esc                  Return to the desktop
+  Fare hareketi         İmleci hareket ettirir ve kart seçer
+  Sol tık               Kartı açar veya ekrandaki geri düğmesini etkinleştirir
+  Sağ tık               Masaüstüne döner
+  Yukarı/Aşağı veya W/S Guard, Terminal ya da Files seçer
+  Enter                 Seçili ekranı açar
+  1 / 2 / 3             İlgili ekranı doğrudan açar
+  Esc                   Masaüstüne döner
 
-Status boundary
----------------
+Projenin mevcut sınırı
+----------------------
 
-The EFI binary is a real bootable UEFI preview, not a finished operating
-system. The production kernel, hardware drivers, compositor handoff, installer,
-and desktop session remain under development.
+EFI dosyası gerçekten açılabilen bir UEFI önizlemesidir; tamamlanmış bir
+işletim sistemi değildir. Üretim çekirdeği, donanım sürücüleri, compositor
+geçişi, disk kurucusu ve gerçek masaüstü oturumu hâlâ geliştirme aşamasındadır.

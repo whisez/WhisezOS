@@ -1,37 +1,50 @@
-# Contributing to WhisezOS
+# WhisezOS'a katkıda bulunma
 
-WhisezOS welcomes focused fixes, tests, documentation, and small platform
-improvements. The production kernel, drivers, installer, and desktop handoff
-are still research work; pull requests must not describe unfinished code as a
-production-ready operating system.
+WhisezOS; odaklı hata düzeltmelerini, testleri, belge iyileştirmelerini ve küçük
+platform geliştirmelerini memnuniyetle karşılar. Üretim çekirdeği, sürücüler,
+disk kurucusu ve gerçek masaüstü oturumu hâlâ araştırma/geliştirme aşamasındadır.
+Tamamlanmamış kodu üretime hazır gibi gösteren değişiklikler kabul edilmez.
 
-## Development setup
+## Geliştirme ortamı
 
-Follow [INSTALL.md](INSTALL.md), then run:
+Önce [INSTALL.md](INSTALL.md) rehberini uygulayın, ardından:
 
 ```powershell
 cargo xtask setup
 cargo xtask test
 ```
 
-The test command checks Whisez Guard, the host verification harness, Clippy,
-and the UEFI preview build. Shader validation is skipped when `glslc` is not
-installed.
+Test komutu; Whisez Guard testlerini, ana bilgisayar doğrulama paketini, Clippy
+denetimini ve UEFI önizleme derlemesini çalıştırır. `glslc` kurulu değilse shader
+doğrulaması atlanır.
 
-## Pull request guidelines
+## Pull request kuralları
 
-- Keep each pull request focused on one problem.
-- Add or update tests when behavior changes.
-- Update `README.md`, `INSTALL.md`, or `BUILD.md` when commands change.
-- Keep generated output, VM state, signing keys, and local configuration out of
-  commits.
-- Do not include real names, personal email addresses, private file paths,
-  access tokens, logs containing personal data, or scanned user files.
-- Run `cargo xtask test` before requesting review.
+- Her pull request yalnızca tek bir probleme odaklansın.
+- Davranış değiştiğinde test ekleyin veya mevcut testleri güncelleyin.
+- Komutlar değişirse `README.md`, `INSTALL.md` ya da `BUILD.md` belgelerini de
+  güncelleyin.
+- Üretilen çıktıları, sanal makine durumunu, imzalama anahtarlarını ve yerel
+  ayarları commit içine eklemeyin.
+- Gerçek ad, kişisel e-posta, özel dosya yolu, erişim tokenı, kişisel bilgi
+  içeren log veya taranan kullanıcı dosyası paylaşmayın.
+- Pull request açmadan önce `cargo xtask test` komutunu çalıştırın.
+- Projenin yapım aşamasında olduğunu ve fiziksel donanıma hazır olmadığını
+  açıkça belirtin.
 
-## Security reports
+## Commit mesajları
 
-Do not open a public issue for a possible vulnerability. Use the repository's
-private vulnerability reporting form described in [SECURITY.md](SECURITY.md).
+Kısa ve neyin değiştiğini söyleyen mesajlar kullanın:
 
-All contributions are licensed under the Mozilla Public License 2.0.
+```text
+Fix mouse selection in desktop preview
+Add Turkish setup troubleshooting
+Test capability revocation edge case
+```
+
+## Güvenlik bildirimleri
+
+Olası bir güvenlik açığı için herkese açık issue açmayın. [SECURITY.md](SECURITY.md)
+dosyasındaki özel güvenlik bildirimi yolunu kullanın.
+
+Tüm katkılar Mozilla Public License 2.0 koşullarıyla lisanslanır.

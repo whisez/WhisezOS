@@ -1,18 +1,25 @@
-# Install and run WhisezOS
+# WhisezOS kurulum ve çalıştırma rehberi
 
-WhisezOS currently ships as a developer preview for QEMU. It does not install
-itself to a physical disk, change the Windows bootloader, or modify firmware.
-Do not try to install the preview on real hardware.
+WhisezOS şu anda yalnızca QEMU için bir geliştirici önizlemesidir. Fiziksel
+diske kendini kurmaz, Windows önyükleyicisini değiştirmez ve firmware ayarlarına
+dokunmaz.
 
-## Supported setup
+> [!CAUTION]
+> Bu sürümü gerçek bilgisayara, USB diske veya ana işletim sisteminizin yanına
+> kurmaya çalışmayın. Disk kurucusu ve donanım desteği henüz hazır değildir.
 
-The verified setup is a 64-bit Windows 10 or Windows 11 machine with:
+## Gereksinimler
 
-- Git for cloning the repository
-- Rustup for the pinned Rust nightly toolchain
-- QEMU with EDK2/OVMF firmware for the virtual machine
+Doğrulanmış hızlı başlangıç ortamı 64 bit Windows 10 veya Windows 11'dir:
 
-Install the prerequisites from PowerShell or Windows Terminal:
+- Depoyu indirmek için Git
+- Sabitlenmiş Rust nightly araç zinciri için Rustup
+- Sanal makine ve EDK2/OVMF firmware için QEMU
+- İlk kurulum sırasında internet bağlantısı
+
+## 1. Gerekli araçları kurun
+
+PowerShell veya Windows Terminal'i açın:
 
 ```powershell
 winget install --id Git.Git --exact
@@ -20,119 +27,171 @@ winget install --id Rustlang.Rustup --exact
 winget install --id SoftwareFreedomConservancy.QEMU --exact
 ```
 
-Close and reopen the terminal after installation so the new commands are on
-`PATH`.
+Kurulum bittikten sonra terminali kapatıp yeniden açın. Şu komutlarla araçların
+görüldüğünü kontrol edebilirsiniz:
 
-## Run the UEFI preview
+```powershell
+git --version
+rustup --version
+qemu-system-x86_64 --version
+```
+
+## 2. WhisezOS'u indirin
 
 ```powershell
 git clone https://github.com/whisez/WhisezOS.git
 Set-Location WhisezOS
+```
+
+## 3. Geliştirme ortamını hazırlayın
+
+```powershell
 cargo xtask setup
+```
+
+Bu komut `rust-toolchain.toml` içinde sabitlenen Rust sürümünü ve gerekli UEFI
+hedefini hazırlar. İlk çalıştırma, bağımlılıklar indirildiği için birkaç dakika
+sürebilir.
+
+## 4. UEFI önizlemesini QEMU'da açın
+
+```powershell
 cargo xtask run
 ```
 
-`cargo xtask setup` installs the toolchain components pinned by
-`rust-toolchain.toml`. `cargo xtask run` builds the real UEFI preview, creates a
-private QEMU firmware-variable image under `target`, and starts the virtual
-machine. The first build may take several minutes while Rust dependencies are
-downloaded.
+Komut şu işlemleri otomatik yapar:
 
-QEMU controls:
+1. Gerçek UEFI uygulamasını release modunda derler.
+2. QEMU için geçici ve özel bir firmware değişken dosyası oluşturur.
+3. EDK2/OVMF firmware ile sanal makineyi başlatır.
+4. WhisezOS açılış animasyonu ve masaüstü önizlemesini gösterir.
 
-- Move the mouse to select a card; left-click opens it.
-- Right-click or press `Esc` to return to the desktop.
-- Use `Up`/`Down` or `W`/`S` to select an application.
-- Press `Enter` to open the selected application.
-- Press `1`, `2`, or `3` to open Guard, Terminal, or Files directly.
-- Press `Ctrl+Alt+G` to release QEMU's input capture.
+QEMU penceresini kapattığınızda önizleme durur. Bilgisayarınızın fiziksel diski
+bu işlem sırasında sanal makineye bağlanmaz.
 
-Close the QEMU window to stop the preview.
+## Kontroller
 
-## Build without starting QEMU
+- Fareyi hareket ettirerek kart seçin, sol tıkla açın.
+- Sağ tık veya `Esc` ile masaüstüne dönün.
+- `Yukarı` / `Aşağı` ya da `W` / `S` ile seçim yapın.
+- `Enter` ile seçili uygulamayı açın.
+- `1`, `2`, `3` ile Guard, Terminal veya Files uygulamasını açın.
+- `Ctrl+Alt+G` ile QEMU'nun yakaladığı fareyi serbest bırakın.
 
-Build only the UEFI application:
+## Yalnızca derleme
+
+QEMU'yu başlatmadan EFI uygulamasını derlemek için:
 
 ```powershell
 cargo xtask demo
 ```
 
-The EFI binary is written to:
+Oluşan dosya:
 
 ```text
 target/x86_64-unknown-uefi/release/spectre-demo.efi
 ```
 
-Build a portable developer bundle:
+EFI, Whisez Guard ve 4K duvar kâğıdını tek klasörde toplamak için:
 
 ```powershell
 cargo xtask bundle
 ```
 
-The bundle is written to `dist/WhisezOS` and contains:
+Paket `dist/WhisezOS` içine yazılır:
 
-- `EFI/BOOT/BOOTX64.EFI` — bootable UEFI preview
-- `Tools/whisez-guard.exe` — defensive Windows command-line tool
-- `Wallpapers/whisezos-dragon-4k.png` — 4K wallpaper
+```text
+dist/WhisezOS/
+├── EFI/BOOT/BOOTX64.EFI
+├── Tools/whisez-guard.exe
+├── Wallpapers/whisezos-dragon-4k.png
+└── README.txt
+```
 
-## Use Whisez Guard only
+## Hazır paketi indirme
 
-Whisez Guard can be built and used without QEMU:
+Kaynak kodu derlemeden dosyaları incelemek için:
+
+**[WhisezOS v0.1.0 Developer Preview ZIP](https://github.com/whisez/WhisezOS/releases/download/v0.1.0/WhisezOS-v0.1.0-developer-preview.zip)**
+
+ZIP dosyasının SHA-256 değeri:
+
+```text
+808B2D3F3249A1DF5516311ED259CEB2D730D1CFDB8B8B07AF733DD97CED61F6
+```
+
+Bu paket tek başına bir Windows kurucusu değildir. UEFI önizlemesini en kolay
+ve güvenli biçimde çalıştırmak için kaynak kod yolundaki `cargo xtask run`
+komutunu kullanın.
+
+## Yalnızca Whisez Guard kullanımı
+
+Whisez Guard, QEMU olmadan ayrı olarak derlenip kullanılabilir:
 
 ```powershell
 cargo build --release -p whisez-guard
 ./target/release/whisez-guard.exe audit
-./target/release/whisez-guard.exe scan C:\path\to\inspect
+./target/release/whisez-guard.exe scan C:\incelenecek-klasor
 ```
 
-The scanner is local-only. It does not execute inspected files, upload data,
-delete files, or quarantine anything automatically.
+Araç yerel çalışır; incelediği dosyaları çalıştırmaz, yüklemez, silmez veya
+otomatik karantinaya almaz.
 
-## Verify the checkout
+## Kurulumu doğrulama
 
-Run every supported test, lint, and preview-build check:
+Tüm desteklenen test, lint ve UEFI derleme kontrollerini çalıştırın:
 
 ```powershell
 cargo xtask test
 ```
 
-The supported verification boundary currently contains 234 tests: 231
-host-side kernel/filesystem/boot logic tests and 3 Whisez Guard tests.
+Doğrulama sınırı 234 test içerir: 231 çekirdek/dosya sistemi/önyükleme mantığı
+testi ve 3 Whisez Guard testi.
 
-## Troubleshooting
+## Sorun çözme
 
 ### `QEMU not found`
 
-Confirm that `C:\Program Files\qemu\qemu-system-x86_64.exe` exists. If it does
-not, reinstall QEMU with the Winget command above. The build tool checks both
-`PATH` and the standard Windows installation folders.
+Şu dosyanın varlığını kontrol edin:
+
+```text
+C:\Program Files\qemu\qemu-system-x86_64.exe
+```
+
+Dosya yoksa yukarıdaki Winget komutuyla QEMU'yu yeniden kurun ve terminali
+yeniden açın.
 
 ### `UEFI firmware not found`
 
-The Windows QEMU package should include EDK2 firmware in its `share` folder.
-Reinstall the current QEMU package if files such as
-`edk2-x86_64-code.fd` are missing.
+Windows QEMU paketi EDK2 firmware dosyalarını `share` klasöründe taşımalıdır.
+`edk2-x86_64-code.fd` gibi dosyalar yoksa QEMU paketini yeniden kurun.
 
-### Rust toolchain or target errors
-
-Run the setup step again:
+### Rust toolchain veya target hatası
 
 ```powershell
 cargo xtask setup
 ```
 
-Do not replace the pinned nightly with a floating `nightly` toolchain; the
-project intentionally uses a reproducible toolchain date.
+Projenin sabitlediği nightly sürümü, gelişigüzel `nightly` sürümüyle
+değiştirmeyin; tekrarlanabilir derleme için tarihli sürüm kullanılır.
 
-### Other operating systems
+### QEMU açılıyor ama siyah ekran kalıyor
 
-Windows is the tested quick-start path. Linux and macOS developers should read
-[BUILD.md](BUILD.md) for the required QEMU/OVMF paths and production-toolchain
-notes.
+- Birkaç saniye bekleyin; ilk derleme ve açılış normalden uzun sürebilir.
+- Terminalde hata mesajı olup olmadığını kontrol edin.
+- QEMU ve Rust araç zincirini güncel kurulum komutlarıyla yeniden hazırlayın.
+- Sorun devam ederse kişisel bilgi içermeyen terminal çıktısıyla GitHub Issue
+  açın.
 
-## Remove the preview
+### Linux ve macOS
 
-WhisezOS does not install services or write to a physical disk. To remove the
-checkout, close QEMU and delete the cloned `WhisezOS` folder. Rustup and QEMU
-are separate tools and can be removed through Windows Settings if no longer
-needed.
+Windows hızlı başlangıç yolu doğrulanmıştır. Linux ve macOS geliştiricileri
+QEMU/OVMF yolları ve üretim araç zinciri ayrıntıları için [BUILD.md](BUILD.md)
+dosyasını okumalıdır.
+
+## Kaldırma
+
+WhisezOS Windows'a servis kurmaz ve fiziksel diske yazmaz. Kaldırmak için QEMU
+penceresini kapatıp klonladığınız `WhisezOS` klasörünü silmeniz yeterlidir.
+Git, Rustup ve QEMU ayrı programlardır; artık kullanmayacaksanız Windows
+Ayarları'ndan kaldırabilirsiniz.

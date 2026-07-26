@@ -18,10 +18,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Check out source
+      - name: Kaynak kodu al
         uses: actions/checkout@v6
 
-      - name: Install the pinned Rust toolchain
+      - name: Sabitlenmiş Rust araç zincirini kur
         shell: pwsh
         run: >-
           rustup toolchain install $env:RUST_TOOLCHAIN
@@ -31,13 +31,13 @@ jobs:
           --component rust-src
           --target x86_64-unknown-uefi
 
-      - name: Check formatting for runnable host packages
+      - name: Çalışan paketlerin biçimini denetle
         shell: pwsh
         run: |
           cargo +$env:RUST_TOOLCHAIN fmt -p whisez-guard -- --check
           cargo +$env:RUST_TOOLCHAIN fmt -p xtask -- --check
           cargo +$env:RUST_TOOLCHAIN fmt --manifest-path verify/Cargo.toml -- --check
 
-      - name: Run host tests, lints, and the UEFI preview build
+      - name: Testleri, lint denetimini ve UEFI derlemesini çalıştır
         shell: pwsh
         run: cargo +$env:RUST_TOOLCHAIN xtask test

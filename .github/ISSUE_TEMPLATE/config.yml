@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Private security report
+  - name: Özel güvenlik bildirimi
     url: https://github.com/whisez/WhisezOS/security/advisories/new
-    about: Report potential vulnerabilities privately instead of opening an issue.
+    about: Olası güvenlik açıklarını herkese açık issue yerine özel olarak bildirin.

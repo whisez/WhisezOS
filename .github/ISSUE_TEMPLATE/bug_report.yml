@@ -1,55 +1,56 @@
-name: Bug report
-description: Report a reproducible WhisezOS preview or Whisez Guard problem.
-title: "[Bug]: "
+name: Hata bildirimi
+description: WhisezOS önizlemesi veya Whisez Guard için tekrar oluşturulabilir bir hata bildirin.
+title: "[Hata]: "
 labels:
   - bug
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve WhisezOS. Do not include passwords, private
-        files, security tokens, or other personal information.
+        WhisezOS'u geliştirmeye yardımcı olduğunuz için teşekkürler.
+        Parola, özel dosya, erişim anahtarı veya kişisel bilgi eklemeyin.
+        Projenin henüz yapım aşamasında olduğunu unutmayın.
   - type: dropdown
     id: component
     attributes:
-      label: Component
+      label: Bileşen
       options:
-        - UEFI preview
+        - UEFI önizlemesi
         - Whisez Guard
-        - Build tooling
-        - Verification harness
-        - Documentation
-        - Other
+        - Derleme araçları
+        - Doğrulama testleri
+        - Belgeler
+        - Diğer
     validations:
       required: true
   - type: textarea
     id: description
     attributes:
-      label: What happened?
-      description: Describe the problem and what you expected instead.
+      label: Ne oldu?
+      description: Gördüğünüz sonucu ve beklediğiniz davranışı açıklayın.
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
-      label: Reproduction steps
+      label: Tekrar oluşturma adımları
       placeholder: |
-        1. Run ...
-        2. Select ...
-        3. Observe ...
+        1. ... komutunu çalıştırdım
+        2. ... seçeneğini açtım
+        3. ... sonucunu gördüm
     validations:
       required: true
   - type: input
     id: environment
     attributes:
-      label: Environment
-      description: Windows version, QEMU version, and command used.
+      label: Ortam
+      description: Windows, QEMU ve kullandığınız komutun sürümünü yazın.
       placeholder: Windows 11, QEMU 11, cargo xtask run
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Relevant logs
-      description: Remove usernames, local paths, and other personal data first.
+      label: İlgili terminal çıktısı
+      description: Önce kullanıcı adlarını, yerel yolları ve diğer kişisel bilgileri kaldırın.
       render: shell

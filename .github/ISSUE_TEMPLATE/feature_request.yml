@@ -1,33 +1,38 @@
-name: Feature request
-description: Suggest a focused improvement to WhisezOS.
-title: "[Feature]: "
+name: Özellik isteği
+description: WhisezOS için odaklı ve uygulanabilir bir geliştirme önerin.
+title: "[Özellik]: "
 labels:
   - enhancement
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Proje yapım aşamasındadır. Lütfen öneriyi en küçük yararlı değişiklik
+        olarak ve mevcut geliştirici önizlemesi sınırlarını dikkate alarak yazın.
   - type: textarea
     id: problem
     attributes:
-      label: Problem
-      description: What limitation or user need should this address?
+      label: Çözülmesi gereken sorun
+      description: Hangi sınırlamayı veya kullanıcı ihtiyacını ele almalı?
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
-      label: Proposed change
-      description: Describe the smallest useful solution.
+      label: Önerilen değişiklik
+      description: En küçük yararlı çözümü açıklayın.
     validations:
       required: true
   - type: dropdown
     id: area
     attributes:
-      label: Area
+      label: Alan
       options:
-        - UEFI preview
+        - UEFI önizlemesi
         - Whisez Guard
-        - Kernel research
-        - Desktop research
-        - Build and packaging
-        - Documentation
+        - Çekirdek araştırması
+        - Masaüstü araştırması
+        - Derleme ve paketleme
+        - Belgeler
     validations:
       required: true

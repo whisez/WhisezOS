@@ -1,41 +1,62 @@
+<div align="center">
+
 # WhisezOS
 
+### Rust ile geliştirilen deneysel işletim sistemi ve savunma araçları
+
 [![CI](https://github.com/whisez/WhisezOS/actions/workflows/ci.yml/badge.svg)](https://github.com/whisez/WhisezOS/actions/workflows/ci.yml)
+![Durum](https://img.shields.io/badge/durum-yapım%20aşamasında-orange)
+[![Sürüm](https://img.shields.io/badge/sürüm-v0.1.0%20önizleme-00bcd4)](https://github.com/whisez/WhisezOS/releases/tag/v0.1.0)
+[![Lisans](https://img.shields.io/badge/lisans-MPL--2.0-blue)](LICENSE)
 
-WhisezOS is an experimental, cyberpunk-themed operating-system project built
-around a capability-secured Rust microkernel design. The repository now has a
-real bootable UEFI visual preview, a local defensive security tool, and a
-packaged 4K desktop wallpaper.
+</div>
 
-> [!IMPORTANT]
-> WhisezOS is a developer preview, not a finished operating system. Run it in
-> QEMU only; do not install it on real hardware.
+WhisezOS; yetenek tabanlı güvenliği hedefleyen bir Rust mikroçekirdek tasarımı,
+QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma aracı
+**Whisez Guard** içeren deneysel bir projedir.
 
-![WhisezOS UEFI boot preview](docs/whisezos-boot-preview.png)
+> [!WARNING]
+> **WhisezOS henüz tamamlanmış bir işletim sistemi değildir.** Proje aktif
+> geliştirme aşamasındadır. Yalnızca QEMU sanal makinesinde deneyin; fiziksel
+> diske veya gerçek donanıma kurmaya çalışmayın.
 
-![WhisezOS desktop preview with mouse cursor](docs/whisezos-mouse-preview.png)
+## Proje durumu
 
-![Whisez Guard UEFI screen](docs/whisezos-guard-preview.png)
+| Bileşen | Durum | Açıklama |
+|---|:---:|---|
+| UEFI önizlemesi | ✅ Çalışıyor | QEMU/OVMF üzerinde açılır, WhisezOS animasyonunu ve masaüstünü gösterir |
+| Fare ve klavye | ✅ Çalışıyor | Kart seçme, sol tıkla açma, sağ tıkla geri dönme ve klavye kısayolları |
+| Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
+| Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
+| Otomatik testler | ✅ 234 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
+| Üretim çekirdeği | 🚧 Yapılıyor | Temel mimari mevcut; tam donanım başlatma ve sürücüler tamamlanmadı |
+| Masaüstü oturumu | 🚧 Yapılıyor | Önizleme var; gerçek çekirdekten masaüstüne geçiş henüz tamamlanmadı |
+| Fiziksel kurulum | ❌ Hazır değil | Disk kurucusu, donanım uyumluluğu ve kurtarma yolu tamamlanmadan kullanılamaz |
 
-## What works today
+Önyükleme önizlemesi, tamamlanmamış üretim yükleyicisinden özellikle ayrı
+tutulur. Böylece proje olduğundan daha hazır gösterilmeden UEFI, framebuffer,
+girdi, görsel varlık, derleme ve sanal makine yolu gerçek biçimde sınanabilir.
 
-| Component | Status |
-|---|---|
-| UEFI preview | Boots in QEMU/OVMF, renders the WhisezOS dragon, then enters the desktop preview |
-| Desktop input | Visible cyan cursor, PS/2 and USB mouse input, hover selection, left-click open, and right-click back |
-| Boot animation | Time-limited smooth reveal and fade; it no longer remains on the loading screen |
-| Whisez Guard | Windows posture audit, offline content scan, SHA3-256 baselines, verification, and monitoring |
-| Wallpaper | 3840x2160 WhisezOS dragon wallpaper |
-| Logic harness | 231 kernel/filesystem/boot logic tests |
-| Production OS | Architecture and core logic exist; kernel handoff, drivers, installer, and desktop session are not complete |
+## Görseller
 
-The boot preview is deliberately separate from the unfinished production
-loader. It proves the UEFI, framebuffer, asset, build, packaging, and VM path
-without pretending the full operating system is ready.
+![WhisezOS UEFI açılış önizlemesi](docs/whisezos-boot-preview.png)
 
-## Quick start on Windows
+![WhisezOS masaüstü ve fare önizlemesi](docs/whisezos-mouse-preview.png)
 
-Install Git, Rustup, and QEMU:
+![Whisez Guard UEFI ekranı](docs/whisezos-guard-preview.png)
+
+## En kolay deneme yolu
+
+Kod derlemek istemiyorsanız hazır geliştirici paketini indirin:
+
+**[WhisezOS v0.1.0 Developer Preview paketini indir](https://github.com/whisez/WhisezOS/releases/download/v0.1.0/WhisezOS-v0.1.0-developer-preview.zip)**
+
+> Paketteki EFI dosyası doğrudan Windows programı gibi açılmaz. UEFI
+> önizlemesini çalıştırmanın önerilen yolu aşağıdaki kaynak kod kurulumudur.
+
+### Windows'ta kaynak koddan çalıştırma
+
+PowerShell veya Windows Terminal'i açın ve gerekli araçları kurun:
 
 ```powershell
 winget install --id Git.Git --exact
@@ -43,7 +64,7 @@ winget install --id Rustlang.Rustup --exact
 winget install --id SoftwareFreedomConservancy.QEMU --exact
 ```
 
-Clone, prepare, and open the WhisezOS UEFI preview:
+Terminali kapatıp yeniden açın. Ardından projeyi indirip QEMU'da başlatın:
 
 ```powershell
 git clone https://github.com/whisez/WhisezOS.git
@@ -52,95 +73,102 @@ cargo xtask setup
 cargo xtask run
 ```
 
-This runs the preview inside QEMU and does not modify the host bootloader or a
-physical disk. See [INSTALL.md](INSTALL.md) for the full installation guide,
-build-only commands, bundle layout, and troubleshooting.
+Bu işlem Windows önyükleyicisini, fiziksel diski veya BIOS/UEFI ayarlarını
+değiştirmez. Ayrıntılı anlatım ve sorun çözümleri için
+**[Türkçe kurulum rehberini](INSTALL.md)** okuyun.
 
-Desktop controls:
+## Kontroller
 
-- Move the mouse over a card to select it; left-click opens it
-- Right-click returns to the desktop; the on-screen back button also accepts a left-click
-- QEMU keeps the host pointer visible and scales the guest desktop to the window; `Ctrl+Alt+G` releases input capture
-- `Up` / `Down` or `W` / `S`: select an application
-- `Enter`: open the selected application
-- `1`, `2`, `3`: open Guard, Terminal, or Files directly
-- `Esc`: return to the desktop
+- Fareyi bir kartın üzerine getirerek seçin, sol tıkla açın.
+- Sağ tık veya `Esc` ile masaüstüne dönün.
+- `Yukarı` / `Aşağı` ya da `W` / `S` ile uygulama seçin.
+- `Enter` ile seçili uygulamayı açın.
+- `1`, `2`, `3` ile Guard, Terminal veya Files uygulamasını doğrudan açın.
+- QEMU fareyi yakalarsa `Ctrl+Alt+G` ile serbest bırakın.
 
-Build a ready-to-copy bundle containing the EFI binary, Whisez Guard, and the
-4K wallpaper:
+## Whisez Guard
+
+Whisez Guard yalnızca yerel ve savunma amaçlı çalışır. İncelediği dosyaları
+çalıştırmaz, internete yüklemez, silmez ve otomatik karantinaya almaz.
+
+```powershell
+# Windows Firewall, Defender, UAC, Secure Boot ve dinleyen portları denetle
+cargo run --release -p whisez-guard -- audit
+
+# Bir klasörü çevrimdışı tara
+cargo run --release -p whisez-guard -- scan C:\incelenecek-klasor
+
+# SHA3-256 dosya bütünlüğü temeli oluştur ve doğrula
+cargo run --release -p whisez-guard -- baseline C:\onemli --output baseline.json
+cargo run --release -p whisez-guard -- verify baseline.json
+
+# Beş saniyede bir tekrar kontrol et
+cargo run --release -p whisez-guard -- monitor baseline.json --interval 5
+```
+
+Otomasyon için `audit`, `scan` veya `verify` komutuna `--json` ekleyebilirsiniz.
+
+## Geliştirme yol haritası
+
+- [x] QEMU/OVMF üzerinde açılan gerçek UEFI önizlemesi
+- [x] Animasyonlu masaüstü, fare ve klavye girdisi
+- [x] Whisez Guard savunma aracı
+- [x] Tek komutla derleme, test ve geliştirici paketi
+- [ ] Üretim yükleyicisinden Rust mikroçekirdeğine tam geçiş
+- [ ] Kesme, zamanlayıcı, depolama, ağ ve ekran sürücülerini tamamlama
+- [ ] Kullanıcı alanı servisleri ve gerçek masaüstü oturumu
+- [ ] Güvenli güncelleme, kurtarma ve disk kurulum sistemi
+- [ ] Donanım uyumluluk matrisi ve kararlı sürüm
+
+Bu maddelerin tarih sözü olmadığını unutmayın. Proje araştırma ve geliştirme
+aşamasındadır; ilerleme test edilebilir küçük adımlarla yapılır.
+
+## Derleme ve doğrulama
+
+Hazır geliştirici paketi oluşturmak için:
 
 ```powershell
 cargo xtask bundle
 ```
 
-The result is written to `dist/WhisezOS`.
-
-## Whisez Guard
-
-Whisez Guard is defensive and local-only. It never executes inspected files,
-uploads data, or automatically deletes/quarantines anything.
-
-```powershell
-# Windows Firewall, Defender, UAC, Secure Boot, and listening-socket posture
-cargo run --release -p whisez-guard -- audit
-
-# Offline multi-indicator scan
-cargo run --release -p whisez-guard -- scan C:\path\to\inspect
-
-# Build and verify a SHA3-256 file-integrity baseline
-cargo run --release -p whisez-guard -- baseline C:\important --output baseline.json
-cargo run --release -p whisez-guard -- verify baseline.json
-
-# Re-check continuously every five seconds
-cargo run --release -p whisez-guard -- monitor baseline.json --interval 5
-```
-
-Use `--json` with `audit`, `scan`, or `verify` for automation.
-
-## Verification
+Çıktı `dist/WhisezOS` klasörüne yazılır. Tüm desteklenen kontrolleri çalıştırmak
+için:
 
 ```powershell
 cargo xtask test
 ```
 
-This runs 234 supported tests, Clippy for runnable host tools, and a release
-build of the UEFI preview. The QEMU boot path and real mouse input were visually
-verified at 1920x1080 with EDK2/OVMF firmware.
+Bu komut 234 testi, çalışır araçlar için Clippy denetimini ve UEFI önizlemesinin
+release derlemesini çalıştırır.
 
-## Repository layout
+## Depo yapısı
 
 ```text
-boot/spectre-boot/       Production-loader design plus bootable UEFI preview
-kernel/spectre-kernel/   Capability, IPC, scheduler, vault, and platform work
-userland/prism/          Vulkan compositor and animation engine
-userland/whisez-guard/   Working defensive host security CLI
-userland/winbridge/      PE-loader and Windows compatibility work
-userland/spectreshield/  Heuristic process-risk engine
-fs/spectrefs/            Copy-on-write filesystem work
-assets/wallpapers/       WhisezOS desktop artwork
-xtask/                   Cross-platform build, bundle, and QEMU orchestration
-verify/                  Host-side logic verification harness
+boot/spectre-boot/       Üretim yükleyicisi tasarımı ve UEFI önizlemesi
+kernel/spectre-kernel/   Yetenekler, IPC, zamanlayıcı, vault ve platform kodu
+userland/prism/          Vulkan compositor ve animasyon motoru
+userland/whisez-guard/   Çalışan yerel savunma komut satırı aracı
+userland/winbridge/      PE yükleyicisi ve Windows uyumluluk çalışmaları
+userland/spectreshield/  Sezgisel süreç risk motoru
+fs/spectrefs/            Copy-on-write dosya sistemi çalışmaları
+assets/wallpapers/       WhisezOS masaüstü görselleri
+xtask/                   Derleme, paketleme, test ve QEMU otomasyonu
+verify/                  Ana bilgisayarda çalışan mantık testleri
 ```
 
-See [BUILD.md](BUILD.md) for production toolchain details and
-[ARCHITECTURE.md](ARCHITECTURE.md) for the long-term system design.
+Uzun vadeli tasarım için [ARCHITECTURE.md](ARCHITECTURE.md), ayrıntılı üretim
+araç zinciri için [BUILD.md](BUILD.md) dosyasına bakın.
 
-## Security boundary
+## Katkı ve güvenlik
 
-WhisezOS is not currently safe to install on real hardware. Test the preview in
-QEMU only. The production loader's Secure Boot/TPM chain, storage drivers,
-network service isolation, and desktop handoff remain development work.
+- Katkıda bulunmadan önce [CONTRIBUTING.md](CONTRIBUTING.md) dosyasını okuyun.
+- Hata ve özellik istekleri için Türkçe GitHub Issue formlarını kullanın.
+- Güvenlik açığını herkese açık issue olarak yazmayın;
+  [SECURITY.md](SECURITY.md) içindeki özel bildirim yolunu kullanın.
+- Issue veya pull request içine parola, erişim anahtarı, kişisel e-posta,
+  kullanıcı klasörü ya da özel dosya içeriği eklemeyin.
 
-Please report suspected vulnerabilities privately as described in
-[SECURITY.md](SECURITY.md).
+## Lisans
 
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Bug and
-feature forms are available in GitHub Issues; suspected vulnerabilities must
-use private vulnerability reporting.
-
-## License
-
-WhisezOS is licensed under the Mozilla Public License 2.0. See
-[LICENSE](LICENSE) for the full terms.
+WhisezOS, Mozilla Public License 2.0 ile lisanslanmıştır. Ayrıntılar için
+[LICENSE](LICENSE) dosyasına bakın.
