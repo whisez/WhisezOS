@@ -27,12 +27,12 @@ homepage = "https://github.com/whisez/WhisezOS"
 # See BUILD.md §4 for the linker flags that enforce this.
 
 [workspace.dependencies]
-sha3 = { version = "0.11", default-features = false }
+sha3 = { version = "0.12", default-features = false }
 chacha20poly1305 = { version = "0.11", default-features = false }
 argon2 = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 bitflags = { version = "2.6", default-features = false }
-spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.12", default-features = false, features = ["spin_mutex"] }
 
 [profile.release]
 opt-level = 3

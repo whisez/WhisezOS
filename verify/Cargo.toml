@@ -19,7 +19,7 @@ forensic-dump = []
 
 [dependencies]
 heapless = "0.9"
-spin = "0.10"
+spin = "0.12"
 bitflags = "2.6"
-sha3 = "0.11"
+sha3 = "0.12"
 chacha20poly1305 = "0.11"
