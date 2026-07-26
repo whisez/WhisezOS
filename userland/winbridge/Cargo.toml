@@ -1,0 +1,22 @@
+[package]
+name = "winbridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags = { workspace = true }
+zerocopy = { workspace = true }
+heapless = "0.9"
+
+[features]
+default = ["pe-loader", "ntdll", "kernel32"]
+pe-loader = []
+ntdll = []
+kernel32 = []
+# DirectX -> Vulkan translation. Feature-gated because it is the largest and
+# least complete component; see ARCHITECTURE.md §6.
+d3d-translation = []
+# Fallback path: launch a real Windows VM with GPU passthrough for applications
+# WinBridge cannot host natively.
+vm-fallback = []

@@ -1,0 +1,34 @@
+[package]
+name = "spectre-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+# Stage-1 loader. Target: x86_64-unknown-uefi (PE32+ EFI application).
+# Built with `cargo xtask boot`, installed to \EFI\BOOT\BOOTX64.EFI.
+
+[dependencies]
+uefi = { version = "0.36", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
+sha3 = { workspace = true }
+bitflags = { workspace = true }
+heapless = "0.9"
+
+[build-dependencies]
+cc = "1.2"
+
+[features]
+default = []
+# The architecture document describes the production loader, but several of
+# its platform modules are still specifications. Keep it explicitly gated so
+# the bootable preview remains honest and independently buildable.
+production-loader = []
+
+[[bin]]
+name = "spectre-demo"
+path = "src/demo.rs"
+
+[[bin]]
+name = "spectre-boot"
+path = "src/main.rs"
+required-features = ["production-loader"]

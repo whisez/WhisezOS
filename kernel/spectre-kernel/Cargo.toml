@@ -1,0 +1,25 @@
+[package]
+name = "spectre-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Target: x86_64-unknown-none, built with -Z build-std=core,alloc.
+# The kernel has no `std`, no unwinding, and no heap outside the slab allocator
+# in `vault.rs`.
+
+[dependencies]
+chacha20poly1305 = { workspace = true }
+zerocopy = { workspace = true }
+bitflags = { workspace = true }
+spin = { workspace = true }
+
+[features]
+default = []
+# Enables the forensic memory-dump path in vault.rs. Off by default: dumping a
+# violating process's memory to disk is itself a data-exposure risk, so it is
+# opt-in per-install rather than always-on.
+forensic-dump = []
+
+[lib]
+crate-type = ["staticlib", "rlib"]

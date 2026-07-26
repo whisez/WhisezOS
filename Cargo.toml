@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "boot/spectre-boot",
+    "kernel/spectre-kernel",
+    "userland/prism",
+    "userland/winbridge",
+    "userland/spectreshield",
+    "userland/whisez-guard",
+    "fs/spectrefs",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["WhisezOS Contributors"]
+
+# Every workspace member that touches userland is built PIE + full RELRO.
+# See BUILD.md §4 for the linker flags that enforce this.
+
+[workspace.dependencies]
+sha3 = { version = "0.11", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false }
+argon2 = { version = "0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+bitflags = { version = "2.6", default-features = false }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1              # keep frame pointers for the forensic unwinder
+overflow-checks = true # kept ON in release: correctness > 1% throughput
+
+[profile.kernel]
+inherits = "release"
+opt-level = 3
+debug = 2

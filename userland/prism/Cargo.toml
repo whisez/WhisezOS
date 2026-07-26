@@ -1,0 +1,25 @@
+[package]
+name = "prism"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash = "0.38"              # thin Vulkan bindings; no wrapper framework
+gpu-allocator = "0.28"
+raw-window-handle = "0.6"
+bitflags = { workspace = true }
+
+[build-dependencies]
+# GLSL is compiled to SPIR-V at build time, never at runtime. Runtime shader
+# compilation is the single biggest source of first-frame hitching in
+# compositors, and it also means shipping a compiler into a security-sensitive
+# process.
+shaderc = "0.9"
+
+[features]
+default = ["raytrace"]
+# VK_KHR_ray_tracing_pipeline path for the wallpaper reflections. Off on GPUs
+# without the extension; the compositor falls back to screen-space reflections
+# rather than refusing to start.
+raytrace = []

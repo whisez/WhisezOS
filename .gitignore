@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+/verify/target/
+**/*.rs.bk
+
+# Generated bundles, disk images, and VM state
+/dist/
+*.fd
+*.img
+*.iso
+*.qcow2
+
+# Generated captures and logs
+*.ppm
+*.log
+
+# Local tools and editor state
+/.claude/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local signing material and secrets
+/keys/
+*.key
+*.pem
+*.p12
+*.pfx

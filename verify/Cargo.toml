@@ -1,0 +1,25 @@
+[package]
+name = "verify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: detached from the root workspace so `cargo test` here builds only
+# the host-testable logic modules, not the no_std kernel/bootloader crates that
+# still need their platform layer written.
+[workspace]
+
+[features]
+default = []
+forensic-dump = []
+
+# The modules under test are pulled in with #[path] includes rather than copied,
+# so these tests run against the real source files. Any fix applied here is a fix
+# to the shipped code, not to a divergent copy.
+
+[dependencies]
+heapless = "0.9"
+spin = "0.10"
+bitflags = "2.6"
+sha3 = "0.11"
+chacha20poly1305 = "0.11"
