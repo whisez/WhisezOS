@@ -1,5 +1,7 @@
 # WhisezOS kurulum ve çalıştırma rehberi
 
+**[Türkçe](INSTALL.md) · [English](INSTALL.en.md)**
+
 WhisezOS şu anda yalnızca QEMU için bir geliştirici önizlemesidir. Fiziksel
 diske kendini kurmaz, Windows önyükleyicisini değiştirmez ve firmware ayarlarına
 dokunmaz.
@@ -117,7 +119,7 @@ Kaynak kodu derlemeden dosyaları incelemek için:
 ZIP dosyasının SHA-256 değeri:
 
 ```text
-808B2D3F3249A1DF5516311ED259CEB2D730D1CFDB8B8B07AF733DD97CED61F6
+DC79DB14ECBA5F431DFBB23B5F70586CB95E2A7903175A19AA85F4AA0235819F
 ```
 
 Bu paket tek başına bir Windows kurucusu değildir. UEFI önizlemesini en kolay

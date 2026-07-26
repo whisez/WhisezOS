@@ -1,0 +1,38 @@
+name: Feature request (English)
+description: Propose a focused and actionable improvement to WhisezOS.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        WhisezOS is under development. Describe the smallest useful change and
+        keep the limits of the current developer preview in mind.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Which limitation or user need should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest useful solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - UEFI preview
+        - Whisez Guard
+        - Kernel research
+        - Desktop research
+        - Build and packaging
+        - Documentation
+    validations:
+      required: true

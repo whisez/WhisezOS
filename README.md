@@ -4,6 +4,8 @@
 
 ### Rust ile geliştirilen deneysel işletim sistemi ve savunma araçları
 
+**[Türkçe](README.md) · [English](README.en.md)**
+
 [![CI](https://github.com/whisez/WhisezOS/actions/workflows/ci.yml/badge.svg)](https://github.com/whisez/WhisezOS/actions/workflows/ci.yml)
 ![Durum](https://img.shields.io/badge/durum-yapım%20aşamasında-orange)
 [![Sürüm](https://img.shields.io/badge/sürüm-v0.1.0%20önizleme-00bcd4)](https://github.com/whisez/WhisezOS/releases/tag/v0.1.0)
@@ -75,7 +77,8 @@ cargo xtask run
 
 Bu işlem Windows önyükleyicisini, fiziksel diski veya BIOS/UEFI ayarlarını
 değiştirmez. Ayrıntılı anlatım ve sorun çözümleri için
-**[Türkçe kurulum rehberini](INSTALL.md)** okuyun.
+**[Türkçe kurulum rehberini](INSTALL.md)** okuyun. İngilizce anlatım için
+**[English installation guide](INSTALL.en.md)** sayfasına geçin.
 
 ## Kontroller
 
@@ -162,7 +165,8 @@ araç zinciri için [BUILD.md](BUILD.md) dosyasına bakın.
 ## Katkı ve güvenlik
 
 - Katkıda bulunmadan önce [CONTRIBUTING.md](CONTRIBUTING.md) dosyasını okuyun.
-- Hata ve özellik istekleri için Türkçe GitHub Issue formlarını kullanın.
+- Hata ve özellik istekleri için Türkçe veya İngilizce GitHub Issue formlarını
+  kullanın.
 - Güvenlik açığını herkese açık issue olarak yazmayın;
   [SECURITY.md](SECURITY.md) içindeki özel bildirim yolunu kullanın.
 - Issue veya pull request içine parola, erişim anahtarı, kişisel e-posta,

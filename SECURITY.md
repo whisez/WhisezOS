@@ -1,5 +1,7 @@
 # Güvenlik politikası
 
+**[Türkçe](SECURITY.md) · [English](SECURITY.en.md)**
+
 WhisezOS deneysel bir yazılımdır. Gerçek donanıma kurulmaya veya üretim
 ortamında güvenlik sınırı olarak kullanılmaya hazır değildir.
 

@@ -1,5 +1,7 @@
 # WhisezOS'a katkıda bulunma
 
+**[Türkçe](CONTRIBUTING.md) · [English](CONTRIBUTING.en.md)**
+
 WhisezOS; odaklı hata düzeltmelerini, testleri, belge iyileştirmelerini ve küçük
 platform geliştirmelerini memnuniyetle karşılar. Üretim çekirdeği, sürücüler,
 disk kurucusu ve gerçek masaüstü oturumu hâlâ araştırma/geliştirme aşamasındadır.
