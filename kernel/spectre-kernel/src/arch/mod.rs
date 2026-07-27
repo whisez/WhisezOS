@@ -31,9 +31,11 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod memory;
 pub mod paging;
 pub mod pic;
+pub mod rtc;
 pub mod segments;
 pub mod serial;
 pub mod syscall;
@@ -227,6 +229,111 @@ pub unsafe fn start_timer() -> Result<apic::TimerInfo, apic::ApicError> {
         pic::disable();
         apic::init()
     }
+}
+
+/// Routes one device's interrupt to a vector, masked, and leaves it off.
+///
+/// Returns the rate the device will run at once somebody claims it.
+///
+/// # Why the device is not armed here
+///
+/// It was, and it did not work, for a reason worth keeping written down. The
+/// RTC raises its interrupt and sets a flag in register C, and it raises no
+/// further interrupt until that flag is read. Arming it at bring-up meant it
+/// fired immediately, into a line that was masked because nobody owned it yet —
+/// so the I/O APIC discarded the interrupt while the device went on holding the
+/// flag. By the time a driver claimed the line and unmasked it, the device had
+/// been waiting on an acknowledgement for several seconds and never asserted
+/// again. The line was live, the handler was correct, and nothing arrived.
+///
+/// So bring-up decides the wiring and nothing else. Arming and unmasking both
+/// happen when a process claims the line, in that order, in
+/// `unmask_device_line`.
+///
+/// # Safety
+/// Called once, after the IDT is installed and the LAPIC is up, with interrupts
+/// disabled.
+pub unsafe fn start_device_interrupt(line: usize) -> Result<u32, ioapic::IoApicError> {
+    // SAFETY: bring-up, interrupts disabled, identity map active.
+    let chip = unsafe { ioapic::init(ioapic::DEFAULT_BASE) }?;
+    kprintln!(
+        "[kernel] ioapic id={} pins={}",
+        chip.id,
+        u16::from(chip.highest_pin) + 1
+    );
+
+    let vector = ioapic::DEVICE_VECTOR_BASE + line as u8;
+    // SAFETY: `interrupts::install` gave every device vector a gate, and this
+    // one specifically the handler that delivers to user space.
+    unsafe { chip.route(rtc::IRQ, vector, 0) }?;
+
+    *ROUTED_PINS.lock() = Some((line, rtc::IRQ));
+    kprintln!(
+        "[kernel] rtc routed masked: irq {} -> vector {vector}, {} Hz when claimed",
+        rtc::IRQ,
+        rtc::HZ
+    );
+    Ok(rtc::HZ)
+}
+
+/// Which I/O APIC pin each claimable line was routed to.
+///
+/// One entry today. It exists because unmasking happens somewhere else and much
+/// later — when a process claims the line — and that code has no business
+/// knowing that line zero means IRQ 8. The wiring is decided once, here, and
+/// remembered.
+static ROUTED_PINS: spin::Mutex<Option<(usize, u8)>> = spin::Mutex::new(None);
+
+/// Arms the device and lets its line deliver.
+///
+/// The separation from `start_device_interrupt` is the point, and it cost two
+/// failed boots to get right. Routing is what the kernel knows — this pin, that
+/// vector — and it is true from bring-up. Arming and unmasking are what a
+/// process asked for, and they are true only once one has. Doing all three
+/// together produces a device interrupting 64 times a second into a kernel whose
+/// only possible response is to observe that nobody wanted it; doing the first
+/// two together produces a device that latches an acknowledgement nobody will
+/// read and then falls silent forever.
+///
+/// # Order
+///
+/// Arm, then unmask. An interrupt from an armed device whose line is masked is
+/// discarded — recoverable, because the acknowledgement below clears the flag
+/// that would otherwise wedge it. An unmasked line into an unarmed device is
+/// merely quiet.
+///
+/// # Safety
+/// The line must have been routed by `start_device_interrupt`, and the caller
+/// must have established that a process owns it.
+pub unsafe fn unmask_device_line(line: usize) -> Result<(), ioapic::IoApicError> {
+    let Some((routed, pin)) = *ROUTED_PINS.lock() else {
+        return Err(ioapic::IoApicError::NotPresent);
+    };
+    if routed != line {
+        return Err(ioapic::IoApicError::NoSuchPin {
+            pin: line as u8,
+            highest: routed as u8,
+        });
+    }
+
+    // SAFETY: the identity map is active and this runs with interrupts off — a
+    // system call cleared IF through `SFMASK`. `attach` rather than `init`:
+    // `init` masks every pin, which would undo this call as it made it.
+    let chip = unsafe { ioapic::attach(ioapic::DEFAULT_BASE) }?;
+
+    // SAFETY: interrupts are off, and `start_periodic` reads register C as its
+    // last step — which clears any flag the firmware or a discarded interrupt
+    // left set, and is what makes the device able to raise the next one.
+    unsafe { rtc::start_periodic() };
+
+    // SAFETY: the pin was routed to a vector with a handler by the call that
+    // recorded it above.
+    unsafe { chip.unmask(pin) }?;
+    kprintln!(
+        "[kernel] line {line} claimed and unmasked, rtc armed at {} Hz",
+        rtc::HZ
+    );
+    Ok(())
 }
 
 /// Prints a panic message without taking the console lock.

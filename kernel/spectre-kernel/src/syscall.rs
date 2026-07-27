@@ -18,13 +18,14 @@
 
 use crate::abi::{
     SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
-    SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
 use crate::channel::{self, Outcome};
 use crate::device;
 use crate::dma;
+use crate::irq;
 use crate::kprintln;
 use crate::task;
 use crate::usercopy::validate_user_range;
@@ -68,6 +69,7 @@ pub fn handle(
         SYS_DEVICE_INFO => sys_device_info(a0, a1, a2, a3),
         SYS_MAP_DEVICE => sys_map_device(a0, a1),
         SYS_ALLOC_DMA => sys_alloc_dma(a0, a1, a2),
+        SYS_IRQ_WAIT => sys_irq_wait(a0, a1, frame),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -231,6 +233,44 @@ fn sys_alloc_dma(bytes: u64, ptr: u64, capacity: u64) -> Result<u64, SyscallErro
     Ok(out_bytes)
 }
 
+/// `SYS_IRQ_WAIT(grant, index) -> count`.
+///
+/// Blocks until the device has interrupted at least once, then reports how many
+/// times. The line is claimed on the first call rather than by a separate
+/// syscall: a process that can wait for a device's interrupt is exactly a
+/// process that owns it, so a claim step would be a second name for the same
+/// authority and a second thing to get out of step with the first.
+fn sys_irq_wait(grant: u64, index: u64, frame: &TrapFrame) -> Result<u64, SyscallError> {
+    // The grant is checked first, so a process without one learns nothing about
+    // which devices have interrupts.
+    let line = device::line(grant, index)?;
+    let pid = task::current_pid();
+    let fresh = irq::claim(line, pid)?;
+
+    // Armed and unmasked only now that the line has an owner, and only on the
+    // claim that took it. Before this the line is routed and nothing is
+    // delivered — an interrupt with nobody to give it to is one the kernel can
+    // only count and discard, and for this device it is worse than that: the
+    // RTC would hold its acknowledgement flag and never fire again.
+    if fresh {
+        // SAFETY: the line was routed during bring-up, the claim above
+        // established that this process owns it, and a system call arrives with
+        // interrupts disabled, which the register accesses require.
+        if let Err(error) = unsafe { arch::unmask_device_line(line) } {
+            kprintln!("[kernel] could not unmask line {line}: {error:?}");
+            return Err(SyscallError::NotPermitted);
+        }
+    }
+
+    match irq::wait(line, pid)? {
+        irq::Wait::Ready(count) => Ok(count),
+        // SAFETY: reached from a system call with interrupts disabled, on the
+        // syscall stack, and nothing on that stack is needed afterwards. The
+        // handler writes the count into this frame's `rax` when it wakes it.
+        irq::Wait::Block => unsafe { task::block_current(frame) },
+    }
+}
+
 /// `SYS_EXIT(code)`.
 ///
 /// Marks the process finished and then waits to be scheduled away. It does not
@@ -244,6 +284,10 @@ fn sys_exit(code: u64) -> ! {
     // blocked on this server has to be told, or it waits for a reply that
     // cannot arrive.
     channel::on_process_gone(pid);
+    // And any interrupt line it held, or the line stays claimed by a pid that
+    // will be reused — delivering somebody else's interrupts to a process that
+    // never asked for them.
+    irq::on_process_gone(pid);
     if code == 0 {
         kprintln!("[kernel] pid {pid} exited with code 0");
     } else {

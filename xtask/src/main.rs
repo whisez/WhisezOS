@@ -510,6 +510,16 @@ const REQUIRED_LINES: &[&str] = &[
     "[init 1] dma buffer verified, zeroed and writable",
     "[init 2] dma buffer verified, zeroed and writable",
     "[init 3] dma buffer verified, zeroed and writable",
+    // A device's interrupt reaching a process that is not the kernel. Three of
+    // them, because a delivery path that fires once and then stops — line left
+    // masked, device left unacknowledged — passes a one-interrupt test.
+    "[kernel] rtc",
+    "[init 1] woken by hardware 3 time(s)",
+    // And a process with no grant cannot wait on a line it was not given, which
+    // is what stops "wait for an interrupt" from being a way to observe a
+    // device somebody else owns.
+    "[init 2] no interrupt grant, as expected",
+    "[init 3] no interrupt grant, as expected",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.

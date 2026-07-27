@@ -67,6 +67,7 @@ pub mod device;
 pub mod dma;
 pub mod elf;
 pub mod font;
+pub mod irq;
 pub mod rendezvous;
 pub mod roundrobin;
 pub mod syscall;
@@ -186,6 +187,21 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
             // process runs until it makes a system call — which is a degraded
             // system, and is reported as one rather than looking like success.
             kprintln!("[kernel] WARNING no timer ({error:?}), running without preemption");
+        }
+    }
+
+    // And the one device line a process can wait on. After the timer, because
+    // routing it depends on the LAPIC being the thing the I/O APIC delivers to;
+    // before ring 3, because a process that calls `SYS_IRQ_WAIT` on a line that
+    // was never armed waits forever rather than being told.
+    // SAFETY: the IDT gave every device vector a gate, the LAPIC is up, and
+    // interrupts are still disabled.
+    match unsafe { arch::start_device_interrupt(device::TICKER_LINE) } {
+        Ok(_) => {}
+        Err(error) => {
+            // Not fatal, and for the same reason the timer is not: the system
+            // runs, with one capability missing, and says so.
+            kprintln!("[kernel] WARNING no device interrupts ({error:?})");
         }
     }
 

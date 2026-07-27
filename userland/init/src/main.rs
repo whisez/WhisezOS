@@ -25,7 +25,7 @@ mod abi;
 
 use abi::{
     decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO,
-    SYS_EXIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_EXIT, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -226,6 +226,10 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
     // Everything else here holds zero, and zero never matches.
     drive_display(pid, grant);
 
+    // --- waiting on hardware ----------------------------------------------
+    // The other half of driving a device: the device answering.
+    await_interrupts(pid, grant);
+
     // --- talking to another process ---------------------------------------
     if endpoint != 0 {
         if pid == SERVER_ROLE {
@@ -242,6 +246,53 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
 /// The process that owns the endpoint. Given the endpoint by the kernel at
 /// spawn; every other process is a client.
 const SERVER_ROLE: u64 = 1;
+
+/// The device index of the ticker, which is the second entry the kernel lists.
+const TICKER_DEVICE: u64 = 1;
+
+/// Interrupts to wait for before moving on.
+///
+/// Three, not one. One proves an interrupt arrived; three prove the path works
+/// repeatedly — that the device was acknowledged, that the line was not left
+/// masked, and that the process can go back to sleep and be woken again. A
+/// delivery path that fires once and stops is a common enough bug to be worth
+/// spending two more wakes on.
+const INTERRUPTS_TO_AWAIT: u64 = 3;
+
+/// Blocks until the granted device interrupts, three times over.
+///
+/// This is the first time a process outside the kernel is woken by hardware.
+/// Everything else in this file runs because the process asked for it; this runs
+/// because a device asked.
+fn await_interrupts(pid: u64, grant: u64) {
+    let mut seen = 0u64;
+
+    for _ in 0..INTERRUPTS_TO_AWAIT {
+        match call(SYS_IRQ_WAIT, grant, TICKER_DEVICE) {
+            Ok(count) => {
+                if count == 0 {
+                    // The call blocks until there is something to report, so a
+                    // count of zero would mean it returned without one.
+                    say(pid, &[b"WOKEN WITH NO INTERRUPT TO SHOW FOR IT"]);
+                    exit(16);
+                }
+                seen += count;
+            }
+            Err(SyscallError::NotPermitted) => {
+                // The expected answer for every process that is not the driver.
+                say(pid, &[b"no interrupt grant, as expected"]);
+                return;
+            }
+            Err(error) => {
+                say(pid, &[b"irq wait failed: ", error.name().as_bytes()]);
+                exit(17);
+            }
+        }
+    }
+
+    let digit = [b'0' + (seen % 10) as u8];
+    say(pid, &[b"woken by hardware ", &digit, b" time(s)"]);
+}
 
 /// What `SYS_ALLOC_DMA` writes. The kernel's `dma::DmaRegion`, same size, for
 /// the same reason as `DeviceInfo` below.

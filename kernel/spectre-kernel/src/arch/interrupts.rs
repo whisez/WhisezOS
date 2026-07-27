@@ -169,6 +169,17 @@ pub unsafe fn install(layout: &GdtLayout) -> Result<(), IdtError> {
         cs,
     )?;
 
+    // The device lines a process can claim. One gate each rather than one
+    // shared gate that works out which line fired: the vector *is* the line, so
+    // asking the hardware again would be asking a question already answered.
+    for (line, entry) in DEVICE_LINE_ENTRIES.iter().enumerate() {
+        idt.set_device_handler(
+            super::ioapic::DEVICE_VECTOR_BASE + line as u8,
+            handler_addr(*entry as *const () as usize),
+            cs,
+        )?;
+    }
+
     if let Some(missing) = idt.missing_exception_vectors().next() {
         return Err(IdtError::MissingHandler(missing));
     }
@@ -352,6 +363,75 @@ extern "x86-interrupt" fn hypervisor_injection(frame: InterruptFrame) -> ! {
 /// EOI here would acknowledge whatever interrupt is genuinely in service and
 /// lose it.
 extern "x86-interrupt" fn spurious(_frame: InterruptFrame) {}
+
+/// One entry point per claimable line, so the vector identifies the line.
+///
+/// An array of function items rather than a macro-generated match: the vector
+/// the CPU dispatched on is the only evidence of which device fired, and
+/// recovering it inside a shared handler would mean reading the LAPIC's
+/// in-service register to ask the hardware something the dispatch already
+/// decided.
+type LineHandler = extern "x86-interrupt" fn(InterruptFrame);
+
+static DEVICE_LINE_ENTRIES: [LineHandler; crate::irq::MAX_LINES] = [line_0, line_1, line_2, line_3];
+
+extern "x86-interrupt" fn line_0(_frame: InterruptFrame) {
+    device_line(0);
+}
+extern "x86-interrupt" fn line_1(_frame: InterruptFrame) {
+    device_line(1);
+}
+extern "x86-interrupt" fn line_2(_frame: InterruptFrame) {
+    device_line(2);
+}
+extern "x86-interrupt" fn line_3(_frame: InterruptFrame) {
+    device_line(3);
+}
+
+/// A device interrupt, delivered to whichever process claimed the line.
+///
+/// # What this does not do
+///
+/// It does not switch. Waking a process marks it `Ready` and leaves the choice
+/// of what runs next to the timer path, which is the only code that makes that
+/// decision — the alternative is two places that can reschedule, disagreeing
+/// under exactly the timing that is hardest to reproduce. The cost is that a
+/// woken driver waits up to one tick, which is 10 ms and is a scheduling policy
+/// question rather than a correctness one.
+///
+/// It also does not read the device. That is the driver's job, and the only
+/// reason the acknowledgement below is here at all is that reading a port from
+/// ring 3 needs authority that does not exist yet — see `arch/rtc.rs`.
+fn device_line(line: usize) {
+    // Before the EOI, because the device will not raise another interrupt until
+    // it is acknowledged and the LAPIC will not deliver one until it is.
+    // SAFETY: an interrupt gate cleared IF, so this access cannot be interposed.
+    unsafe { super::rtc::acknowledge() };
+
+    match crate::irq::on_interrupt(line) {
+        crate::irq::Delivery::Wake { pid, count } => {
+            crate::task::wake(pid, crate::abi::encode(Ok(count)));
+        }
+        crate::irq::Delivery::Counted => {}
+        crate::irq::Delivery::Unclaimed => {
+            // An interrupt on a line nobody owns means something is unmasked
+            // that should not be, and it will arrive again immediately and
+            // forever. Masking it is the only response that ends the storm.
+            kprintln!("[kernel] interrupt on unclaimed line {line}, masking");
+            // `ioapic::init` masks every pin, which is exactly the response
+            // wanted here — a line nobody owns has no claim on staying routed,
+            // and one that is storming is not worth being surgical about.
+            // SAFETY: bring-up established the I/O APIC is present, and an
+            // interrupt gate cleared IF so the two-step register access below
+            // cannot be interposed.
+            unsafe {
+                let _ = super::ioapic::init(super::ioapic::DEFAULT_BASE);
+            }
+        }
+    }
+
+    super::apic::end_of_interrupt();
+}
 
 extern "x86-interrupt" fn unexpected_device(frame: InterruptFrame) {
     // No interrupt controller is programmed yet, so nothing should arrive here.

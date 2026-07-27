@@ -480,8 +480,37 @@ fn no_runnable_process(states: &[Slot]) -> ! {
     if live == 0 {
         report_shutdown();
     }
+
+    // A process waiting on hardware is not deadlocked. Every process being
+    // blocked means none can move only when each is waiting on another; a
+    // driver blocked in `SYS_IRQ_WAIT` is waiting on something outside the set,
+    // and the interrupt that wakes it needs the processor to be running with
+    // interrupts on to arrive.
+    //
+    // This distinction is not academic: without it the first driver to block on
+    // its device is reported as a deadlock a few microseconds before the device
+    // answers.
+    let waiting_on_hardware = crate::irq::waiters();
+    if waiting_on_hardware > 0 {
+        kprintln!("[kernel] idle: {waiting_on_hardware} process(es) waiting on hardware");
+        idle_until_interrupt();
+    }
+
     kprintln!("[kernel] DEADLOCK: {live} process(es) blocked, none runnable");
     crate::arch::halt_forever();
+}
+
+/// Waits for the interrupt that will make something runnable again.
+///
+/// Enabling interrupts here is the whole point — the processor arrived with
+/// them off, through a gate or a system call, and a device cannot deliver into
+/// that. What resumes normal scheduling is the next timer tick, which finds the
+/// woken process `Ready` like any other.
+fn idle_until_interrupt() -> ! {
+    crate::arch::enable_interrupts();
+    loop {
+        crate::arch::halt_once();
+    }
 }
 
 fn report_shutdown() -> ! {

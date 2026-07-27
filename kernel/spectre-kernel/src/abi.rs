@@ -88,6 +88,15 @@ pub const SYS_MAP_DEVICE: u64 = 7;
 /// need not be spoken aloud.
 pub const SYS_ALLOC_DMA: u64 = 8;
 
+/// Wait for a granted device's interrupt. `(grant, index) -> count`.
+///
+/// Returns how many interrupts arrived since the last call, which is at least
+/// one — the call blocks until there is something to report. A count rather
+/// than one wake per interrupt because interrupts carry no data: the driver
+/// reads the device afterwards and finds whatever accumulated, and a queue of
+/// identical empty events would only add a depth to overflow. See `irq.rs`.
+pub const SYS_IRQ_WAIT: u64 = 9;
+
 /// Longest message body, in either direction.
 ///
 /// The kernel holds one buffer of this size per endpoint, so it bounds kernel
@@ -331,7 +340,7 @@ mod tests {
         assert_eq!((SYS_LOG, SYS_EXIT, SYS_PING), (0, 1, 2));
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
         assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
-        assert_eq!(SYS_ALLOC_DMA, 8);
+        assert_eq!((SYS_ALLOC_DMA, SYS_IRQ_WAIT), (8, 9));
     }
 
     #[test]
