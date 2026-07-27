@@ -155,7 +155,37 @@ pub fn read_cr4() -> u64 {
 /// `EFER`, which holds the long-mode and no-execute enables.
 #[must_use]
 pub fn read_efer() -> u64 {
-    read_msr(0xC000_0080)
+    read_msr(MSR_EFER)
+}
+
+/// `IA32_EFER`. Bit 0 is `SCE`, which is what makes `syscall` an instruction
+/// rather than `#UD`.
+pub const MSR_EFER: u32 = 0xC000_0080;
+/// `IA32_STAR`: the segment selectors `syscall` and `sysret` derive.
+pub const MSR_STAR: u32 = 0xC000_0081;
+/// `IA32_LSTAR`: where `syscall` jumps in 64-bit mode.
+pub const MSR_LSTAR: u32 = 0xC000_0082;
+/// `IA32_FMASK`: RFLAGS bits cleared on `syscall` entry.
+pub const MSR_SFMASK: u32 = 0xC000_0084;
+/// `IA32_GS_BASE`: the base `gs:` adds while this code is running.
+pub const MSR_GS_BASE: u32 = 0xC000_0101;
+/// `IA32_KERNEL_GS_BASE`: what `swapgs` exchanges `IA32_GS_BASE` with.
+pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+/// `EFER.SCE` — system call extensions.
+pub const EFER_SYSCALL_ENABLE: u64 = 1 << 0;
+
+/// # Safety
+/// Writing an MSR can change how the processor executes every instruction after
+/// it. `msr` must be an MSR the caller understands and `value` a bit pattern it
+/// accepts; a reserved bit set here is a #GP with no useful diagnostic.
+pub unsafe fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    // SAFETY: the caller guarantees the MSR and the value.
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nostack, preserves_flags));
+    }
 }
 
 #[must_use]

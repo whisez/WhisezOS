@@ -117,22 +117,28 @@ Beklenen çıktı şu sırayla gelir: yükleyici bellek denetimi, çekirdek ELF'
 doğrulanması, boot servislerinden çıkış, devir, ardından çekirdeğin GDT, IDT,
 çerçeve ayırıcı ve sayfa tablosu satırları ve `[kernel] stage 1 complete`.
 
+Ardından ikinci aşama gelir: çekirdek `init` imajını kendi kullanıcı adres
+uzayına haritalar ve ring 3'e geçer. `[init]` ile başlayan satırlar kullanıcı
+alanından, `syscall` üzerinden yazılır. Üç tanesi kasıtlı ihlaldir ve
+reddedilmeleri beklenir — çekirdek belleğini okutmaya çalışmak, sınırı aşan bir
+uzunluk vermek ve tanımsız bir syscall numarası çağırmak.
+
 Aynı önyüklemeyi otomatik doğrulamak için:
 
 ```powershell
 cargo xtask boot-test
 ```
 
-Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve on bir aşamanın
+Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve yirmi iki aşamanın
 sırasıyla göründüğünü doğrular. `cargo xtask test` içinde de çalışır; QEMU
 kurulu değilse uyarıyla atlanır.
 
 > Üretim yükleyicisi projenin kendi 8 GiB bellek tabanını uygular ve altındaki
 > bir platformu açmayı reddeder. Bu yüzden sanal makine 9 GiB ile başlatılır.
 
-> Çekirdek henüz bir init süreci başlatmaz; `stage 1 complete` satırından sonra
-> durur. Bu, tamamlanmış bir işletim sistemi değil, doğrulanabilir ilk dikey
-> dilimdir.
+> `init` çıktıktan sonra sistem durur. Zamanlayıcı, süreç tablosu ve gerçek IPC
+> henüz yok, dolayısıyla çalıştırılacak ikinci bir şey de yok. Bu, tamamlanmış
+> bir işletim sistemi değil, doğrulanabilir ikinci dikey dilimdir.
 
 ## Yalnızca derleme
 

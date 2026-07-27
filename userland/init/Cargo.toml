@@ -1,0 +1,17 @@
+[package]
+name = "init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+# The first user-space process. Target: x86_64-unknown-none, linked to a fixed
+# user virtual address by `init.ld` and entered in ring 3 by the kernel.
+#
+# No dependencies, deliberately. Everything it can do it does through the
+# syscall ABI, so anything it links would be code running in ring 3 that the
+# capability model has not been asked about yet.
+
+[[bin]]
+name = "init"
+path = "src/main.rs"

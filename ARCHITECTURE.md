@@ -181,11 +181,18 @@ Nothing else. All drivers except the GPU, all filesystems, the network stack,
 USB, and input are user-space processes.
 
 **What is in the bootable image today**, as distinct from what is written and
-tested. The kernel binary links `arch` and `boot_info` and nothing else: it
-boots on QEMU, installs its GDT, IDT, and TSS, brings up the serial console,
-builds a frame allocator from the handoff memory map, constructs its own page
-tables with the image mapped W^X by section, switches CR3, and halts.
-`cargo xtask boot-test` asserts that sequence from the serial log.
+tested. The kernel binary links `arch`, `boot_info`, `abi`, `elf`, `usercopy`,
+and `syscall`. It boots on QEMU, installs its GDT, IDT, and TSS, brings up the
+serial console, builds a frame allocator from the handoff memory map,
+constructs its own page tables with the image mapped W^X by section, switches
+CR3, installs the `SYSCALL`/`SYSRET` MSRs, maps `init` into a user address
+space, and enters ring 3. `init` calls back through `syscall`, has three
+deliberate boundary violations refused, and exits. `cargo xtask boot-test`
+asserts that whole sequence from the serial log.
+
+What is *not* there: no interrupt controller, no timer, no preemption, no
+process table, and no real IPC. `SYS_PING` stands in for an IPC round trip, and
+the system halts when `init` exits because there is nothing to schedule next.
 
 The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
 and carry the bulk of the test suite, but they are written against platform

@@ -34,6 +34,8 @@
 
 extern crate alloc;
 
+/// Shared with the kernel, which parses the init image with the same code.
+#[path = "../../../kernel/spectre-kernel/src/elf.rs"]
 mod elf;
 
 /// The handoff layout, included from the kernel rather than copied.
@@ -71,6 +73,7 @@ use elf::Elf64;
 use serial::{Uart, X86Ports, COM1};
 
 const KERNEL_PATH: &str = "\\SPECTRE\\KERNEL.ELF";
+const INIT_PATH: &str = "\\SPECTRE\\INIT";
 const PAGE_SIZE: u64 = 4096;
 
 /// OS-defined memory type for the kernel image.
@@ -177,6 +180,13 @@ fn load(uart: &mut Uart<X86Ports>) -> Result<(), Status> {
     }
     log!(uart, "{} segments loaded", kernel.segments().count());
 
+    // ---- 4b. The init image ----------------------------------------------
+    // Copied whole, unparsed, into memory the kernel will see as `Loader`. The
+    // kernel maps it into a user address space itself, because deciding the
+    // page permissions of a user process is not a decision a loader with no
+    // address space can make.
+    let init = stage_init_image(uart);
+
     // ---- 5. Collect what needs boot services -----------------------------
     let framebuffer = probe_framebuffer();
     let rsdp = acpi_rsdp();
@@ -191,6 +201,10 @@ fn load(uart: &mut Uart<X86Ports>) -> Result<(), Status> {
     info.kernel_bytes = span;
     info.framebuffer = framebuffer;
     info.acpi_rsdp = rsdp;
+    if let Some((phys, len)) = init {
+        info.init_image_phys = phys;
+        info.init_image_bytes = len;
+    }
     // One processor. Counting the rest needs the ACPI MADT, which nothing
     // parses yet; reporting a guess would be worse than reporting the truth.
     info.cpu_count = 1;
@@ -260,18 +274,53 @@ fn load(uart: &mut Uart<X86Ports>) -> Result<(), Status> {
     }
 }
 
-fn read_kernel(uart: &mut Uart<X86Ports>) -> Result<Vec<u8>, Status> {
-    let volume = uefi::boot::get_image_file_system(uefi::boot::image_handle()).map_err(|e| {
-        log!(uart, "no filesystem on the boot device: {e:?}");
-        Status::NOT_FOUND
-    })?;
+/// Reads a file from the volume this loader was started from.
+///
+/// The boot device rather than any filesystem: an image is only trusted to the
+/// extent that it came from the same place as the loader, and searching every
+/// attached volume for `\SPECTRE\KERNEL.ELF` would let an inserted USB stick
+/// supply the kernel.
+fn read_esp_file(path: &str) -> Result<Vec<u8>, Status> {
+    let volume = uefi::boot::get_image_file_system(uefi::boot::image_handle())
+        .map_err(|_| Status::NOT_FOUND)?;
     let mut fs = uefi::fs::FileSystem::new(volume);
+    let path = uefi::CString16::try_from(path).map_err(|_| Status::INVALID_PARAMETER)?;
+    fs.read(uefi::fs::Path::new(&path))
+        .map_err(|_| Status::NOT_FOUND)
+}
 
-    let path = uefi::CString16::try_from(KERNEL_PATH).map_err(|_| Status::INVALID_PARAMETER)?;
-    fs.read(uefi::fs::Path::new(&path)).map_err(|e| {
+fn read_kernel(uart: &mut Uart<X86Ports>) -> Result<Vec<u8>, Status> {
+    read_esp_file(KERNEL_PATH).inspect_err(|e| {
         log!(uart, "cannot read {KERNEL_PATH}: {e:?}");
-        Status::NOT_FOUND
     })
+}
+
+/// Reads `\SPECTRE\INIT` into `LOADER_DATA` and returns `(physical, length)`.
+///
+/// A missing init is not fatal here. The kernel reports it and halts, which is
+/// a better failure than the loader stopping before it has said anything about
+/// the memory map or the framebuffer — those are the things an operator needs
+/// when working out why init is missing in the first place.
+fn stage_init_image(uart: &mut Uart<X86Ports>) -> Option<(u64, u64)> {
+    let bytes = match read_esp_file(INIT_PATH) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log!(uart, "no init image at {INIT_PATH}: {e:?}");
+            return None;
+        }
+    };
+
+    let pages = (bytes.len() as u64).div_ceil(PAGE_SIZE) as usize;
+    let ptr =
+        uefi::boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages).ok()?;
+    // SAFETY: `pages` pages were just allocated at `ptr`, which is at least as
+    // large as `bytes`, and the two ranges cannot overlap — one is a fresh
+    // allocation.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len());
+    }
+    log!(uart, "init image {} KiB staged", bytes.len() >> 10);
+    Some((ptr.as_ptr() as u64, bytes.len() as u64))
 }
 
 /// Reserves a page-aligned home for the handoff structure.

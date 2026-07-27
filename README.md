@@ -31,11 +31,12 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Kurulum ekranı | ✅ Çalışıyor | Aşamalı, ilerleme çubuklu kurulum provası; hiçbir diske dokunmaz |
 | Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
 | Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
-| Otomatik testler | ✅ 330 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
+| Otomatik testler | ✅ 351 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
 | Üretim yükleyicisi | ✅ Çalışıyor | Çekirdek ELF'ini okur, doğrular, yükler ve boot servislerinden çıkıp devreder |
 | Üretim çekirdeği | ✅ QEMU'da açılıyor | GDT, IDT, seri konsol, çerçeve ayırıcı ve kendi sayfa tabloları; `cargo xtask boot-test` seri günlükle kanıtlar |
 | Kesme denetleyicisi ve zamanlayıcı | 🚧 Yapılıyor | APIC, zamanlayıcı tick'i ve bağlam değiştirme henüz bağlanmadı |
-| Kullanıcı alanı | ❌ Hazır değil | Init süreci, IPC ve yetenek dağıtımı çekirdekten henüz başlatılmıyor |
+| Kullanıcı alanı | ✅ İlk süreç çalışıyor | `init` kendi adres uzayında ring 3'te açılıyor, `syscall` ile çekirdeğe dönüyor ve sınır ihlalleri reddediliyor |
+| Süreç yönetimi | ❌ Hazır değil | Zamanlayıcı, süreç tablosu ve gerçek IPC henüz yok; `init` çıkınca sistem duruyor |
 | Masaüstü oturumu | 🚧 Yapılıyor | Önizleme var; gerçek çekirdekten masaüstüne geçiş henüz tamamlanmadı |
 | Fiziksel kurulum | ❌ Hazır değil | Disk kurucusu, donanım uyumluluğu ve kurtarma yolu tamamlanmadan kullanılamaz |
 

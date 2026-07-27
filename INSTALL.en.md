@@ -118,22 +118,28 @@ Expect, in order: the loader's memory audit, validation of the kernel ELF, the
 exit from boot services, the handoff, then the kernel's GDT, IDT, frame
 allocator, and page-table lines, ending with `[kernel] stage 1 complete`.
 
+Stage 2 follows: the kernel maps the `init` image into its own user address
+space and enters ring 3. Every line beginning `[init]` is written from user
+space through `syscall`. Three of them are deliberate violations that are
+expected to be refused — reading kernel memory, a length past the limit, and an
+unassigned syscall number.
+
 To verify the same boot automatically:
 
 ```powershell
 cargo xtask boot-test
 ```
 
-This runs QEMU headless, captures the serial log, and asserts that eleven stages
+This runs QEMU headless, captures the serial log, and asserts that twenty-two stages
 appear in order. It also runs as part of `cargo xtask test`, and is skipped
 with a warning when QEMU is not installed.
 
 > The production loader enforces the project's own 8 GiB memory floor and
 > refuses to boot a platform below it, which is why the VM is started with 9 GiB.
 
-> The kernel does not start an init process yet; it halts after
-> `stage 1 complete`. This is the first verifiable vertical slice, not a
-> finished operating system.
+> The system halts once `init` exits. There is no scheduler, no process table,
+> and no real IPC yet, so there is nothing else to run. This is the second
+> verifiable vertical slice, not a finished operating system.
 
 ## Build only
 

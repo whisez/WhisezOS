@@ -7,6 +7,7 @@ default-members = [
 members = [
     "boot/spectre-boot",
     "kernel/spectre-kernel",
+    "userland/init",
     "userland/prism",
     "userland/winbridge",
     "userland/spectreshield",

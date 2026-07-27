@@ -97,6 +97,19 @@ pub unsafe fn install() -> Result<GdtLayout, GdtError> {
     Ok(layout)
 }
 
+/// A kernel stack for exceptions arriving from ring 3.
+///
+/// Reuses the debug IST stack's sibling rather than adding a fifth: this is the
+/// `RSP0` the CPU loads on a privilege transition, and it must not be the user
+/// stack or the syscall stack. It becomes per-thread the moment there is more
+/// than one thread.
+#[must_use]
+pub fn ring3_kernel_stack_top() -> u64 {
+    stack_top(core::ptr::addr_of_mut!(RING3_STACK)).as_u64()
+}
+
+static mut RING3_STACK: FaultStack = FaultStack([0; FAULT_STACK_BYTES]);
+
 /// Sets the stack the CPU switches to on a ring 3 → 0 transition.
 ///
 /// Not used yet — nothing runs in ring 3 — but it is the one TSS field that has

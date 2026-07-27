@@ -376,6 +376,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "init"
+version = "0.1.0"
+
+[[package]]
 name = "inout"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

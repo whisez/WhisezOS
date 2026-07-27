@@ -94,13 +94,21 @@ pub mod attest;
 #[path = "../../boot/spectre-boot/src/spd.rs"]
 pub mod spd;
 
-#[path = "../../boot/spectre-boot/src/elf.rs"]
+#[path = "../../kernel/spectre-kernel/src/elf.rs"]
 pub mod elf;
 
 /// The loader-to-kernel ABI. Compiled here as well as in both binaries, so a
 /// layout change that breaks the handoff fails a host test rather than a boot.
 #[path = "../../kernel/spectre-kernel/src/boot_info.rs"]
 pub mod boot_info;
+
+/// The syscall ABI, compiled here as well as in the kernel and in init — the
+/// three places that have to agree about it.
+#[path = "../../kernel/spectre-kernel/src/abi.rs"]
+pub mod abi;
+
+#[path = "../../kernel/spectre-kernel/src/usercopy.rs"]
+pub mod usercopy;
 
 #[path = "../../boot/spectre-boot/src/pointer.rs"]
 pub mod pointer;

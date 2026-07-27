@@ -31,11 +31,12 @@ defensive utility named **Whisez Guard**.
 | Setup screen | ✅ Working | A staged installation rehearsal with progress bars; it touches no disk |
 | Whisez Guard | ✅ Working | Windows security audit, offline scan, SHA3-256 baseline verification, and monitoring |
 | Build and packaging | ✅ Working | Produces an EFI application, Guard binary, and 4K wallpaper package with one command |
-| Automated tests | ✅ 330 tests | Kernel, file-system, boot-logic, and Guard tests |
+| Automated tests | ✅ 351 tests | Kernel, file-system, boot-logic, and Guard tests |
 | Production loader | ✅ Working | Reads, validates, and loads the kernel ELF, then exits boot services and hands off |
 | Production kernel | ✅ Boots in QEMU | GDT, IDT, serial console, frame allocator, and its own page tables; `cargo xtask boot-test` proves it from the serial log |
 | Interrupt controller and timer | 🚧 In progress | APIC, timer tick, and context switching are not wired up yet |
-| User space | ❌ Not ready | No init process, IPC, or capability distribution starts from the kernel yet |
+| User space | ✅ First process runs | `init` starts in ring 3 in its own address space, calls back through `syscall`, and has its boundary violations refused |
+| Process management | ❌ Not ready | No scheduler, process table, or real IPC yet; the system halts when `init` exits |
 | Desktop session | 🚧 In progress | A preview exists; the real kernel-to-desktop path is not complete |
 | Physical installation | ❌ Not ready | Requires a disk installer, hardware compatibility work, and a recovery path |
 

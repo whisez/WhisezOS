@@ -54,8 +54,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod abi;
 pub mod arch;
 pub mod boot_info;
+pub mod elf;
+pub mod syscall;
+pub mod usercopy;
 
 pub use boot_info::BootInfo;
 
@@ -72,19 +76,46 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     let boot = unsafe { &*boot_info };
 
     // SAFETY: first and only call, interrupts disabled, as required above.
-    match unsafe { arch::early_init(boot) } {
-        Ok(()) => {
+    let platform = match unsafe { arch::early_init(boot) } {
+        Ok(platform) => {
             kprintln!("[kernel] stage 1 complete");
+            platform
         }
         Err(error) => {
             kprintln!("[kernel] BRING-UP FAILED: {error:?}");
             arch::halt_forever();
         }
-    }
+    };
 
-    // Interrupts stay masked. Enabling them requires an interrupt controller
-    // and a timer, and stage 1 has neither: `sti` here would let a stray legacy
-    // PIC line arrive at a vector nothing is prepared to service.
-    kprintln!("[kernel] no init process yet, halting");
-    arch::halt_forever()
+    // SAFETY: the handoff was validated by `early_init`, and the init image
+    // lives in `Loader` memory, which the frame allocator does not hand out.
+    let Some(image) = (unsafe { boot.init_image() }) else {
+        kprintln!("[kernel] no init image in the handoff, halting");
+        arch::halt_forever();
+    };
+    kprintln!("[kernel] init image {} KiB", image.len() >> 10);
+
+    // SAFETY: the early allocator is up, physical memory is identity mapped,
+    // and `platform.kernel_root` is the table currently in CR3.
+    let process = match unsafe { arch::user::load(image, platform.kernel_root) } {
+        Ok(process) => process,
+        Err(error) => {
+            kprintln!("[kernel] INIT REJECTED: {error:?}");
+            arch::halt_forever();
+        }
+    };
+    kprintln!(
+        "[kernel] init mapped, entry={:#018x} stack={:#018x} regions={}",
+        process.entry,
+        process.stack_top,
+        process.regions().len()
+    );
+
+    arch::user::set_current(process);
+    kprintln!("[kernel] entering ring 3");
+
+    // SAFETY: `process` came from `load` against the active kernel table and
+    // the syscall MSRs are installed, which is what init needs on its first
+    // instruction.
+    unsafe { arch::user::enter(&process, &platform.gdt, arch::fault_stack_top()) }
 }

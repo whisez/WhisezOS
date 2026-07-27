@@ -36,7 +36,11 @@ pub const BOOT_INFO_MAGIC: u64 = 0x5748_4953_455A_4F53;
 
 /// Bumped on any incompatible change to the layout below. The kernel refuses a
 /// version it does not know rather than guessing.
-pub const BOOT_INFO_VERSION: u16 = 1;
+///
+/// v2 added the init image extent. The version is what makes that a refusal
+/// rather than a kernel reading two fields of noise where the framebuffer used
+/// to be, and it is why the field went at the end.
+pub const BOOT_INFO_VERSION: u16 = 2;
 
 /// Upper bound on regions carried across the handoff.
 pub const MAX_REGIONS: usize = 128;
@@ -248,6 +252,17 @@ pub struct BootInfo {
     pub cpu_count: u32,
     _pad: u32,
     pub framebuffer: Framebuffer,
+    /// Physical address of the **unparsed** init ELF file, or 0 if the loader
+    /// found none.
+    ///
+    /// The file, not the loaded segments. The loader could parse and place it
+    /// as it does the kernel, but then the loader would be deciding the page
+    /// permissions of a user-space process, and it has no address space to put
+    /// them in. Handing over the bytes lets the kernel map init into a real
+    /// user address space with `W^X` applied per segment by the same code path
+    /// every later process will use.
+    pub init_image_phys: u64,
+    pub init_image_bytes: u64,
     pub regions: [MemoryRegion; MAX_REGIONS],
 }
 
@@ -276,6 +291,8 @@ impl BootInfo {
                 stride: 0,
                 bytes_per_pixel: 0,
             },
+            init_image_phys: 0,
+            init_image_bytes: 0,
             regions: [MemoryRegion::new(0, 0, MemoryKind::Reserved); MAX_REGIONS],
         }
     }
@@ -293,6 +310,27 @@ impl BootInfo {
     #[must_use]
     pub const fn memory_map_truncated(&self) -> bool {
         self.flags & FLAG_MEMORY_MAP_TRUNCATED != 0
+    }
+
+    /// The init image bytes, if the loader supplied one.
+    ///
+    /// # Safety
+    /// Physical memory must be identity mapped, and the range must still be
+    /// intact — it lives in `Loader` memory, which nothing reclaims during
+    /// early boot.
+    #[must_use]
+    pub unsafe fn init_image(&self) -> Option<&[u8]> {
+        if self.init_image_phys == 0 || self.init_image_bytes == 0 {
+            return None;
+        }
+        // SAFETY: the caller guarantees the range is mapped and live; the
+        // loader wrote it and marked it `LOADER_DATA`.
+        Some(unsafe {
+            core::slice::from_raw_parts(
+                self.init_image_phys as *const u8,
+                self.init_image_bytes as usize,
+            )
+        })
     }
 
     /// Checks everything the kernel is about to rely on.

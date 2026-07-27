@@ -208,8 +208,48 @@ fn build_bundle() -> Result<()> {
 
 /// Where the built kernel ELF lands.
 const KERNEL_ELF: &str = "target/x86_64-unknown-none/kernel/spectre-kernel";
+/// Where the built init ELF lands.
+const INIT_ELF: &str = "target/x86_64-unknown-none/kernel/init";
 /// Where the built production loader lands.
 const LOADER_EFI: &str = "target/x86_64-unknown-uefi/release/spectre-boot.efi";
+
+/// Builds init, the first user-space process.
+///
+/// Same profile and target as the kernel so both are linked by the same
+/// toolchain with the same code model, but its own linker script: init is
+/// placed at a user virtual address far from the kernel's identity map, and
+/// `init.ld` is what puts it there.
+fn build_init() -> Result<()> {
+    // `code-model=large` because init is linked at 16 TiB. The default small
+    // model reaches its own data with 32-bit signed displacements, which covers
+    // the low 2 GiB and nothing else; every reference to a string literal in
+    // init would be a relocation that does not fit. Linking lower is not the
+    // alternative it looks like — the low 512 GiB is the kernel's identity map,
+    // shared into every address space, and mapping a user page there would
+    // modify the kernel's own tables.
+    let flags = "-C link-arg=-Tuserland/init/init.ld \
+                 -C relocation-model=static \
+                 -C code-model=large";
+    run_with_env(
+        "cargo",
+        &[
+            "build",
+            "--profile",
+            "kernel",
+            "-p",
+            "init",
+            "--bin",
+            "init",
+            "--target",
+            "x86_64-unknown-none",
+            "-Z",
+            "build-std=core,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ],
+        &[("RUSTFLAGS", flags)],
+    )
+}
 
 fn build_kernel() -> Result<()> {
     // The linker script is not optional. It fixes the load address the loader
@@ -246,6 +286,7 @@ fn build_kernel() -> Result<()> {
 fn stage_boot_esp(dir: &Path) -> Result<()> {
     build_boot()?;
     build_kernel()?;
+    build_init()?;
 
     let efi = dir.join("EFI/BOOT");
     let spectre = dir.join("SPECTRE");
@@ -253,6 +294,7 @@ fn stage_boot_esp(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&spectre)?;
     std::fs::copy(LOADER_EFI, efi.join("BOOTX64.EFI")).context("staging the loader")?;
     std::fs::copy(KERNEL_ELF, spectre.join("KERNEL.ELF")).context("staging the kernel")?;
+    std::fs::copy(INIT_ELF, spectre.join("INIT")).context("staging init")?;
     Ok(())
 }
 
@@ -339,7 +381,23 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     "[kernel] idt installed",
     "[kernel] frames total=",
     "[kernel] page tables active",
+    "[kernel] syscall enabled=true",
     "[kernel] stage 1 complete",
+    // Stage 2: a real process, in ring 3, calling back into the kernel.
+    "[kernel] init mapped",
+    "[kernel] entering ring 3",
+    // Printed by init, through SYS_LOG, from ring 3.
+    "[init] hello from ring 3",
+    // The round trip. Printing could be faked by a kernel that never left ring
+    // 0; a value the kernel transformed and returned could not.
+    "[init] ping round trip ok",
+    // Each of these would be a privilege escalation if it had succeeded.
+    "[init] refused as expected: reading kernel memory through SYS_LOG",
+    "[init] refused as expected: a length past the end of the buffer limit",
+    "[init] refused as expected: an unassigned syscall number",
+    "[init] all checks passed",
+    "[kernel] init exited with code 0",
+    "[kernel] stage 2 complete",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.
@@ -649,7 +707,13 @@ fn run_tests() -> Result<()> {
     run("cargo", &["test", "--manifest-path", "verify/Cargo.toml"])?;
     run("cargo", &["test", "-p", "whisez-guard"])?;
 
-    for package in ["whisez-guard", "xtask", "spectre-boot", "spectre-kernel"] {
+    for package in [
+        "whisez-guard",
+        "xtask",
+        "spectre-boot",
+        "spectre-kernel",
+        "init",
+    ] {
         run("cargo", &["fmt", "-p", package, "--", "--check"])?;
     }
     run(
@@ -718,9 +782,37 @@ fn run_tests() -> Result<()> {
         )],
     )?;
 
+    // init is linked with `code-model=large` against a user address, so it is
+    // linted with the same flags it is built with — a lint run under different
+    // codegen options is not a lint run of the shipped binary.
+    run_with_env(
+        "cargo",
+        &[
+            "clippy",
+            "-p",
+            "init",
+            "--bin",
+            "init",
+            "--target",
+            "x86_64-unknown-none",
+            "-Z",
+            "build-std=core,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[(
+            "RUSTFLAGS",
+            "-C link-arg=-Tuserland/init/init.ld -C relocation-model=static -C code-model=large",
+        )],
+    )?;
+
     build_demo()?;
     build_boot()?;
     build_kernel()?;
+    build_init()?;
 
     // The boot test is the only thing here that proves the kernel runs rather
     // than merely compiles, so it is not optional when it can be run at all.

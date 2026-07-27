@@ -33,6 +33,8 @@ pub mod memory;
 pub mod paging;
 pub mod segments;
 pub mod serial;
+pub mod syscall;
+pub mod user;
 
 use crate::boot_info::BootInfo;
 use crate::kprintln;
@@ -46,12 +48,19 @@ pub enum InitError {
     Memory(memory::MemoryError),
 }
 
+/// What `early_init` produces and stage 2 needs.
+#[derive(Debug, Clone, Copy)]
+pub struct Platform {
+    pub gdt: gdt::GdtLayout,
+    pub kernel_root: addr::PhysAddr,
+}
+
 /// Brings the processor up to a known state.
 ///
 /// # Safety
 /// Called exactly once, on the bootstrap processor, with interrupts disabled and
 /// the loader's identity mapping still active.
-pub unsafe fn early_init(boot: &BootInfo) -> Result<(), InitError> {
+pub unsafe fn early_init(boot: &BootInfo) -> Result<Platform, InitError> {
     console::init();
     kprintln!("[kernel] WhisezOS microkernel, stage 1");
 
@@ -88,9 +97,19 @@ pub unsafe fn early_init(boot: &BootInfo) -> Result<(), InitError> {
     // which necessarily includes the running code, the current stack, and the
     // table itself.
     let root = unsafe { memory::activate_kernel_tables() }.map_err(InitError::Memory)?;
-    kprintln!("[kernel] page tables active cr3={:#018x}", root);
+    kprintln!("[kernel] page tables active cr3={:#018x}", root.as_u64());
 
-    Ok(())
+    // Last, because `SCE` makes `syscall` a valid instruction and the entry
+    // path it points at needs a kernel stack and a live GDT to be worth
+    // jumping to.
+    // SAFETY: the GDT is installed and the selectors in `layout` are loaded.
+    unsafe { syscall::init(&layout) };
+    syscall::report();
+
+    Ok(Platform {
+        gdt: layout,
+        kernel_root: root,
+    })
 }
 
 fn report_handoff(boot: &BootInfo) {
@@ -165,6 +184,12 @@ pub fn disable_interrupts() {
 
 pub fn halt_forever() -> ! {
     cpu::halt_forever()
+}
+
+/// Top of the stack the CPU switches to when a fault arrives from ring 3.
+#[must_use]
+pub fn fault_stack_top() -> u64 {
+    segments::ring3_kernel_stack_top()
 }
 
 /// Prints a panic message without taking the console lock.

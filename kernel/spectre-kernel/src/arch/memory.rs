@@ -140,11 +140,10 @@ impl ImageLayout {
 /// table we build preserves it, so a physical address is dereferenceable as-is
 /// for the whole of bring-up. `BootInfo::physical_memory_offset` exists for the
 /// day this stops being true; while it is zero, the two views coincide.
-struct IdentityAccess<'a> {
+pub struct IdentityAccess<'a> {
     allocator: &'a mut FrameAllocator<'static>,
-    /// Frames handed out for intermediate tables, reported so the boot log shows
-    /// what the mapping cost.
-    tables_allocated: u64,
+    /// Frames handed out, for reporting what a mapping cost.
+    frames_allocated: u64,
 }
 
 impl IdentityAccess<'_> {
@@ -166,6 +165,21 @@ impl IdentityAccess<'_> {
         // bring-up is this structure.
         unsafe { (phys.as_u64() as *mut PageTable).as_mut() }
     }
+
+    /// Allocates a frame and zeroes it.
+    ///
+    /// Both callers need the zeroing for different reasons and neither can skip
+    /// it: an unzeroed page table is read by the CPU as a table full of present
+    /// entries pointing at arbitrary physical addresses, and an unzeroed user
+    /// page hands a process whatever the firmware or a previous owner left
+    /// there.
+    pub fn alloc_zeroed(&mut self) -> Option<PhysAddr> {
+        let frame = self.allocator.alloc().ok()?;
+        let table = self.table_mut(frame)?;
+        *table = PageTable::new();
+        self.frames_allocated += 1;
+        Some(frame)
+    }
 }
 
 impl TableAccess for IdentityAccess<'_> {
@@ -180,14 +194,7 @@ impl TableAccess for IdentityAccess<'_> {
     }
 
     fn alloc_table(&mut self) -> Option<PhysAddr> {
-        let frame = self.allocator.alloc().ok()?;
-        // A fresh frame holds whatever the firmware left there. An unzeroed page
-        // table is read by the CPU as a table full of present entries pointing
-        // at arbitrary physical addresses.
-        let table = self.table_mut(frame)?;
-        *table = PageTable::new();
-        self.tables_allocated += 1;
-        Some(frame)
+        self.alloc_zeroed()
     }
 }
 
@@ -253,54 +260,50 @@ pub unsafe fn init(boot: &BootInfo) -> Result<MemoryStats, MemoryError> {
 /// below `EARLY_PHYS_LIMIT`, which necessarily includes the running code, the
 /// current stack, and the table itself — the three things a CR3 switch cannot
 /// survive without.
-pub unsafe fn activate_kernel_tables() -> Result<u64, MemoryError> {
+pub unsafe fn activate_kernel_tables() -> Result<PhysAddr, MemoryError> {
     let mut guard = ALLOCATOR.lock();
     let allocator = guard.as_mut().ok_or(MemoryError::NotInitialised)?;
     let image = ImageLayout::current()?;
 
     let mut access = IdentityAccess {
         allocator,
-        tables_allocated: 0,
+        frames_allocated: 0,
     };
     let root = access.alloc_table().ok_or(MemoryError::OutOfFrames)?;
+
+    let data = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::GLOBAL;
 
     let mut phys = 0u64;
     while phys < EARLY_PHYS_LIMIT {
         let chunk_end = phys + LARGE_PAGE;
-        let overlaps_image = image.start < chunk_end && image.end > phys;
+        // The first chunk is split for the null guard below; any chunk holding
+        // part of the kernel image is split so each section gets its own
+        // permissions. A 2 MiB entry can express neither.
+        let split = phys == 0 || (image.start < chunk_end && image.end > phys);
 
-        if overlaps_image {
+        if split {
             let mut page = phys;
             while page < chunk_end {
+                // Leave the page at physical zero unmapped. A null dereference
+                // should fault, not quietly read the real-mode interrupt vector
+                // table and find plausible-looking pointers there.
+                if page == 0 {
+                    page += PAGE_SIZE;
+                    continue;
+                }
                 let flags = if image.contains(page) {
                     image.flags_for(page)
                 } else {
-                    PageFlags::PRESENT
-                        | PageFlags::WRITABLE
-                        | PageFlags::NO_EXECUTE
-                        | PageFlags::GLOBAL
+                    data
                 };
                 map(&mut access, root, page, flags, PageSize::Small)?;
                 page += PAGE_SIZE;
             }
         } else {
-            map(
-                &mut access,
-                root,
-                phys,
-                PageFlags::PRESENT
-                    | PageFlags::WRITABLE
-                    | PageFlags::NO_EXECUTE
-                    | PageFlags::GLOBAL,
-                PageSize::Large,
-            )?;
+            map(&mut access, root, phys, data, PageSize::Large)?;
         }
         phys = chunk_end;
     }
-
-    // Frame 0 is left unmapped on purpose: a null dereference should fault
-    // rather than quietly read the real-mode interrupt vector table.
-    unmap_null(&mut access, root)?;
 
     *ROOT.lock() = Some(root);
 
@@ -308,7 +311,7 @@ pub unsafe fn activate_kernel_tables() -> Result<u64, MemoryError> {
     // running code executable and the current stack writable, and the table
     // frames themselves are inside that range.
     unsafe { cpu::write_cr3(root.as_u64()) };
-    Ok(root.as_u64())
+    Ok(root)
 }
 
 fn map(
@@ -324,18 +327,22 @@ fn map(
     Ok(())
 }
 
-fn unmap_null(access: &mut IdentityAccess<'_>, root: PhysAddr) -> Result<(), MemoryError> {
-    let virt = VirtAddr::from_indices_sign_extended(0, PagingMode::Level4);
-    match paging::unmap_page(access, root, virt, PagingMode::Level4) {
-        Ok(_) => Ok(()),
-        // The first 2 MiB is mapped as one large page when the kernel does not
-        // live there, and unmapping a 4 KiB page out of a large one is refused.
-        // Splitting the large page for this would mean 512 entries to protect
-        // one address; leaving it mapped is the lesser problem, and the page is
-        // non-executable either way.
-        Err(PageError::NotMapped) | Err(PageError::InvalidHugePage { .. }) => Ok(()),
-        Err(e) => Err(MemoryError::Page(e)),
-    }
+/// Runs `f` with page-table access backed by the early frame allocator.
+///
+/// The allocator lock and the identity-mapped view of physical memory belong
+/// together — building a table requires allocating frames, and reading a table
+/// requires the identity map — so they are handed out as one thing rather than
+/// letting a caller take the lock and construct its own view.
+pub fn with_table_access<R>(
+    f: impl FnOnce(&mut IdentityAccess<'_>) -> Result<R, MemoryError>,
+) -> Result<R, MemoryError> {
+    let mut guard = ALLOCATOR.lock();
+    let allocator = guard.as_mut().ok_or(MemoryError::NotInitialised)?;
+    let mut access = IdentityAccess {
+        allocator,
+        frames_allocated: 0,
+    };
+    f(&mut access)
 }
 
 /// Allocates one physical frame from the early allocator.
