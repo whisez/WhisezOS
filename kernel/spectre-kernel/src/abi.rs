@@ -107,6 +107,102 @@ pub const SYS_IRQ_WAIT: u64 = 9;
 /// including for what the kernel will not hand over at any price.
 pub const SYS_GRANT_PORTS: u64 = 10;
 
+/// What a device is, so a driver can tell what it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DeviceKind {
+    /// Nothing here.
+    None = 0,
+    /// A linear framebuffer, already configured by the firmware.
+    Framebuffer = 1,
+    /// A periodic interrupt source with no registers worth mapping.
+    Ticker = 2,
+    /// A virtio block device: a disk, reached through a mapped window.
+    Block = 3,
+}
+
+/// What `SYS_DEVICE_INFO` writes.
+///
+/// This lives in `abi.rs` rather than beside the device table for the same
+/// reason the syscall numbers do: it is compiled by the kernel and by every
+/// process, and one definition is the only arrangement in which they cannot
+/// disagree.
+///
+/// It did not start here. It was a struct in `device.rs` with a hand-written
+/// copy in init and a comment claiming an assertion kept the two the same size
+/// — which it did not, because each side asserted against its own idea of the
+/// size. Growing the kernel's copy produced a driver whose buffer was suddenly
+/// too small, reported as `TooLong` from a call that had worked for weeks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct DeviceInfo {
+    pub kind: u32,
+    pub _pad: u32,
+    /// Bytes the mapping covers.
+    pub length: u64,
+    /// Geometry, meaningful for a framebuffer and zero otherwise. Not a
+    /// physical address: a driver has no use for one, and telling it would be
+    /// telling it where everything else is not.
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub bytes_per_pixel: u32,
+    /// Offsets of the four virtio structures within the mapped window, and the
+    /// notification stride. Meaningful for a `Block` device and zero otherwise.
+    ///
+    /// The kernel reads these out of PCI configuration space, which a driver
+    /// cannot reach, and passes them on without knowing what any of them are
+    /// for.
+    pub common_offset: u32,
+    pub notify_offset: u32,
+    pub notify_multiplier: u32,
+    pub isr_offset: u32,
+    pub config_offset: u32,
+    pub _pad2: u32,
+}
+
+impl DeviceInfo {
+    pub const EMPTY: Self = Self {
+        kind: DeviceKind::None as u32,
+        _pad: 0,
+        length: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        bytes_per_pixel: 0,
+        common_offset: 0,
+        notify_offset: 0,
+        notify_multiplier: 0,
+        isr_offset: 0,
+        config_offset: 0,
+        _pad2: 0,
+    };
+}
+
+const _: () = assert!(core::mem::size_of::<DeviceInfo>() == 56);
+
+/// What `SYS_ALLOC_DMA` writes. Here for the same reason as `DeviceInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct DmaRegion {
+    /// Where the process reads and writes it.
+    pub virt: u64,
+    /// What the process programs into the device.
+    pub bus: u64,
+    /// Bytes mapped, rounded up from what was asked for.
+    pub length: u64,
+}
+
+impl DmaRegion {
+    pub const EMPTY: Self = Self {
+        virt: 0,
+        bus: 0,
+        length: 0,
+    };
+}
+
+const _: () = assert!(core::mem::size_of::<DmaRegion>() == 24);
+
 /// Longest message body, in either direction.
 ///
 /// The kernel holds one buffer of this size per endpoint, so it bounds kernel

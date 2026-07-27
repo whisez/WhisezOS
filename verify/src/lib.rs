@@ -131,6 +131,9 @@ pub mod rendezvous;
 #[path = "../../kernel/spectre-kernel/src/roundrobin.rs"]
 pub mod roundrobin;
 
+#[path = "../../kernel/spectre-kernel/src/virtio.rs"]
+pub mod virtio;
+
 #[path = "../../kernel/spectre-kernel/src/vmspace.rs"]
 pub mod vmspace;
 

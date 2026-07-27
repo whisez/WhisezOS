@@ -38,6 +38,7 @@
 
 #![allow(dead_code)]
 
+pub use crate::abi::DmaRegion;
 use crate::abi::SyscallError;
 
 /// Where DMA buffers appear in a process's address space.
@@ -73,36 +74,6 @@ pub const MAX_DMA_BYTES: u64 = DMA_SLOT_SIZE;
 
 /// Bytes per page.
 const PAGE_SIZE: u64 = 4096;
-
-/// What a process receives when a buffer is created.
-///
-/// `#[repr(C)]` because it is copied into the process's own memory; the layout
-/// is ABI, like `DeviceInfo` and `BootInfo`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct DmaRegion {
-    /// Where the process reads and writes it.
-    pub virt: u64,
-    /// What the process programs into the device.
-    ///
-    /// A physical address today, an IOMMU address once there is an IOMMU. The
-    /// process treats it as an opaque number to hand to hardware either way,
-    /// which is why it is not called `phys`.
-    pub bus: u64,
-    /// Bytes mapped. Rounded up from what was asked for, so a process that asks
-    /// for one byte and writes a page has not gone outside its mapping.
-    pub length: u64,
-}
-
-impl DmaRegion {
-    pub const EMPTY: Self = Self {
-        virt: 0,
-        bus: 0,
-        length: 0,
-    };
-}
-
-const _: () = assert!(core::mem::size_of::<DmaRegion>() == 24);
 
 /// Where a buffer will go and how big it will be, before anything is allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -42,60 +42,12 @@
 use spin::Mutex;
 
 use crate::abi::SyscallError;
+pub use crate::abi::{DeviceInfo, DeviceKind};
 use crate::boot_info::BootInfo;
 use crate::portauth::PortRange;
 
 /// Devices the kernel can describe.
 pub const MAX_DEVICES: usize = 8;
-
-/// What a device is, so a driver can tell what it was handed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum DeviceKind {
-    /// Nothing here.
-    None = 0,
-    /// A linear framebuffer, already configured by the firmware.
-    Framebuffer = 1,
-    /// A periodic interrupt source with no registers worth mapping.
-    ///
-    /// The whole of this device is its interrupt, which is what makes it the
-    /// one that can demonstrate delivery before any driver exists.
-    Ticker = 2,
-}
-
-/// One device, as user space sees it.
-///
-/// `#[repr(C)]` because it is copied into a process's buffer; the layout is
-/// part of the ABI, like `BootInfo`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct DeviceInfo {
-    pub kind: u32,
-    pub _pad: u32,
-    /// Bytes the mapping covers.
-    pub length: u64,
-    /// Geometry, meaningful for a framebuffer and zero otherwise. Not a
-    /// physical address: a driver has no use for one, and telling it would be
-    /// telling it where everything else is not.
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub bytes_per_pixel: u32,
-}
-
-impl DeviceInfo {
-    pub const EMPTY: Self = Self {
-        kind: DeviceKind::None as u32,
-        _pad: 0,
-        length: 0,
-        width: 0,
-        height: 0,
-        stride: 0,
-        bytes_per_pixel: 0,
-    };
-}
-
-const _: () = assert!(core::mem::size_of::<DeviceInfo>() == 32);
 
 /// The kernel's private half of an entry.
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +117,7 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
                     height: boot.framebuffer.height,
                     stride: boot.framebuffer.stride,
                     bytes_per_pixel: boot.framebuffer.bytes_per_pixel,
+                    ..DeviceInfo::EMPTY
                 },
                 phys: boot.framebuffer.base,
                 ports: None,
@@ -185,12 +138,7 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
     table.entries[slot] = Entry {
         info: DeviceInfo {
             kind: DeviceKind::Ticker as u32,
-            _pad: 0,
-            length: 0,
-            width: 0,
-            height: 0,
-            stride: 0,
-            bytes_per_pixel: 0,
+            ..DeviceInfo::EMPTY
         },
         phys: 0,
         ports: Some(TICKER_PORTS),
@@ -215,6 +163,40 @@ pub const TICKER_LINE: usize = 0;
 /// the short version is that it is a property of a machine from 1984 and not
 /// something this code can divide more finely.
 pub const TICKER_PORTS: PortRange = PortRange::new(0x70, 2);
+
+/// Adds a virtio block device to the table.
+///
+/// Called from the PCI scan, which is the only thing that knows a disk exists.
+/// Returns the index it took, or `None` when the table is full.
+pub fn add_block(
+    window: u64,
+    length: u64,
+    layout: &crate::virtio::Layout,
+    line: usize,
+) -> Option<u64> {
+    let mut table = TABLE.lock();
+    let slot = table.len;
+    if slot >= MAX_DEVICES {
+        return None;
+    }
+    table.entries[slot] = Entry {
+        info: DeviceInfo {
+            kind: DeviceKind::Block as u32,
+            length,
+            common_offset: layout.common.offset,
+            notify_offset: layout.notify.offset,
+            notify_multiplier: layout.notify_multiplier,
+            isr_offset: layout.isr.offset,
+            config_offset: layout.device.offset,
+            ..DeviceInfo::EMPTY
+        },
+        phys: window,
+        ports: None,
+        line: Some(line),
+    };
+    table.len = slot + 1;
+    Some(slot as u64)
+}
 
 /// The ports device `index` is driven through.
 ///

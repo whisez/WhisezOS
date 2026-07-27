@@ -340,6 +340,28 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
     );
     let machine_arg = format!("{machine},smm=on");
 
+    // A disk for the virtio block driver to find. Created rather than required,
+    // so the boot test does not depend on a file somebody remembered to make;
+    // 16 MiB is enough for a filesystem to be built on later and small enough
+    // that creating it costs nothing.
+    let disk = Path::new("target/virtio-disk.img");
+    if !disk.exists() {
+        let file = std::fs::File::create(disk)?;
+        file.set_len(16 * 1024 * 1024)?;
+    }
+    let disk_drive = format!(
+        "if=none,id=vblk,format=raw,file={}",
+        qemu_path(&std::fs::canonicalize(disk)?)
+    );
+    // `disable-legacy=on` forces the virtio 1.0 transport, whose configuration
+    // structures live in memory BARs. The legacy transport puts them in a port
+    // BAR, and PCI port windows are assigned above 0x400 — outside the I/O
+    // permission bitmap, and so unreachable from ring 3 by construction. Modern
+    // virtio fits the mechanism that already exists; legacy would need the
+    // bitmap widened to cover every port, which is what `portauth.rs` argues
+    // against at length.
+    let disk_device = "virtio-blk-pci,drive=vblk,disable-legacy=on,disable-modern=off";
+
     // Headless when capturing, windowed when a person is watching. The kernel
     // draws its console to the framebuffer as well as the serial port, so the
     // window is not decoration — it is the same log, on the display the
@@ -378,6 +400,10 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
             &vars_drive,
             "-drive",
             &fat_drive,
+            "-drive",
+            &disk_drive,
+            "-device",
+            disk_device,
             "-serial",
             &serial_arg,
             "-display",
@@ -521,6 +547,15 @@ const REQUIRED_LINES: &[&str] = &[
     "[kernel] pid 1 granted 2 port(s) from 0x70",
     "[init 1] granted the rtc's ports, driving it from ring 3",
     "[init 1] woken by hardware 3 time(s)",
+    // A real PCI device, found by walking the bus and driven from ring 3. The
+    // capacity is the part that cannot be faked: it comes from the device's own
+    // configuration structure, at an offset the kernel took out of PCI
+    // capability space, and 0x8000 sectors of 512 bytes is exactly the 16 MiB
+    // file this file attaches — a number neither side hardcodes twice.
+    "[kernel] virtio-blk is device 2",
+    "[init 1] disk ready from ring 3: 0x0000000000008000 sectors",
+    "[init 2] no disk grant, as expected",
+    "[init 3] no disk grant, as expected",
     // And a process with no grant cannot wait on a line it was not given, which
     // is what stops "wait for an interrupt" from being a way to observe a
     // device somebody else owns.

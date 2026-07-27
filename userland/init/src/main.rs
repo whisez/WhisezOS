@@ -24,9 +24,9 @@
 mod abi;
 
 use abi::{
-    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO,
-    SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE,
-    SYS_REPLY,
+    decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
+    SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG,
+    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -231,6 +231,9 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
     // The other half of driving a device: the device answering.
     await_interrupts(pid, grant);
 
+    // --- a real PCI device ------------------------------------------------
+    probe_disk(pid, grant);
+
     // --- talking to another process ---------------------------------------
     if endpoint != 0 {
         if pid == SERVER_ROLE {
@@ -250,6 +253,203 @@ const SERVER_ROLE: u64 = 1;
 
 /// The device index of the ticker, which is the second entry the kernel lists.
 const TICKER_DEVICE: u64 = 1;
+
+/// The device index of the virtio disk, which the PCI scan appends third.
+const BLOCK_DEVICE: u64 = 2;
+
+/// Offsets in the virtio common configuration structure (virtio 1.0 §4.1.4.3).
+mod common {
+    pub const DEVICE_FEATURE_SELECT: u32 = 0x00;
+    pub const DEVICE_FEATURE: u32 = 0x04;
+    pub const NUM_QUEUES: u32 = 0x12;
+    pub const DEVICE_STATUS: u32 = 0x14;
+}
+
+/// Device status bits (virtio 1.0 §2.1). Written in order; each one tells the
+/// device how far the driver has got, and the device may refuse to proceed if
+/// they arrive out of sequence.
+mod status {
+    /// The driver has noticed the device.
+    pub const ACKNOWLEDGE: u8 = 1;
+    /// The driver knows how to drive it.
+    pub const DRIVER: u8 = 2;
+    /// Set by the *device* when it has given up on the driver.
+    pub const FAILED: u8 = 128;
+}
+
+/// Bytes per sector, which virtio-blk fixes regardless of the disk's own
+/// geometry.
+const SECTOR_BYTES: u64 = 512;
+
+/// The size of the disk the build attaches, in bytes.
+///
+/// Checked rather than merely printed. A capacity read through a mapping that
+/// is subtly wrong — off by a page, pointing at the ISR structure — produces a
+/// plausible number, and only comparing it against a value chosen elsewhere
+/// turns "we read something" into "we read the right thing".
+const EXPECTED_DISK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// # Safety
+/// `address` must be inside a device window this process was given.
+unsafe fn mmio_read8(address: u64) -> u8 {
+    // SAFETY: the caller guarantees the mapping. Volatile because these are
+    // device registers with side effects, not memory.
+    unsafe { (address as *const u8).read_volatile() }
+}
+
+/// # Safety
+/// As `mmio_read8`.
+unsafe fn mmio_read16(address: u64) -> u16 {
+    // SAFETY: as above.
+    unsafe { (address as *const u16).read_volatile() }
+}
+
+/// # Safety
+/// As `mmio_read8`.
+unsafe fn mmio_read32(address: u64) -> u32 {
+    // SAFETY: as above.
+    unsafe { (address as *const u32).read_volatile() }
+}
+
+/// # Safety
+/// As `mmio_read8`, and a write to a device register does something.
+unsafe fn mmio_write8(address: u64, value: u8) {
+    // SAFETY: as above.
+    unsafe { (address as *mut u8).write_volatile(value) }
+}
+
+/// # Safety
+/// As `mmio_write8`.
+unsafe fn mmio_write32(address: u64, value: u32) {
+    // SAFETY: as above.
+    unsafe { (address as *mut u32).write_volatile(value) }
+}
+
+/// Brings a real PCI device up to the point where a queue could be created.
+///
+/// This is the first three steps of the virtio initialisation sequence, done
+/// from ring 3 on hardware the kernel found and mapped but does not understand.
+/// The kernel knows this device is virtio type 2 and where its four structures
+/// are; it does not know what a status register is, and nothing here goes
+/// through it.
+///
+/// The capacity read at the end is the part that cannot be faked. It comes from
+/// the device-specific configuration structure, at an offset the kernel took
+/// out of PCI capability space, and it has to equal the size of the file the
+/// build attached — which is decided in `xtask` and known to neither side.
+fn probe_disk(pid: u64, grant: u64) {
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+
+    match call5(
+        SYS_DEVICE_INFO,
+        grant,
+        BLOCK_DEVICE,
+        (&raw mut info) as u64,
+        size,
+        0,
+    ) {
+        Ok(_) => {}
+        Err(SyscallError::NotPermitted) => {
+            say(pid, &[b"no disk grant, as expected"]);
+            return;
+        }
+        Err(error) => {
+            say(pid, &[b"disk info failed: ", error.name().as_bytes()]);
+            exit(20);
+        }
+    }
+
+    if info.kind != DeviceKind::Block as u32 {
+        say(pid, &[b"device 2 is not a block device"]);
+        exit(21);
+    }
+
+    let window = match call(SYS_MAP_DEVICE, grant, BLOCK_DEVICE) {
+        Ok(base) => base,
+        Err(error) => {
+            say(pid, &[b"disk map failed: ", error.name().as_bytes()]);
+            exit(22);
+        }
+    };
+
+    let common = window + u64::from(info.common_offset);
+    let config = window + u64::from(info.config_offset);
+
+    // SAFETY: `window` is a device mapping the kernel just gave this process,
+    // and every offset below came from the same call that described it.
+    unsafe {
+        // Reset. Writing zero to the status register is how a driver tells a
+        // virtio device to forget whatever the firmware did with it, and the
+        // device answering with zero is the first evidence the mapping reaches
+        // the device at all rather than reading back stale bytes.
+        mmio_write8(common + u64::from(common::DEVICE_STATUS), 0);
+        if mmio_read8(common + u64::from(common::DEVICE_STATUS)) != 0 {
+            say(pid, &[b"disk did not accept a reset"]);
+            exit(23);
+        }
+
+        // Two steps of the handshake, each read back. A mapping that was
+        // write-only, or pointed at the wrong structure, would fail here.
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE,
+        );
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER,
+        );
+        let state = mmio_read8(common + u64::from(common::DEVICE_STATUS));
+        if state != status::ACKNOWLEDGE | status::DRIVER {
+            say(pid, &[b"disk refused the handshake"]);
+            exit(24);
+        }
+        if state & status::FAILED != 0 {
+            say(pid, &[b"disk gave up on this driver"]);
+            exit(25);
+        }
+
+        // A read that depends on a write: selecting feature word 0 and reading
+        // what comes back. If the window were mapped read-only, or the writes
+        // were going somewhere else, this would not track the selector.
+        mmio_write32(common + u64::from(common::DEVICE_FEATURE_SELECT), 0);
+        let low = mmio_read32(common + u64::from(common::DEVICE_FEATURE));
+        mmio_write32(common + u64::from(common::DEVICE_FEATURE_SELECT), 1);
+        let high = mmio_read32(common + u64::from(common::DEVICE_FEATURE));
+        if low == high {
+            // Not impossible in principle, but for QEMU's virtio-blk the two
+            // words differ, and equal ones mean the selector was ignored.
+            say(pid, &[b"disk feature selector had no effect"]);
+            exit(26);
+        }
+
+        let queues = mmio_read16(common + u64::from(common::NUM_QUEUES));
+        if queues == 0 {
+            say(pid, &[b"disk reports no queues"]);
+            exit(27);
+        }
+
+        // The capacity, in 512-byte sectors, from the device-specific
+        // structure. Read as two halves because the field is not guaranteed
+        // aligned for a 64-bit access on every device.
+        let sectors = u64::from(mmio_read32(config)) | u64::from(mmio_read32(config + 4)) << 32;
+        let bytes = sectors * SECTOR_BYTES;
+        if bytes != EXPECTED_DISK_BYTES {
+            say(pid, &[b"disk capacity is not the size the build attached"]);
+            exit(28);
+        }
+
+        let mut buffer = [0u8; 18];
+        say(
+            pid,
+            &[
+                b"disk ready from ring 3: ",
+                hex(sectors, &mut buffer),
+                b" sectors",
+            ],
+        );
+    }
+}
 
 /// Interrupts to wait for before moving on.
 ///
@@ -361,18 +561,6 @@ fn await_interrupts(pid: u64, grant: u64) {
     say(pid, &[b"woken by hardware ", &digit, b" time(s)"]);
 }
 
-/// What `SYS_ALLOC_DMA` writes. The kernel's `dma::DmaRegion`, same size, for
-/// the same reason as `DeviceInfo` below.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct DmaRegion {
-    virt: u64,
-    bus: u64,
-    length: u64,
-}
-
-const _: () = assert!(core::mem::size_of::<DmaRegion>() == 24);
-
 /// Bytes to ask for. Not a round number of pages, deliberately: the reply has
 /// to be the rounded-up mapping rather than the request, and a request that was
 /// already page-aligned would not tell the two apart.
@@ -388,11 +576,7 @@ const DMA_REQUEST_BYTES: u64 = 5000;
 /// which is the part a mapping with the wrong permissions or the wrong physical
 /// frames cannot fake.
 fn take_dma_buffer(pid: u64) {
-    let mut region = DmaRegion {
-        virt: 0,
-        bus: 0,
-        length: 0,
-    };
+    let mut region = DmaRegion::EMPTY;
     let size = core::mem::size_of::<DmaRegion>() as u64;
 
     match call5(
@@ -450,42 +634,13 @@ fn take_dma_buffer(pid: u64) {
     say(pid, &[b"dma buffer verified, zeroed and writable"]);
 }
 
-/// What `SYS_DEVICE_INFO` writes. The layout is the kernel's `DeviceInfo`, and
-/// like the syscall numbers it is one definition compiled by both sides — this
-/// copy exists because the kernel's is behind a module user space does not
-/// include, and the `assert` below is what keeps them the same size.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct DeviceInfo {
-    kind: u32,
-    _pad: u32,
-    length: u64,
-    width: u32,
-    height: u32,
-    stride: u32,
-    bytes_per_pixel: u32,
-}
-
-const _: () = assert!(core::mem::size_of::<DeviceInfo>() == 32);
-
-/// `DeviceKind::Framebuffer`.
-const DEVICE_FRAMEBUFFER: u32 = 1;
-
 /// Maps the framebuffer and draws on it, from ring 3.
 ///
 /// This is the first time anything outside the kernel touches hardware. The
 /// process never names a physical address: it asks for device zero, and the
 /// kernel — which is the only thing that knows where device zero is — maps it.
 fn drive_display(pid: u64, grant: u64) {
-    let mut info = DeviceInfo {
-        kind: 0,
-        _pad: 0,
-        length: 0,
-        width: 0,
-        height: 0,
-        stride: 0,
-        bytes_per_pixel: 0,
-    };
+    let mut info = DeviceInfo::EMPTY;
     let size = core::mem::size_of::<DeviceInfo>() as u64;
 
     match call5(SYS_DEVICE_INFO, grant, 0, (&raw mut info) as u64, size, 0) {
@@ -501,7 +656,7 @@ fn drive_display(pid: u64, grant: u64) {
         }
     }
 
-    if info.kind != DEVICE_FRAMEBUFFER || info.bytes_per_pixel != 4 {
+    if info.kind != DeviceKind::Framebuffer as u32 || info.bytes_per_pixel != 4 {
         say(pid, &[b"device 0 is not a framebuffer this driver knows"]);
         return;
     }

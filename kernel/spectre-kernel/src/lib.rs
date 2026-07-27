@@ -75,9 +75,106 @@ pub mod roundrobin;
 pub mod syscall;
 pub mod task;
 pub mod usercopy;
+pub mod virtio;
 pub mod vmspace;
 
 pub use boot_info::BootInfo;
+
+/// Registers a virtio block device found on the bus, if this is one.
+///
+/// Called once per device the scan reports. Everything it decides is either
+/// PCI or virtio generic — it does not know what a disk is, only that this
+/// device says it is virtio type 2 and where it keeps its registers.
+///
+/// # What it writes
+///
+/// Two bits in the command register. `MEMORY_SPACE` makes the device answer to
+/// accesses in its own BARs, which firmware usually sets but is not obliged to;
+/// `BUS_MASTER` lets it read the memory a driver gives it, without which every
+/// DMA the driver sets up is silently ignored. Neither is something a driver
+/// could set for itself, because both are in configuration space.
+fn register_virtio_block(
+    address: pci::Address,
+    header: &pci::Header,
+    space: &mut arch::PortConfigSpace,
+) {
+    use pci::ConfigSpace;
+
+    if !virtio::is_virtio(header, virtio::TYPE_BLOCK) {
+        return;
+    }
+
+    // Size every BAR once. The layout walk needs to check each region against
+    // the BAR holding it, and sizing is destructive enough that doing it twice
+    // is worth avoiding.
+    let mut sizes = [None; 6];
+    let mut bases = [0u64; 6];
+    let mut index = 0usize;
+    while index < 6 {
+        // SAFETY: bring-up, interrupts disabled, no driver exists yet — which
+        // is what makes the probe-and-restore safe.
+        let Some(bar) = (unsafe { pci::bar(space, address, index) }) else {
+            break;
+        };
+        if let pci::Bar::Memory { base, size, .. } = bar {
+            if size != 0 {
+                sizes[index] = Some(size);
+                bases[index] = base;
+            }
+        }
+        index += bar.slots_consumed();
+    }
+
+    let mut capabilities = [pci::Capability { id: 0, offset: 0 }; 16];
+    // SAFETY: as above.
+    let found = unsafe { pci::capabilities(space, address, header, &mut capabilities) };
+
+    // SAFETY: as above.
+    let layout = match unsafe {
+        virtio::layout(space, address, &capabilities[..found], |bar| {
+            sizes.get(bar as usize).copied().flatten()
+        })
+    } {
+        Ok(layout) => layout,
+        Err(error) => {
+            kprintln!("[kernel] virtio-blk layout rejected: {error:?}");
+            return;
+        }
+    };
+
+    // Every structure in one BAR is what QEMU produces and all the mapper can
+    // express — a device window is one contiguous range. A device spreading
+    // them across BARs is legal and would need several windows, which is work
+    // for a device that behaves that way rather than for one that might.
+    let bars = layout.bars_used();
+    if bars.count_ones() != 1 {
+        kprintln!("[kernel] virtio-blk spreads its registers across {bars:#b}, not supported");
+        return;
+    }
+    let bar = bars.trailing_zeros() as usize;
+    let (Some(size), base) = (sizes[bar], bases[bar]) else {
+        return;
+    };
+
+    // SAFETY: as above. Enabling the two bits a driver cannot set for itself.
+    unsafe {
+        let command = space.read(address, pci::offset::COMMAND);
+        space.write(
+            address,
+            pci::offset::COMMAND,
+            command | u32::from(pci::command::MEMORY_SPACE | pci::command::BUS_MASTER),
+        );
+    }
+
+    match device::add_block(base, size, &layout, device::TICKER_LINE) {
+        Some(index) => kprintln!(
+            "[kernel] virtio-blk is device {index}: bar {bar} at {base:#x}, {} KiB, irq {}",
+            size >> 10,
+            header.interrupt_line
+        ),
+        None => kprintln!("[kernel] device table full, virtio-blk not listed"),
+    }
+}
 
 /// Kernel entry, called from the loader's handoff trampoline with the verified
 /// memory map and framebuffer.
@@ -134,18 +231,21 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     kprintln!("[kernel] endpoint created for pid=1");
 
     // The device grant. Drawn from the same generator as endpoint handles, and
-    // handed to exactly one process — the display driver — so every other
-    // process holds zero and zero never matches.
+    // handed to exactly one process — the driver — so every other process holds
+    // zero and zero never matches.
+    let grant = channel::issue_token();
+    let devices = device::init(boot, grant);
+
     // What is actually in the machine. Everything past the framebuffer is on
     // the PCI bus and invisible until somebody walks it, and walking it is
     // kernel work by construction: configuration space lives behind ports that
     // `portauth.rs` keeps out of the I/O bitmap on purpose.
-    // SAFETY: bring-up, interrupts disabled, before any driver exists.
-    let on_bus = unsafe { arch::scan_pci(|_address, _header, _space| {}) };
+    //
+    // The table has to exist first — this adds to it.
+    // SAFETY: bring-up, interrupts disabled, before any driver exists, which is
+    // what BAR sizing requires.
+    let on_bus = unsafe { arch::scan_pci(register_virtio_block) };
     kprintln!("[kernel] {on_bus} pci device(s) on bus 0");
-
-    let grant = channel::issue_token();
-    let devices = device::init(boot, grant);
     kprintln!("[kernel] {devices} device(s) listed, grant issued to pid=1");
 
     // One respawn, into whichever slot the first reap empties. It is what turns
