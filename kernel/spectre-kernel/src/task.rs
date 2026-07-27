@@ -64,6 +64,9 @@ struct Process {
     regions: [UserRegion; MAX_USER_REGIONS],
     region_count: usize,
     exit_code: u64,
+    /// DMA buffers this process holds, which is both its next slot number and
+    /// the limit it is checked against.
+    dma_regions: u64,
     /// Device mappings this process has taken, so a second request for the same
     /// device does not map it twice.
     devices_mapped: u64,
@@ -86,6 +89,7 @@ impl Process {
         regions: [UserRegion::new(0, 0); MAX_USER_REGIONS],
         region_count: 0,
         exit_code: 0,
+        dma_regions: 0,
         devices_mapped: 0,
     };
 
@@ -279,6 +283,7 @@ pub fn admit(image: &UserProcess, argument: u64, second: u64, third: u64) -> Opt
         regions,
         region_count: supplied.len(),
         exit_code: 0,
+        dma_regions: 0,
         devices_mapped: 0,
     };
     Some(pid)
@@ -326,6 +331,39 @@ pub fn devices_mapped() -> u64 {
     table.slots[table.current].devices_mapped
 }
 
+/// Records a DMA buffer the running process has just been given.
+///
+/// The same bookkeeping as `record_device_mapping` and for the same reason —
+/// the range has to become a permitted region or the process cannot pass a
+/// pointer into its own buffer to any other call — but counted separately,
+/// because the two windows have separate slot numbering and sharing a counter
+/// would place the second buffer in the slot the first device took.
+///
+/// Returns the slot the buffer used, or `None` when the process has taken as
+/// many as it may.
+pub fn record_dma_mapping(base: u64, length: u64) -> Option<u64> {
+    let mut table = TABLE.lock();
+    let current = table.current;
+    let process = &mut table.slots[current];
+    if process.region_count == MAX_USER_REGIONS
+        || process.dma_regions >= crate::dma::MAX_DMA_REGIONS
+    {
+        return None;
+    }
+    let slot = process.dma_regions;
+    process.regions[process.region_count] = UserRegion::new(base, length);
+    process.region_count += 1;
+    process.dma_regions += 1;
+    Some(slot)
+}
+
+/// How many DMA buffers the running process already holds.
+#[must_use]
+pub fn dma_regions() -> u64 {
+    let table = TABLE.lock();
+    table.slots[table.current].dma_regions
+}
+
 /// The running process's top-level page table.
 ///
 /// Needed by IPC: a message delivered later has to be written through the
@@ -360,12 +398,12 @@ pub unsafe fn block_current(frame: &TrapFrame) -> ! {
         table.slots[current].frame = *frame;
         table.slots[current].state = State::Blocked;
     }
-    // SAFETY: the caller''s state is saved, so resuming somebody else loses
+    // SAFETY: the caller's state is saved, so resuming somebody else loses
     // nothing.
     unsafe { resume_next() }
 }
 
-/// Makes a blocked process runnable again, with `result` as its call''s return.
+/// Makes a blocked process runnable again, with `result` as its call's return.
 ///
 /// Returns false if the pid names nothing blocked, which is a bug in the caller
 /// rather than something to recover from — but reporting it beats corrupting a

@@ -24,8 +24,8 @@
 mod abi;
 
 use abi::{
-    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_LOG,
-    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO,
+    SYS_EXIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -216,6 +216,11 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
         say(pid, &[b"round ", &digit]);
     }
 
+    // --- memory a device could read ---------------------------------------
+    // Unlike a device mapping, this needs no grant: a process asking for its
+    // own buffer is asking for nothing that belongs to anyone else.
+    take_dma_buffer(pid);
+
     // --- driving a device -------------------------------------------------
     // Only the process the kernel gave a grant to gets past the first call.
     // Everything else here holds zero, and zero never matches.
@@ -237,6 +242,95 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
 /// The process that owns the endpoint. Given the endpoint by the kernel at
 /// spawn; every other process is a client.
 const SERVER_ROLE: u64 = 1;
+
+/// What `SYS_ALLOC_DMA` writes. The kernel's `dma::DmaRegion`, same size, for
+/// the same reason as `DeviceInfo` below.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DmaRegion {
+    virt: u64,
+    bus: u64,
+    length: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<DmaRegion>() == 24);
+
+/// Bytes to ask for. Not a round number of pages, deliberately: the reply has
+/// to be the rounded-up mapping rather than the request, and a request that was
+/// already page-aligned would not tell the two apart.
+const DMA_REQUEST_BYTES: u64 = 5000;
+
+/// Asks for a DMA buffer and proves it is real memory this process owns.
+///
+/// Three things are checked, and each one fails differently if the kernel got
+/// it wrong. The mapping must cover what was asked for — a kernel that returned
+/// the request unrounded would hand back a buffer whose last bytes are not
+/// mapped. It must arrive zeroed, because a buffer still holding a previous
+/// owner's bytes is a disclosure. And it must survive a write and a read back,
+/// which is the part a mapping with the wrong permissions or the wrong physical
+/// frames cannot fake.
+fn take_dma_buffer(pid: u64) {
+    let mut region = DmaRegion {
+        virt: 0,
+        bus: 0,
+        length: 0,
+    };
+    let size = core::mem::size_of::<DmaRegion>() as u64;
+
+    match call5(
+        SYS_ALLOC_DMA,
+        DMA_REQUEST_BYTES,
+        (&raw mut region) as u64,
+        size,
+        0,
+        0,
+    ) {
+        Ok(_) => {}
+        Err(error) => {
+            say(pid, &[b"dma refused: ", error.name().as_bytes()]);
+            exit(11);
+        }
+    }
+
+    if region.length < DMA_REQUEST_BYTES {
+        say(pid, &[b"dma buffer is smaller than requested"]);
+        exit(12);
+    }
+    // A bus address of zero would mean the kernel mapped page zero, and an
+    // unaligned one would mean it handed over something that is not a frame.
+    if region.bus == 0 || !region.bus.is_multiple_of(4096) {
+        say(pid, &[b"dma bus address is not a frame"]);
+        exit(13);
+    }
+
+    let buffer = region.virt as *mut u8;
+    // Both ends, because a mapping that is short is a mapping whose last page
+    // faults — and the fault would be at the end, not the beginning.
+    let probes = [0usize, (region.length - 1) as usize];
+
+    for &offset in &probes {
+        // SAFETY: the kernel reported this range as mapped and writable for
+        // this process, and `offset` is inside `region.length`.
+        if unsafe { buffer.add(offset).read_volatile() } != 0 {
+            say(pid, &[b"dma buffer arrived with somebody else's bytes"]);
+            exit(14);
+        }
+    }
+
+    for (index, &offset) in probes.iter().enumerate() {
+        let value = 0xA5u8 ^ index as u8;
+        // SAFETY: as above; the range was just read successfully.
+        unsafe {
+            buffer.add(offset).write_volatile(value);
+            if buffer.add(offset).read_volatile() != value {
+                say(pid, &[b"dma buffer did not keep what was written"]);
+                exit(15);
+            }
+        }
+    }
+
+    say(pid, &[b"dma buffer verified, zeroed and writable"]);
+}
 
 /// What `SYS_DEVICE_INFO` writes. The layout is the kernel's `DeviceInfo`, and
 /// like the syscall numbers it is one definition compiled by both sides — this

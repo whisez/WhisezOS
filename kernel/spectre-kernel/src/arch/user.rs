@@ -23,6 +23,7 @@
 //! it anyway, and catching it here names the segment.
 
 use crate::abi;
+use crate::device;
 use crate::elf::{Elf64, ElfError};
 use crate::usercopy::UserRegion;
 
@@ -255,6 +256,24 @@ pub unsafe fn load(image: &[u8], kernel_root: PhysAddr) -> Result<UserProcess, U
 /// it, so a device mapping can never land on something the process already has.
 pub const DEVICE_WINDOW_BASE: u64 = 0x0000_2000_0000_0000;
 
+/// Address space reserved per device, whatever the device's real size.
+///
+/// The window is carved into fixed slots rather than packed, so a second
+/// mapping cannot be placed by arithmetic that depends on the first — and a
+/// process cannot infer one device's size from another's address.
+pub const DEVICE_SLOT_SIZE: u64 = 256 * 1024 * 1024;
+
+/// The two user windows must not meet.
+///
+/// `dma.rs` reasons about this and asserts it against its own copy of the base,
+/// because that file is host-testable and this one is not. This is the check
+/// that the copy is the real number: if either window moves, one of the two
+/// fails, and between them they cover both halves of the claim.
+const _: () = assert!(
+    DEVICE_WINDOW_BASE + (device::MAX_DEVICES as u64) * DEVICE_SLOT_SIZE
+        < crate::dma::DMA_WINDOW_BASE
+);
+
 /// Maps a physical device range into a process, uncacheable.
 ///
 /// # Why the cache bits are not optional
@@ -284,9 +303,8 @@ pub unsafe fn map_device(
     // The window is carved into fixed slots rather than packed, so a second
     // mapping cannot be placed by arithmetic that depends on the first — and a
     // process cannot infer one device's size from another's address.
-    const SLOT_SIZE: u64 = 256 * 1024 * 1024;
-    let base = DEVICE_WINDOW_BASE + slot * SLOT_SIZE;
-    if length > SLOT_SIZE {
+    let base = DEVICE_WINDOW_BASE + slot * DEVICE_SLOT_SIZE;
+    if length > DEVICE_SLOT_SIZE {
         return Err(UserError::DestinationNotWritable { vaddr: phys });
     }
 
@@ -328,6 +346,70 @@ pub unsafe fn map_device(
     // did, offset included — a device whose registers start mid-page would
     // otherwise be off by that offset.
     Ok((base + (phys - first), last - first))
+}
+
+/// Allocates a DMA buffer and maps it into `root`.
+///
+/// Returns the virtual base and the physical base. The physical one goes on to
+/// user space, which is the concession `dma.rs` argues for; everything else
+/// about this is ordinary memory.
+///
+/// # What this is *not*
+///
+/// Not `NO_CACHE`. A device window is uncacheable because a stale read of a
+/// status register is a wrong answer; DMA memory is cache-coherent on x86-64 —
+/// the hardware snoops — so making it uncacheable would slow every access the
+/// driver makes for no correctness gain.
+///
+/// Not `DEVICE` either, which is the important one. That flag tells teardown to
+/// leave a leaf alone because the frames belong to hardware. These frames came
+/// from the allocator and must go back to it, so they are marked as what they
+/// are and the frame ledger stays balanced when the process exits.
+///
+/// # Safety
+/// `root` must be a live top-level table, and physical memory must be identity
+/// mapped so the zeroing below can reach the frames.
+pub unsafe fn map_dma(root: PhysAddr, plan: &crate::dma::Plan) -> Result<(u64, u64), UserError> {
+    let phys = memory::alloc_contiguous_frames(plan.pages, 1)?;
+
+    // Zeroed before the process can see it. A DMA buffer handed over with the
+    // previous owner's bytes still in it is a process reading memory it was
+    // never given, which is the same disclosure as an uninitialised page.
+    // SAFETY: `alloc_contiguous_frames` just returned these frames as unused,
+    // and the identity map covers them.
+    unsafe {
+        core::ptr::write_bytes(
+            phys.as_u64() as *mut u8,
+            0,
+            (plan.pages * PAGE_SIZE) as usize,
+        );
+    }
+
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+
+    let mut offset = 0u64;
+    while offset < plan.pages * PAGE_SIZE {
+        let frame = PhysAddr::new(phys.as_u64() + offset).map_err(|_| {
+            UserError::DestinationNotWritable {
+                vaddr: phys.as_u64() + offset,
+            }
+        })?;
+        memory::with_table_access(|access| {
+            paging::map_page(
+                access,
+                root,
+                VirtAddr::from_indices_sign_extended(plan.base + offset, PagingMode::Level4),
+                frame,
+                flags,
+                PageSize::Small,
+                PagingMode::Level4,
+            )
+            .map_err(MemoryError::Page)
+        })?;
+        offset += PAGE_SIZE;
+    }
+
+    Ok((plan.base, phys.as_u64()))
 }
 
 /// Copies bytes into another process's address space.

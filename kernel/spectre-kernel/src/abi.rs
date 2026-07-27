@@ -78,6 +78,16 @@ pub const SYS_DEVICE_INFO: u64 = 6;
 /// than requests for other things being refused.
 pub const SYS_MAP_DEVICE: u64 = 7;
 
+/// Allocate a buffer a device can read and write.
+/// `(bytes, out_ptr, out_cap) -> bytes written`.
+///
+/// Returns a `DmaRegion` rather than a single value because the caller needs
+/// two addresses that are not derivable from one another: the one it uses and
+/// the one it programs into the device. See `dma.rs` for why the second exists
+/// at all, given that `SYS_MAP_DEVICE` exists precisely so physical addresses
+/// need not be spoken aloud.
+pub const SYS_ALLOC_DMA: u64 = 8;
+
 /// Longest message body, in either direction.
 ///
 /// The kernel holds one buffer of this size per endpoint, so it bounds kernel
@@ -321,6 +331,7 @@ mod tests {
         assert_eq!((SYS_LOG, SYS_EXIT, SYS_PING), (0, 1, 2));
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
         assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
+        assert_eq!(SYS_ALLOC_DMA, 8);
     }
 
     #[test]

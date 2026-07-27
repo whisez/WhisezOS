@@ -110,6 +110,9 @@ pub mod abi;
 #[path = "../../kernel/spectre-kernel/src/device.rs"]
 pub mod device;
 
+#[path = "../../kernel/spectre-kernel/src/dma.rs"]
+pub mod dma;
+
 #[path = "../../kernel/spectre-kernel/src/font.rs"]
 pub mod font;
 

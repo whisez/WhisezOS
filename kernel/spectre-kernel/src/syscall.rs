@@ -17,13 +17,14 @@
 //! holding a pointer to a process of its own.
 
 use crate::abi::{
-    SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_LOG,
-    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
+    SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
 use crate::channel::{self, Outcome};
 use crate::device;
+use crate::dma;
 use crate::kprintln;
 use crate::task;
 use crate::usercopy::validate_user_range;
@@ -66,6 +67,7 @@ pub fn handle(
         SYS_REPLY => blocking(channel::reply(task::current_pid(), a0, a1, a2), frame),
         SYS_DEVICE_INFO => sys_device_info(a0, a1, a2, a3),
         SYS_MAP_DEVICE => sys_map_device(a0, a1),
+        SYS_ALLOC_DMA => sys_alloc_dma(a0, a1, a2),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -175,6 +177,58 @@ fn sys_map_device(grant: u64, index: u64) -> Result<u64, SyscallError> {
         task::current_pid()
     );
     Ok(base)
+}
+
+/// `SYS_ALLOC_DMA(bytes, out_ptr, out_cap) -> bytes written`.
+///
+/// # Order of operations
+///
+/// Everything that can be refused is refused before a frame is taken. The plan
+/// validates the size and the slot, the capacity check and the pointer check
+/// come next, and only then is memory allocated — so a rejected request leaves
+/// the allocator exactly as it found it. The one step that cannot be moved
+/// earlier is recording the region, which needs the mapping to exist; if that
+/// fails the process is told, and the frames stay charged to it until it exits,
+/// at which point teardown reclaims them like any other page it owns.
+fn sys_alloc_dma(bytes: u64, ptr: u64, capacity: u64) -> Result<u64, SyscallError> {
+    let plan = dma::plan(task::dma_regions(), bytes)?;
+
+    let out_bytes = core::mem::size_of::<dma::DmaRegion>() as u64;
+    if capacity < out_bytes {
+        return Err(SyscallError::TooLong);
+    }
+    task::with_current_regions(|regions| validate_user_range(regions, ptr, out_bytes, out_bytes))?;
+
+    // SAFETY: `current_root` is the address space the calling process is running
+    // in, and `plan` was produced by the validator above.
+    let (virt, phys) = unsafe { arch::user::map_dma(task::current_root(), &plan) }
+        .map_err(|_| SyscallError::BadArgument)?;
+
+    if task::record_dma_mapping(virt, plan.length).is_none() {
+        return Err(SyscallError::TooLong);
+    }
+
+    let region = dma::DmaRegion {
+        virt,
+        bus: phys,
+        length: plan.length,
+    };
+    // SAFETY: the destination was validated against the running process's own
+    // regions, and its address space is the one in CR3.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const region).cast::<u8>(),
+            ptr as *mut u8,
+            out_bytes as usize,
+        );
+    }
+
+    kprintln!(
+        "[kernel] dma buffer for pid {}: {} bytes at {virt:#x}",
+        task::current_pid(),
+        plan.length
+    );
+    Ok(out_bytes)
 }
 
 /// `SYS_EXIT(code)`.

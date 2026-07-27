@@ -502,6 +502,14 @@ const REQUIRED_LINES: &[&str] = &[
     // is, let alone map it.
     "[init 2] no device grant, as expected",
     "[init 3] no device grant, as expected",
+    // Memory a device could read. Unlike a device mapping this needs no grant,
+    // so every process takes one — and each checks that what it got back is
+    // zeroed, writable, and at least as large as it asked for. A kernel that
+    // returned the unrounded request, or a page somebody else had been using,
+    // fails on the process that notices first rather than silently.
+    "[init 1] dma buffer verified, zeroed and writable",
+    "[init 2] dma buffer verified, zeroed and writable",
+    "[init 3] dma buffer verified, zeroed and writable",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.

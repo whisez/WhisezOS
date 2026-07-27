@@ -409,6 +409,21 @@ pub fn alloc_frame() -> Result<PhysAddr, MemoryError> {
         .map_err(MemoryError::Frame)
 }
 
+/// Allocates `count` physically contiguous frames.
+///
+/// Separate from `alloc_frame` because contiguity is not a property the ordinary
+/// path provides or needs — the page tables make scattered frames look
+/// contiguous to software, and only a device reading memory directly can tell
+/// the difference. This is for those.
+pub fn alloc_contiguous_frames(count: u64, align_frames: u64) -> Result<PhysAddr, MemoryError> {
+    ALLOCATOR
+        .lock()
+        .as_mut()
+        .ok_or(MemoryError::NotInitialised)?
+        .alloc_contiguous(count, align_frames)
+        .map_err(MemoryError::Frame)
+}
+
 /// Physical address of the active top-level table, once we own it.
 pub fn kernel_root() -> Option<PhysAddr> {
     *ROOT.lock()
