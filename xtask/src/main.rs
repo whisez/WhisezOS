@@ -69,6 +69,14 @@ enum Cmd {
         /// megabytes for itself, and the audit measures what is left.
         #[arg(long, default_value = "9G")]
         ram: String,
+        /// Send the serial log to a file instead of this terminal.
+        ///
+        /// `-serial stdio` needs a console, and QEMU refuses to start without
+        /// one — so a window launched from anything but an interactive shell
+        /// fails before it appears. This is the same run, with the log written
+        /// where it can be read afterwards.
+        #[arg(long)]
+        log: bool,
     },
     /// Boot the microkernel in QEMU headless and assert the serial log.
     BootTest,
@@ -87,7 +95,12 @@ fn main() -> Result<()> {
         Cmd::Image { out } => build_image(&out),
         Cmd::Run { machine, ram, gpu } => run_demo_qemu(&machine, &ram, &gpu),
         Cmd::Test => run_tests(),
-        Cmd::BootRun { machine, ram } => run_kernel_qemu(&machine, &ram, None),
+        Cmd::BootRun { machine, ram, log } => run_kernel_qemu(
+            &machine,
+            &ram,
+            log.then(|| Path::new("target/boot-serial.log")),
+            true,
+        ),
         Cmd::BootTest => boot_test(),
     }
 }
@@ -299,7 +312,13 @@ fn stage_boot_esp(dir: &Path) -> Result<()> {
 }
 
 /// Boots the production loader and kernel in QEMU with the serial port visible.
-fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>) -> Result<()> {
+/// Boots the production loader and kernel in QEMU.
+///
+/// `serial` chooses where the log goes: `None` means this terminal, which needs
+/// a console QEMU can attach to. `windowed` is separate because the two are
+/// independent — the boot test wants a file and no window, and a person
+/// launching from anything but an interactive shell wants both.
+fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bool) -> Result<()> {
     let esp = Path::new("target/boot-esp");
     stage_boot_esp(esp)?;
 
@@ -325,12 +344,14 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>) -> Result<()
     // draws its console to the framebuffer as well as the serial port, so the
     // window is not decoration — it is the same log, on the display the
     // firmware left running.
-    let (serial_arg, display) = match serial {
-        Some(path) => (
-            format!("file:{}", qemu_path(&std::path::absolute(path)?)),
-            "none",
-        ),
-        None => ("stdio".to_string(), "gtk,zoom-to-fit=on"),
+    let serial_arg = match serial {
+        Some(path) => format!("file:{}", qemu_path(&std::path::absolute(path)?)),
+        None => "stdio".to_string(),
+    };
+    let display = if windowed {
+        "gtk,zoom-to-fit=on"
+    } else {
+        "none"
     };
 
     run_path(
@@ -493,7 +514,12 @@ fn boot_test() -> Result<()> {
     // QEMU is left running by `-no-shutdown` so a failure can be inspected, so
     // the run is bounded from outside rather than waited on.
     let child = std::thread::spawn(|| {
-        run_kernel_qemu("q35", "9G", Some(Path::new("target/boot-serial.log")))
+        run_kernel_qemu(
+            "q35",
+            "9G",
+            Some(Path::new("target/boot-serial.log")),
+            false,
+        )
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
