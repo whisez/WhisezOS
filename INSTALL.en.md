@@ -130,6 +130,14 @@ interleaving is the proof that the processor was taken away by the 100 Hz LAPIC
 timer — neither process ever yields. The kernel reports the tick and context
 switch counts at the end.
 
+The processes also talk to each other. At boot the kernel creates one endpoint
+and hands its handle to every process; no process can name any other endpoint.
+The first process becomes the server and the rest clients: a client sends
+`WHISEZ-PING` and blocks, the server answers `WHISEZ-PONG`. That the reply is
+*transformed* is the point — the same buffer coming back would not prove the
+message had been read. Clients also try to receive on an endpoint they do not
+own, and are refused.
+
 When a process exits, the kernel walks its address space, frees its frames, and
 says so (`reaped pid=...`). A third process is then built out of those reclaimed
 frames in the slot that was freed (`respawned pid=...`) — a slot merely marked
@@ -144,7 +152,7 @@ To verify the same boot automatically:
 cargo xtask boot-test
 ```
 
-This runs QEMU headless, captures the serial log, and asserts that forty-one stages
+This runs QEMU headless, captures the serial log, and asserts that forty-nine stages
 appear. Only the causally ordered ones are checked in order; lines from
 different processes are concurrent and interleave differently on every boot, so
 presence is the only honest assertion about them. It also reads the context
@@ -156,9 +164,9 @@ not installed.
 > The production loader enforces the project's own 8 GiB memory floor and
 > refuses to boot a platform below it, which is why the VM is started with 9 GiB.
 
-> The system halts once every process has exited and been reaped: there is no
-> blocking call and no real IPC yet. This is a verifiable vertical slice, not a
-> finished operating system.
+> The system halts once every process has exited and been reaped. This is a
+> verifiable vertical slice, not a finished operating system: there is still no
+> storage, no network, no real desktop, and no signature verification.
 
 > The VM is started with `-cpu qemu64,+x2apic`. QEMU's default CPU model has no
 > x2APIC, and the kernel drives the local APIC through its MSR interface rather

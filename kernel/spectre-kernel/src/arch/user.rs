@@ -73,6 +73,10 @@ pub enum UserError {
     TooManyRegions,
     /// No init image in the handoff.
     NoImage,
+    /// A cross-space copy targeted a page the owning process may not write.
+    DestinationNotWritable {
+        vaddr: u64,
+    },
 }
 
 impl From<MemoryError> for UserError {
@@ -243,6 +247,68 @@ pub unsafe fn load(image: &[u8], kernel_root: PhysAddr) -> Result<UserProcess, U
         regions,
         region_count,
     })
+}
+
+/// Copies bytes into another process's address space.
+///
+/// The kernel is running on some *other* address space when a message is
+/// delivered — the sender's, usually — so the destination is reached by walking
+/// the target's own page tables and writing through the identity map. That is
+/// also the only way to do it without mapping two user spaces at once.
+///
+/// # Why the permissions are re-checked here
+///
+/// The target validated this range against its own regions when it made the
+/// call, which establishes that the address belongs to it. It does not
+/// establish that the address is *writable*: a process can perfectly well pass
+/// a pointer into its own read-only text. Writing through the identity map
+/// bypasses the user mapping's permissions entirely, so a kernel that did not
+/// check here would let any process have its own `W^X` guarantee broken on
+/// request.
+///
+/// # Safety
+/// `root` must be a live top-level table for a process that is not running, and
+/// physical memory must be identity mapped.
+pub unsafe fn copy_into_space(root: PhysAddr, virt: u64, bytes: &[u8]) -> Result<(), UserError> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let address = virt + written as u64;
+        let translation = memory::with_table_access(|access| {
+            paging::translate(
+                access,
+                root,
+                VirtAddr::from_indices_sign_extended(address, PagingMode::Level4),
+                PagingMode::Level4,
+            )
+            .map_err(MemoryError::Page)
+        })?;
+
+        if !translation.flags.contains(PageFlags::WRITABLE)
+            || !translation.flags.contains(PageFlags::USER)
+        {
+            return Err(UserError::DestinationNotWritable { vaddr: address });
+        }
+
+        // Stop at the end of the page the translation resolved to; the next
+        // one may be somewhere else entirely.
+        let page_bytes = translation.size.bytes();
+        let offset_in_page = address & (page_bytes - 1);
+        let room = (page_bytes - offset_in_page) as usize;
+        let take = room.min(bytes.len() - written);
+
+        // SAFETY: the destination is a physical address inside a page the
+        // target owns and may write, identity mapped, and `take` is bounded by
+        // the remaining space in that page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(written),
+                translation.phys.as_u64() as *mut u8,
+                take,
+            );
+        }
+        written += take;
+    }
+    Ok(())
 }
 
 /// Page flags for one loadable segment.

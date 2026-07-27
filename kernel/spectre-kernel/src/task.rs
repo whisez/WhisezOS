@@ -41,6 +41,10 @@ pub enum State {
     /// Runnable, not currently on a processor.
     Ready,
     Running,
+    /// Waiting on IPC. Its saved frame is the system call that blocked; waking
+    /// it means writing the result into that frame's `rax` and marking it
+    /// `Ready`, so it returns from the call as if it had never stopped.
+    Blocked,
     /// Called `SYS_EXIT`, and waiting to be reaped. The next tick frees its
     /// address space and returns the slot to `Empty`; until then it must not be
     /// scheduled, because its frame describes a process that has finished.
@@ -60,6 +64,14 @@ struct Process {
     regions: [UserRegion; MAX_USER_REGIONS],
     region_count: usize,
     exit_code: u64,
+}
+
+impl State {
+    /// Still a process, whether or not it can run right now.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Ready | Self::Running | Self::Blocked)
+    }
 }
 
 impl Process {
@@ -98,6 +110,7 @@ impl Table {
                 State::Empty => Slot::Empty,
                 State::Ready => Slot::Ready,
                 State::Running => Slot::Running,
+                State::Blocked => Slot::Blocked,
                 State::Exited => Slot::Exited,
             };
         }
@@ -135,6 +148,8 @@ struct Spawner {
     /// a real system would spawn on request rather than on a budget.
     remaining: u32,
     next_argument: u64,
+    /// The endpoint every process is introduced to.
+    endpoint: u64,
 }
 
 static SPAWNER: Mutex<Option<Spawner>> = Mutex::new(None);
@@ -152,6 +167,7 @@ pub unsafe fn arm_respawn(
     kernel_root: PhysAddr,
     count: u32,
     first_argument: u64,
+    endpoint: u64,
 ) {
     *SPAWNER.lock() = Some(Spawner {
         image_phys: image.as_ptr() as u64,
@@ -159,6 +175,7 @@ pub unsafe fn arm_respawn(
         kernel_root,
         remaining: count,
         next_argument: first_argument,
+        endpoint,
     });
 }
 
@@ -189,9 +206,10 @@ fn try_spawn() {
             spawner.image_len,
             spawner.kernel_root,
             argument,
+            spawner.endpoint,
         )
     };
-    let (phys, len, kernel_root, argument) = plan;
+    let (phys, len, kernel_root, argument, endpoint) = plan;
 
     // SAFETY: the image is in loader memory, identity mapped and never
     // reclaimed; `arm_respawn` recorded a slice that was live then and cannot
@@ -207,7 +225,7 @@ fn try_spawn() {
             return;
         }
     };
-    match admit(&process, argument) {
+    match admit(&process, argument, endpoint) {
         Some(pid) => kprintln!("[kernel] respawned pid={pid} into a reclaimed slot"),
         None => kprintln!("[kernel] respawn found no free slot"),
     }
@@ -219,7 +237,7 @@ fn try_spawn() {
 /// process entered this way sees it as the first parameter of `_start`. It is
 /// the whole of a process's initial environment right now, and it is how two
 /// instances of the same image tell themselves apart.
-pub fn admit(image: &UserProcess, argument: u64) -> Option<u64> {
+pub fn admit(image: &UserProcess, argument: u64, second: u64) -> Option<u64> {
     let (layout, _, _) = (*PLATFORM.lock())?;
     let mut table = TABLE.lock();
     let slot = table.slots.iter().position(|p| p.state == State::Empty)?;
@@ -235,6 +253,10 @@ pub fn admit(image: &UserProcess, argument: u64) -> Option<u64> {
     // kernel runs forever.
     frame.rflags = 0x202;
     frame.rdi = argument;
+    // The second System V argument register. Two values are the whole of a
+    // process's initial environment: who it is, and the one endpoint it was
+    // introduced to. A process cannot name any other.
+    frame.rsi = second;
 
     let mut regions = [UserRegion::new(0, 0); MAX_USER_REGIONS];
     let supplied = image.regions();
@@ -265,10 +287,140 @@ pub fn with_current_regions<R>(f: impl FnOnce(&[UserRegion]) -> R) -> R {
     }
 }
 
+/// The running process's top-level page table.
+///
+/// Needed by IPC: a message delivered later has to be written through the
+/// recipient's tables, so the sender's identity and address space are recorded
+/// while it is still the one running.
+#[must_use]
+pub fn current_root() -> PhysAddr {
+    let table = TABLE.lock();
+    table.slots[table.current].root
+}
+
 #[must_use]
 pub fn current_pid() -> u64 {
     let table = TABLE.lock();
     table.slots[table.current].pid
+}
+
+/// Parks the running process and resumes something else. Does not return.
+///
+/// `frame` is the system call that is blocking, saved exactly as it stands, so
+/// waking the process later is a matter of writing a result into its `rax` and
+/// marking it runnable — it then returns from the call having noticed only that
+/// time passed.
+///
+/// # Safety
+/// Called from a system call, with interrupts disabled, on the syscall stack.
+/// Nothing on that stack is reachable afterwards.
+pub unsafe fn block_current(frame: &TrapFrame) -> ! {
+    {
+        let mut table = TABLE.lock();
+        let current = table.current;
+        table.slots[current].frame = *frame;
+        table.slots[current].state = State::Blocked;
+    }
+    // SAFETY: the caller''s state is saved, so resuming somebody else loses
+    // nothing.
+    unsafe { resume_next() }
+}
+
+/// Makes a blocked process runnable again, with `result` as its call''s return.
+///
+/// Returns false if the pid names nothing blocked, which is a bug in the caller
+/// rather than something to recover from — but reporting it beats corrupting a
+/// frame that belongs to a different process in a reused slot.
+pub fn wake(pid: u64, result: u64) -> bool {
+    let mut table = TABLE.lock();
+    let Some(slot) = table
+        .slots
+        .iter()
+        .position(|p| p.pid == pid && p.state == State::Blocked)
+    else {
+        return false;
+    };
+    table.slots[slot].frame.rax = result;
+    table.slots[slot].state = State::Ready;
+    true
+}
+
+/// Whether a pid names a live process.
+#[must_use]
+pub fn is_live(pid: u64) -> bool {
+    TABLE
+        .lock()
+        .slots
+        .iter()
+        .any(|p| p.pid == pid && p.state.is_live())
+}
+
+/// Picks the next runnable process and resumes it. Does not return.
+///
+/// Shared by every path that gives the processor away outside the timer: the
+/// caller has already recorded whatever state it needed to.
+///
+/// # Safety
+/// The current process must not be left marked `Running` — it has no valid
+/// frame to come back to.
+unsafe fn resume_next() -> ! {
+    let mut table = TABLE.lock();
+    let states = table.states();
+
+    let Some(next) = roundrobin::next_ready(&states, table.current) else {
+        drop(table);
+        no_runnable_process(&states);
+    };
+
+    table.current = next;
+    table.slots[next].state = State::Running;
+    let frame = table.slots[next].frame;
+    let root = table.slots[next].root;
+    drop(table);
+
+    let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
+    // SAFETY: single processor, interrupts disabled, static stack, and every
+    // address space maps the kernel identically, so the instruction after the
+    // CR3 load is still mapped.
+    unsafe {
+        segments::set_kernel_stack(VirtAddr::from_indices_sign_extended(
+            stack,
+            PagingMode::Level4,
+        ));
+        cpu::write_cr3(root.as_u64());
+        crate::arch::trap::enter_frame(&frame)
+    }
+}
+
+/// Reports why there is nothing to run, and stops.
+///
+/// The two reasons are not the same and must not print the same thing. Nothing
+/// alive is a system that finished. Something alive but nothing runnable is a
+/// deadlock — every live process waiting on another — and a deadlock that halts
+/// quietly is indistinguishable from success in a boot log.
+fn no_runnable_process(states: &[Slot]) -> ! {
+    let live = states.iter().filter(|s| s.is_live()).count();
+    if live == 0 {
+        report_shutdown();
+    }
+    kprintln!("[kernel] DEADLOCK: {live} process(es) blocked, none runnable");
+    crate::arch::halt_forever();
+}
+
+fn report_shutdown() -> ! {
+    let (ticks, switches) = {
+        let table = TABLE.lock();
+        (table.ticks, table.switches)
+    };
+    kprintln!("[kernel] all processes exited after {ticks} ticks, {switches} switches");
+    kprintln!(
+        "[kernel] {} ipc exchanges completed",
+        crate::channel::exchanges()
+    );
+    report_frame_balance();
+    kprintln!("[kernel] stage 2 complete");
+    kprintln!("[kernel] nothing left to schedule, halting");
+    crate::arch::halt_forever();
 }
 
 /// Marks the running process as finished, returning its pid.
@@ -374,13 +526,8 @@ pub fn on_tick(frame: &mut TrapFrame) {
 
     let states = table.states();
     let Some(next) = roundrobin::next_ready(&states, current) else {
-        let (ticks, switches) = (table.ticks, table.switches);
         drop(table);
-        kprintln!("[kernel] all processes exited after {ticks} ticks, {switches} switches");
-        report_frame_balance();
-        kprintln!("[kernel] stage 2 complete");
-        kprintln!("[kernel] nothing left to schedule, halting");
-        crate::arch::halt_forever();
+        no_runnable_process(&states);
     };
 
     if next != current {

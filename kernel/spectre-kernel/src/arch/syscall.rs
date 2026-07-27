@@ -7,11 +7,20 @@
 //! leaves `RSP` pointing at the *user* stack, so the first thing this entry does
 //! is find a kernel stack by hand.
 //!
-//! It is still the right instruction. It is several times faster, it is what
-//! every 64-bit ABI expects, and — the reason it is worth the care — the GDT was
-//! already laid out for it. `gdt.rs` orders user data before user code
-//! specifically because `SYSRET` computes both selectors from `STAR[63:48]`, and
-//! that constraint is only paid for if something actually issues a `SYSRET`.
+//! It is still the right instruction for *entry*: several times faster than a
+//! gate, and what every 64-bit ABI expects.
+//!
+//! The return is `iretq` rather than `sysretq`, which gives some of that back.
+//! The reason is that a system call here can block — an IPC send with no
+//! receiver waiting parks the caller and runs somebody else — and resuming a
+//! different process means restoring a full interrupt frame. `sysretq` can only
+//! return to the `rcx`/`r11` it was given. Keeping both would mean two exit
+//! paths that have to agree about what a saved process looks like, and the
+//! faster one would be the one that is wrong when they drift.
+//!
+//! `STAR[63:48]` is still programmed, and `GdtLayout::validate` still enforces
+//! the descriptor ordering `SYSRET` needs, so the option remains open for a
+//! fast path that provably did not block.
 //!
 //! # `swapgs`, and the window that must not exist
 //!
@@ -29,6 +38,7 @@
 use core::arch::naked_asm;
 
 use super::gdt::GdtLayout;
+use super::trap::TrapFrame;
 use crate::abi::{self, SyscallError};
 use crate::kprintln;
 
@@ -41,8 +51,14 @@ use crate::kprintln;
 struct PerCpu {
     /// Offset 0: where the entry stub puts `RSP`.
     kernel_stack_top: u64,
-    /// Offset 8: where it saves the user's `RSP` until `sysret`.
+    /// Offset 8: where it saves the user's `RSP` until the return.
     user_stack: u64,
+    /// Offset 16 and 24: the ring 3 selectors.
+    ///
+    /// `syscall` does not push a stack frame, so the entry stub builds one, and
+    /// two of its five fields are constants the stub cannot name any other way.
+    user_cs: u64,
+    user_ss: u64,
 }
 
 const SYSCALL_STACK_BYTES: usize = 32 * 1024;
@@ -60,24 +76,9 @@ static mut SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_BYTES]);
 static mut PER_CPU: PerCpu = PerCpu {
     kernel_stack_top: 0,
     user_stack: 0,
+    user_cs: 0,
+    user_ss: 0,
 };
-
-/// What the entry stub pushes, in push order, so `rdi` points at field zero.
-///
-/// Field order must match the pushes exactly; a mismatch hands the dispatcher
-/// the user's `RIP` as a syscall number.
-#[repr(C)]
-pub struct SyscallFrame {
-    pub number: u64,
-    pub a0: u64,
-    pub a1: u64,
-    pub a2: u64,
-    pub a3: u64,
-    /// `syscall` leaves the return address here, not on the stack.
-    pub rip: u64,
-    /// And `RFLAGS` here.
-    pub rflags: u64,
-}
 
 /// Installs the MSRs that make `syscall` work.
 ///
@@ -92,6 +93,8 @@ pub unsafe fn init(layout: &GdtLayout) {
     per_cpu.kernel_stack_top =
         core::ptr::addr_of!(SYSCALL_STACK) as u64 + SYSCALL_STACK_BYTES as u64;
     per_cpu.user_stack = 0;
+    per_cpu.user_cs = u64::from(layout.user_code.0);
+    per_cpu.user_ss = u64::from(layout.user_data.0);
 
     // STAR[47:32] is the base `syscall` uses: CS = base, SS = base + 8.
     // STAR[63:48] is the base `sysret` uses: SS = base + 8, CS = base + 16.
@@ -153,53 +156,69 @@ unsafe extern "C" fn syscall_entry() {
         "mov qword ptr gs:[8], rsp",
         "mov rsp, qword ptr gs:[0]",
 
-        // Caller-saved registers the dispatcher may use but user space still
-        // expects to find intact.
+        // The five fields the CPU pushes for an interrupt, assembled by hand in
+        // the same order, so what a system call leaves on the stack is exactly
+        // a `TrapFrame`. That is what lets a blocking call save its caller and
+        // resume a different process — and it is why the return below is
+        // `iretq` rather than `sysretq`.
+        "push qword ptr gs:[24]",  // ss
+        "push qword ptr gs:[8]",   // the user rsp saved a moment ago
+        "push r11",                // rflags, where `syscall` put them
+        "push qword ptr gs:[16]",  // cs
+        "push rcx",                // rip, likewise
+
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
         "push r8",
         "push r9",
-
-        // SyscallFrame, pushed so the last push lands on field zero.
-        "push r11",  // rflags
-        "push rcx",  // rip
-        "push r10",  // a3
-        "push rdx",  // a2
-        "push rsi",  // a1
-        "push rdi",  // a0
-        "push rax",  // number
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
 
         "mov rdi, rsp",
         "call {dispatch}",
-        // rax now holds the encoded result and must survive the pops below.
 
-        "add rsp, 8", // the number slot; rax replaces it
+        // The result goes into the frame's own `rax` slot, so the restore below
+        // is the same sequence the timer path uses rather than a second one
+        // that has to be kept in step with it.
+        "mov [rsp + 14*8], rax",
+
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
         "pop rdi",
         "pop rsi",
         "pop rdx",
-        "pop r10",
-        "pop rcx",   // return rip for sysret
-        "pop r11",   // return rflags for sysret
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
 
-        "pop r9",
-        "pop r8",
-
-        "mov rsp, qword ptr gs:[8]",
         "swapgs",
-        // `sysretq` faults in ring 0 if RCX is non-canonical, which is a known
-        // escalation primitive. RCX here came from the CPU on entry and was
-        // never exposed to the dispatcher, so it is the address that issued the
-        // syscall and is canonical by construction.
-        "sysretq",
+        "iretq",
         dispatch = sym dispatch,
     )
 }
 
-extern "sysv64" fn dispatch(frame: &mut SyscallFrame) -> u64 {
+extern "sysv64" fn dispatch(frame: &mut TrapFrame) -> u64 {
+    // Arguments come from the frame rather than from registers, because by the
+    // time this runs they are on the stack — and because a call that blocks
+    // needs the frame itself, to save as the state its caller resumes from.
     abi::encode(crate::syscall::handle(
-        frame.number,
-        frame.a0,
-        frame.a1,
-        frame.a2,
-        frame.a3,
+        frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame,
     ))
 }
 

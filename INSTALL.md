@@ -129,6 +129,13 @@ iç içe geçmesi, işlemcinin 100 Hz LAPIC zamanlayıcısı tarafından elden
 alındığının kanıtıdır — hiçbiri kendi isteğiyle sırasını devretmez. Çekirdek
 sonunda kaç tick ve kaç bağlam değişimi olduğunu yazar.
 
+Süreçler ayrıca birbirleriyle konuşur. Çekirdek açılışta bir uç nokta yaratıp
+tutamağını her sürece verir; hiçbir süreç başka bir uç noktayı adlandıramaz.
+Birinci süreç sunucu olur, diğerleri istemci: istemci `WHISEZ-PING` gönderip
+yanıtı bekler, sunucu `WHISEZ-PONG` döner. Yanıtın dönüşmüş olması önemli — aynı
+tamponun geri gelmesi mesajın okunduğunu kanıtlamazdı. İstemciler ayrıca sahibi
+olmadıkları uç noktadan almayı dener ve reddedilirler.
+
 Bir süreç çıktığında çekirdek adres uzayını yürüyerek yıkar ve çerçevelerini
 geri alır (`reaped pid=...`). Boşalan yuvaya, geri kazanılan çerçevelerden
 üçüncü bir süreç kurulur (`respawned pid=...`) — bir yuvanın "boş" işaretlenmesi
@@ -143,7 +150,7 @@ Aynı önyüklemeyi otomatik doğrulamak için:
 cargo xtask boot-test
 ```
 
-Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve kırk bir aşamanın
+Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve kırk dokuz aşamanın
 göründüğünü doğrular. Yalnızca nedensel olarak sıralı olanlar sırayla aranır;
 farklı süreçlerin satırları eşzamanlıdır ve her açılışta farklı iç içe geçer, o
 yüzden onlar için tek dürüst kontrol varlıklarıdır. Ayrıca çekirdeğin yazdığı
@@ -155,9 +162,9 @@ atlanır.
 > Üretim yükleyicisi projenin kendi 8 GiB bellek tabanını uygular ve altındaki
 > bir platformu açmayı reddeder. Bu yüzden sanal makine 9 GiB ile başlatılır.
 
-> Tüm süreçler çıkıp geri alındıktan sonra sistem durur: engelleyen çağrılar ve
-> gerçek IPC henüz yok. Bu, tamamlanmış bir işletim sistemi değil,
-> doğrulanabilir bir dikey dilimdir.
+> Tüm süreçler çıkıp geri alındıktan sonra sistem durur. Bu, tamamlanmış bir
+> işletim sistemi değil, doğrulanabilir bir dikey dilimdir: depolama, ağ, gerçek
+> masaüstü ve imza doğrulaması hâlâ yok.
 
 > Sanal makine `-cpu qemu64,+x2apic` ile başlatılır. QEMU'nun varsayılan CPU
 > modelinde x2APIC yoktur; çekirdek yerel APIC'i MMIO yerine MSR arayüzünden

@@ -14,7 +14,7 @@
 //! the main reason the stub lives here next to the numbers.
 //!
 //!   number  rax
-//!   args    rdi, rsi, rdx, r10
+//!   args    rdi, rsi, rdx, r10, r8
 //!   result  rax
 //!
 //! # Error encoding
@@ -49,6 +49,29 @@ pub const SYS_PING: u64 = 2;
 /// Mixed into `SYS_PING` replies. Arbitrary, but fixed, so the check is exact.
 pub const PING_COOKIE: u64 = 0x5768_6973_657A_0002;
 
+/// Send a message and block until the reply.
+/// `(endpoint, send_ptr, send_len, reply_ptr, reply_cap) -> reply_len`.
+///
+/// Synchronous by design. An asynchronous send needs a queue, a queue needs a
+/// policy for what happens when it is full, and every such policy is either
+/// "block anyway" or "lose messages". A rendezvous has neither problem and is
+/// what the architecture specifies.
+pub const SYS_CALL: u64 = 3;
+
+/// Block until a message arrives on an endpoint this process owns.
+/// `(endpoint, buf_ptr, buf_cap) -> len`.
+pub const SYS_RECEIVE: u64 = 4;
+
+/// Reply to the message last received, unblocking its sender.
+/// `(ptr, len) -> bytes sent`.
+pub const SYS_REPLY: u64 = 5;
+
+/// Longest message body, in either direction.
+///
+/// The kernel holds one buffer of this size per endpoint, so it bounds kernel
+/// memory rather than being a limit the sender chooses.
+pub const MAX_MESSAGE_BYTES: usize = 256;
+
 /// Longest single `SYS_LOG`.
 ///
 /// The kernel copies into a fixed stack buffer, so the bound is what stops a
@@ -72,6 +95,16 @@ pub enum SyscallError {
     NotPermitted = 4,
     /// Argument outside the range the call accepts.
     BadArgument = 5,
+    /// No endpoint with that handle, or not one this process may use.
+    ///
+    /// Deliberately the same answer for both. Distinguishing "no such endpoint"
+    /// from "not yours" tells a process whether a handle it guessed exists,
+    /// which is exactly the information a handle is supposed to withhold.
+    BadEndpoint = 6,
+    /// The endpoint is already in the middle of an exchange.
+    Busy = 7,
+    /// Replying with no message outstanding.
+    NoReplyPending = 8,
 }
 
 impl SyscallError {
@@ -88,6 +121,9 @@ impl SyscallError {
             3 => Some(Self::TooLong),
             4 => Some(Self::NotPermitted),
             5 => Some(Self::BadArgument),
+            6 => Some(Self::BadEndpoint),
+            7 => Some(Self::Busy),
+            8 => Some(Self::NoReplyPending),
             _ => None,
         }
     }
@@ -100,6 +136,9 @@ impl SyscallError {
             Self::TooLong => "too-long",
             Self::NotPermitted => "not-permitted",
             Self::BadArgument => "bad-argument",
+            Self::BadEndpoint => "bad-endpoint",
+            Self::Busy => "busy",
+            Self::NoReplyPending => "no-reply-pending",
         }
     }
 }
@@ -136,7 +175,7 @@ pub const fn decode(raw: u64) -> Result<u64, SyscallError> {
 /// validates what it can, but a pointer argument that is valid and wrong is
 /// still wrong.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn syscall4(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+pub unsafe fn syscall5(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let result: u64;
     // SAFETY: the caller guarantees the arguments. `rcx` and `r11` are declared
     // clobbered because the instruction overwrites them unconditionally, and
@@ -149,6 +188,7 @@ pub unsafe fn syscall4(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             in("rsi") a1,
             in("rdx") a2,
             in("r10") a3,
+            in("r8") a4,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -158,32 +198,43 @@ pub unsafe fn syscall4(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// # Safety
-/// As `syscall4`: the kernel acts on these registers, and a pointer argument
+/// As `syscall5`: the kernel acts on these registers, and a pointer argument
 /// that is valid and wrong is still wrong.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn syscall1(number: u64, a0: u64) -> u64 {
-    // SAFETY: forwarded to `syscall4` with the unused arguments zeroed.
-    unsafe { syscall4(number, a0, 0, 0, 0) }
+    // SAFETY: forwarded to `syscall5` with the unused arguments zeroed.
+    unsafe { syscall5(number, a0, 0, 0, 0, 0) }
 }
 
 /// # Safety
-/// As `syscall4`.
+/// As `syscall5`.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn syscall2(number: u64, a0: u64, a1: u64) -> u64 {
     // SAFETY: as above.
-    unsafe { syscall4(number, a0, a1, 0, 0) }
+    unsafe { syscall5(number, a0, a1, 0, 0, 0) }
+}
+
+/// # Safety
+/// As `syscall5`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn syscall3(number: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    // SAFETY: as above.
+    unsafe { syscall5(number, a0, a1, a2, 0, 0) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_ERRORS: [SyscallError; 5] = [
+    const ALL_ERRORS: [SyscallError; 8] = [
         SyscallError::BadNumber,
         SyscallError::BadPointer,
         SyscallError::TooLong,
         SyscallError::NotPermitted,
         SyscallError::BadArgument,
+        SyscallError::BadEndpoint,
+        SyscallError::Busy,
+        SyscallError::NoReplyPending,
     ];
 
     #[test]
@@ -240,7 +291,14 @@ mod tests {
 
     #[test]
     fn the_syscall_numbers_are_distinct_and_stable() {
-        let numbers = [SYS_LOG, SYS_EXIT, SYS_PING];
+        let numbers = [
+            SYS_LOG,
+            SYS_EXIT,
+            SYS_PING,
+            SYS_CALL,
+            SYS_RECEIVE,
+            SYS_REPLY,
+        ];
         for (i, a) in numbers.iter().enumerate() {
             for b in &numbers[i + 1..] {
                 assert_ne!(a, b);
@@ -249,6 +307,7 @@ mod tests {
         // Pinned: user space is built separately, so renumbering silently
         // repoints every existing binary at a different handler.
         assert_eq!((SYS_LOG, SYS_EXIT, SYS_PING), (0, 1, 2));
+        assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
     }
 
     #[test]

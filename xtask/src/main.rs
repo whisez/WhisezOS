@@ -395,11 +395,19 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // The number the frame-balance check is measured against. The count comes
     // first in the line, so the match starts after it.
     "frames free before any process",
+    "[kernel] endpoint created for pid=1",
     "[kernel] init mapped pid=1",
     "[kernel] init mapped pid=2",
     "[kernel] lapic id=",
     "[kernel] entering ring 3",
     "[kernel] stage 2 complete",
+];
+
+/// The IPC chain. Which client is served first is a race; that a client is
+/// served at all, and that the server finishes only after serving both, is not.
+const IPC_CHAIN: &[&str] = &[
+    "[init 1] served request: WHISEZ-PING",
+    "[init 1] served every client",
 ];
 
 /// Lines that must be caused by an earlier one, in that order.
@@ -450,6 +458,16 @@ const REQUIRED_LINES: &[&str] = &[
     "[kernel] pid 2 exited with code 0",
     "[kernel] reaped pid=1, freed",
     "[kernel] reaped pid=2, freed",
+    // A message crossed between two processes and came back transformed. An
+    // echo would prove only that the buffer survived; the server answering
+    // PONG to a PING proves the receiver read it and produced something new.
+    "[init 2] ipc round trip ok, server answered WHISEZ-PONG",
+    "[init 3] ipc round trip ok, server answered WHISEZ-PONG",
+    // And a process that holds a handle it does not own cannot receive on it,
+    // which is the difference between a capability and a global name.
+    "[init 2] refused as expected: receiving on an endpoint it does not own",
+    "[init 3] refused as expected: receiving on an endpoint it does not own",
+    "ipc exchanges completed",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.
@@ -482,7 +500,8 @@ fn boot_test() -> Result<()> {
         return Err(error);
     }
 
-    let stages = EXPECTED_BOOT_LINES.len() + TEARDOWN_CHAIN.len() + REQUIRED_LINES.len();
+    let stages =
+        EXPECTED_BOOT_LINES.len() + TEARDOWN_CHAIN.len() + IPC_CHAIN.len() + REQUIRED_LINES.len();
     println!("boot test passed: {stages} stages observed");
     Ok(())
 }
@@ -490,6 +509,7 @@ fn boot_test() -> Result<()> {
 fn check_log(captured: &str) -> Result<()> {
     check_ordered(captured, EXPECTED_BOOT_LINES, "boot sequence")?;
     check_ordered(captured, TEARDOWN_CHAIN, "teardown chain")?;
+    check_ordered(captured, IPC_CHAIN, "ipc chain")?;
 
     for expected in REQUIRED_LINES {
         if !captured.contains(expected) {

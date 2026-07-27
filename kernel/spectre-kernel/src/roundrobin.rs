@@ -21,8 +21,11 @@ pub enum Slot {
     /// Runnable, not currently on a processor.
     Ready,
     Running,
-    /// Finished. Never chosen again, and not reused: there is no process
-    /// teardown yet, so handing the slot out would leak the frames behind it.
+    /// Waiting on IPC. Not runnable, and not gone either — only another process
+    /// can make it ready again, which is why a table with nothing `Ready` and
+    /// something `Blocked` is a deadlock rather than an idle system.
+    Blocked,
+    /// Finished, waiting to be reaped.
     Exited,
 }
 
@@ -30,6 +33,12 @@ impl Slot {
     #[must_use]
     pub const fn is_schedulable(self) -> bool {
         matches!(self, Self::Ready | Self::Running)
+    }
+
+    /// Still alive, whether or not it can run right now.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Ready | Self::Running | Self::Blocked)
     }
 }
 
@@ -62,7 +71,7 @@ pub fn schedulable(slots: &[Slot]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::Slot::{Empty, Exited, Ready, Running};
+    use super::Slot::{Blocked, Empty, Exited, Ready, Running};
     use super::*;
 
     #[test]
@@ -108,9 +117,26 @@ mod tests {
     }
 
     #[test]
-    fn exited_and_empty_slots_are_skipped() {
-        let slots = [Running, Exited, Empty, Ready];
+    fn exited_empty_and_blocked_slots_are_skipped() {
+        let slots = [Running, Exited, Blocked, Ready];
         assert_eq!(next_ready(&slots, 0), Some(3));
+    }
+
+    #[test]
+    fn a_table_with_only_blocked_processes_has_nothing_to_run() {
+        // Not the same as an empty table: these processes are alive and waiting
+        // on each other, which is a deadlock rather than a finished system.
+        let slots = [Blocked, Blocked];
+        assert_eq!(next_ready(&slots, 0), None);
+        assert_eq!(schedulable(&slots), 0);
+        assert!(slots.iter().all(|s| s.is_live()));
+    }
+
+    #[test]
+    fn liveness_and_schedulability_are_different_questions() {
+        assert!(Blocked.is_live() && !Blocked.is_schedulable());
+        assert!(!Exited.is_live() && !Exited.is_schedulable());
+        assert!(!Empty.is_live());
     }
 
     #[test]

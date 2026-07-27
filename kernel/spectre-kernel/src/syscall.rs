@@ -16,22 +16,74 @@
 //! *currently scheduled*, which is why it asks the scheduler rather than
 //! holding a pointer to a process of its own.
 
-use crate::abi::{SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_EXIT, SYS_LOG, SYS_PING};
+use crate::abi::{
+    SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_EXIT, SYS_LOG, SYS_PING, SYS_RECEIVE,
+    SYS_REPLY,
+};
 use crate::arch;
+use crate::arch::trap::TrapFrame;
+use crate::channel::{self, Outcome};
 use crate::kprintln;
 use crate::task;
 use crate::usercopy::validate_user_range;
 
 /// Dispatches one call. Returns the value user space will see in `rax`.
-pub fn handle(number: u64, a0: u64, a1: u64, _a2: u64, _a3: u64) -> Result<u64, SyscallError> {
+///
+/// `frame` is the caller's complete state. The IPC calls need it because they
+/// can block: the frame is what the process resumes from when its exchange
+/// completes, with the result written into its `rax`.
+#[allow(clippy::too_many_arguments)]
+pub fn handle(
+    number: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    frame: &TrapFrame,
+) -> Result<u64, SyscallError> {
     match number {
         SYS_LOG => sys_log(a0, a1),
         SYS_EXIT => sys_exit(a0),
         SYS_PING => Ok(a0 ^ PING_COOKIE),
+        SYS_CALL => blocking(
+            channel::call(
+                task::current_pid(),
+                task::current_root(),
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+            ),
+            frame,
+        ),
+        SYS_RECEIVE => blocking(
+            channel::receive(task::current_pid(), task::current_root(), a0, a1, a2),
+            frame,
+        ),
+        SYS_REPLY => blocking(channel::reply(task::current_pid(), a0, a1, a2), frame),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
         _ => Err(SyscallError::BadNumber),
+    }
+}
+
+/// Turns a channel outcome into either a return value or a context switch.
+///
+/// The switch never comes back here: `block_current` saves `frame` and resumes
+/// somebody else, and the value this call eventually returns is written into
+/// that saved frame by whichever process completes the exchange.
+fn blocking(
+    outcome: Result<Outcome, SyscallError>,
+    frame: &TrapFrame,
+) -> Result<u64, SyscallError> {
+    match outcome? {
+        Outcome::Return(value) => Ok(value),
+        // SAFETY: reached from a system call with interrupts disabled, on the
+        // syscall stack, and nothing on that stack is needed afterwards.
+        Outcome::Block => unsafe { task::block_current(frame) },
     }
 }
 
@@ -81,6 +133,10 @@ fn sys_log(ptr: u64, len: u64) -> Result<u64, SyscallError> {
 /// without it the system would stop here with runnable processes left.
 fn sys_exit(code: u64) -> ! {
     let pid = task::exit_current(code);
+    // Before anything else waits on a process that is no longer there. A client
+    // blocked on this server has to be told, or it waits for a reply that
+    // cannot arrive.
+    channel::on_process_gone(pid);
     if code == 0 {
         kprintln!("[kernel] pid {pid} exited with code 0");
     } else {

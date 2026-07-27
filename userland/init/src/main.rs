@@ -23,7 +23,10 @@
 #[path = "../../../kernel/spectre-kernel/src/abi.rs"]
 mod abi;
 
-use abi::{decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_EXIT, SYS_LOG, SYS_PING};
+use abi::{
+    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_EXIT, SYS_LOG, SYS_PING,
+    SYS_RECEIVE, SYS_REPLY,
+};
 
 /// An address inside the kernel's identity map. User space must never be able
 /// to make the kernel read it on its behalf.
@@ -83,6 +86,16 @@ fn tag(pid: u64, out: &mut [u8; 10]) -> &[u8] {
     &out[..text.len()]
 }
 
+/// Clients the server answers before it stops. Two of the three processes are
+/// clients; the third owns the endpoint.
+const CLIENTS: usize = 2;
+
+fn call5(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Result<u64, SyscallError> {
+    // SAFETY: every call site passes arguments the corresponding syscall
+    // accepts, or deliberately does not — the refusals are the point.
+    decode(unsafe { abi::syscall5(number, a0, a1, a2, a3, a4) })
+}
+
 fn call(number: u64, a0: u64, a1: u64) -> Result<u64, SyscallError> {
     // SAFETY: every call site below passes arguments the corresponding syscall
     // accepts, or deliberately does not — the refusals are the point.
@@ -134,7 +147,7 @@ fn spin(iterations: u64) {
 }
 
 #[no_mangle]
-pub extern "sysv64" fn _start(pid: u64) -> ! {
+pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
     let mut prefix = [0u8; 10];
     log_bytes(tag(pid, &mut prefix));
     log("hello from ring 3\n");
@@ -191,9 +204,137 @@ pub extern "sysv64" fn _start(pid: u64) -> ! {
         log_bytes(&digit);
     }
 
+    // --- talking to another process ---------------------------------------
+    if endpoint != 0 {
+        if pid == SERVER_ROLE {
+            serve(pid, endpoint);
+        } else {
+            request(pid, endpoint);
+        }
+    }
+
     log_bytes(tag(pid, &mut prefix));
     log("all checks passed\n");
     exit(0);
+}
+
+/// The process that owns the endpoint. Given the endpoint by the kernel at
+/// spawn; every other process is a client.
+const SERVER_ROLE: u64 = 1;
+
+/// Requests the server answers. Chosen so the reply is a transformation the
+/// client can check rather than an echo, which a kernel that lost the message
+/// could also produce.
+const REQUEST: &[u8] = b"WHISEZ-PING";
+const EXPECTED_REPLY: &[u8] = b"WHISEZ-PONG";
+
+/// Answers one request per client, then stops.
+fn serve(pid: u64, endpoint: u64) -> ! {
+    let mut prefix = [0u8; 10];
+    let mut buffer = [0u8; 64];
+
+    for _ in 0..CLIENTS {
+        let len = match call5(
+            SYS_RECEIVE,
+            endpoint,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+            0,
+            0,
+        ) {
+            Ok(len) => len as usize,
+            Err(error) => {
+                log_bytes(tag(pid, &mut prefix));
+                log("receive failed: ");
+                log(error.name());
+                log("\n");
+                exit(4);
+            }
+        };
+
+        log_bytes(tag(pid, &mut prefix));
+        log("served request: ");
+        log_bytes(&buffer[..len]);
+        log("\n");
+
+        // The transformation the client checks for. A server that replied with
+        // the request unchanged would be indistinguishable from a kernel that
+        // handed the buffer straight back.
+        let mut answer = [0u8; 64];
+        answer[..len].copy_from_slice(&buffer[..len]);
+        if len == REQUEST.len() {
+            answer[..len].copy_from_slice(EXPECTED_REPLY);
+        }
+
+        if let Err(error) = call5(
+            SYS_REPLY,
+            endpoint,
+            answer.as_ptr() as u64,
+            len as u64,
+            0,
+            0,
+        ) {
+            log_bytes(tag(pid, &mut prefix));
+            log("reply failed: ");
+            log(error.name());
+            log("\n");
+            exit(5);
+        }
+    }
+
+    log_bytes(tag(pid, &mut prefix));
+    log("served every client\n");
+    log_bytes(tag(pid, &mut prefix));
+    log("all checks passed\n");
+    exit(0)
+}
+
+/// Sends one request and checks the answer.
+fn request(pid: u64, endpoint: u64) {
+    let mut prefix = [0u8; 10];
+    let mut reply = [0u8; 64];
+
+    let len = match call5(
+        SYS_CALL,
+        endpoint,
+        REQUEST.as_ptr() as u64,
+        REQUEST.len() as u64,
+        reply.as_mut_ptr() as u64,
+        reply.len() as u64,
+    ) {
+        Ok(len) => len as usize,
+        Err(error) => {
+            log_bytes(tag(pid, &mut prefix));
+            log("call failed: ");
+            log(error.name());
+            log("\n");
+            exit(6);
+        }
+    };
+
+    log_bytes(tag(pid, &mut prefix));
+    if &reply[..len] == EXPECTED_REPLY {
+        log("ipc round trip ok, server answered ");
+        log_bytes(&reply[..len]);
+        log("\n");
+    } else {
+        log("IPC REPLY WRONG\n");
+        exit(7);
+    }
+
+    // An endpoint this process does not own must refuse to be received from,
+    // however it was obtained.
+    match call5(SYS_RECEIVE, endpoint, reply.as_mut_ptr() as u64, 8, 0, 0) {
+        Err(SyscallError::BadEndpoint) => {
+            log_bytes(tag(pid, &mut prefix));
+            log("refused as expected: receiving on an endpoint it does not own\n");
+        }
+        _ => {
+            log_bytes(tag(pid, &mut prefix));
+            log("SECURITY CHECK FAILED: received on another process's endpoint\n");
+            exit(8);
+        }
+    }
 }
 
 #[panic_handler]

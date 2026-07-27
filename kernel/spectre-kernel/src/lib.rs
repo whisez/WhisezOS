@@ -62,7 +62,9 @@
 pub mod abi;
 pub mod arch;
 pub mod boot_info;
+pub mod channel;
 pub mod elf;
+pub mod rendezvous;
 pub mod roundrobin;
 pub mod syscall;
 pub mod task;
@@ -112,11 +114,24 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     task::set_baseline_free_frames(baseline);
     kprintln!("[kernel] {baseline} frames free before any process");
 
+    // SAFETY: single-threaded bring-up, called once.
+    unsafe { channel::init() };
+
+    // One endpoint, owned by the first process. Every process is handed the
+    // handle at spawn and can name no other, which is the whole of the
+    // authority model until `cap.rs` links: a process reaches the services it
+    // was introduced to and nothing else.
+    let Some(endpoint) = channel::create(1) else {
+        kprintln!("[kernel] could not create the init endpoint");
+        arch::halt_forever();
+    };
+    kprintln!("[kernel] endpoint created for pid=1");
+
     // One respawn, into whichever slot the first reap empties. It is what turns
     // "the frames were counted back" into "the frames were usable again".
     // SAFETY: the image lives in loader memory, which the frame allocator never
     // issues, so it outlives every process built from it.
-    unsafe { task::arm_respawn(image, platform.kernel_root, 1, 3) };
+    unsafe { task::arm_respawn(image, platform.kernel_root, 1, 3, endpoint) };
 
     // Two processes from one image. They share no memory — each gets its own
     // address space built from the same bytes — and tell themselves apart only
@@ -133,7 +148,7 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
                 arch::halt_forever();
             }
         };
-        match task::admit(&process, argument) {
+        match task::admit(&process, argument, endpoint) {
             Some(pid) => kprintln!(
                 "[kernel] init mapped pid={pid} entry={:#018x} stack={:#018x} regions={}",
                 process.entry,

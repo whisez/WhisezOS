@@ -207,12 +207,34 @@ frames in the reclaimed slot, and the kernel compares free memory against what
 was free before any process existed — the counts must be identical, and the boot
 test fails on either a leak or an over-release.
 
-`task.rs` is not `sched.rs`: it is a fixed table and a rotating index, with the
-selection policy split into `roundrobin.rs` so its fairness is testable on the
-host. The real scheduler still waits on `thread` and `percpu`.
+Processes exchange messages. `rendezvous.rs` is the state machine — four states,
+three operations, and every wrong ordering refused rather than deadlocked — and
+`channel.rs` is what makes it real: one endpoint, a 256-byte buffer, and pointer
+validation at both ends. A message crosses two address spaces, so the second
+copy goes through the recipient's own page tables and re-checks that the
+destination is writable by its owner; writing through the identity map would
+otherwise let a process have its own `W^X` broken on request.
 
-What is *not* there: no blocking system call, and no real IPC. `SYS_PING` stands
-in for an IPC round trip. The system halts once every process has exited.
+A blocking call is what forced the system-call path to build a complete
+`TrapFrame`: a process parked mid-`SYS_CALL` resumes from that frame with the
+reply length written into its `rax`. `SYSRET` cannot express that, so the return
+is `IRETQ` — one exit path shared with the timer rather than two that have to
+agree.
+
+`task.rs` is not `sched.rs`, and `rendezvous.rs`/`channel.rs` are not `ipc.rs`.
+The full design — badged endpoints, page grants, capability transfer, timeslice
+donation on handoff — is written and tested, and reaches `cap`, `sched`, `vault`,
+and `thread`, which between them need ten platform modules that do not exist and
+a crypto dependency that does not compile for this target. What links today is
+the part of it that can run.
+
+Endpoint authority is a 64-bit handle a process is given and cannot construct or
+enumerate. That is deliberately weaker than the 128-bit capabilities `cap.rs`
+specifies, and deliberately not ambient: a process reaches the services it was
+introduced to and no others.
+
+What is *not* there: storage, network, a real desktop session, and signature
+verification. The system halts once every process has exited.
 
 The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
 and carry the bulk of the test suite, but they are written against platform
