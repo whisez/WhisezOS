@@ -66,19 +66,73 @@ Komut şu işlemleri otomatik yapar:
 1. Gerçek UEFI uygulamasını release modunda derler.
 2. QEMU için geçici ve özel bir firmware değişken dosyası oluşturur.
 3. EDK2/OVMF firmware ile sanal makineyi başlatır.
-4. WhisezOS açılış animasyonu ve masaüstü önizlemesini gösterir.
+4. WhisezOS açılış animasyonunu, aşamalı kurulum provasını ve masaüstü
+   önizlemesini gösterir.
+
+Kurulum ekranı yaklaşık bir dakika sürer ve üretim kurulum sırasını gösterir;
+**hiçbir diski okumaz veya yazmaz**. `Esc` ile atlayabilirsiniz.
 
 QEMU penceresini kapattığınızda önizleme durur. Bilgisayarınızın fiziksel diski
 bu işlem sırasında sanal makineye bağlanmaz.
 
 ## Kontroller
 
-- Fareyi hareket ettirerek kart seçin, sol tıkla açın.
+- Kurulum ekranında `Esc` provayı atlar.
+- Fareyi kart veya dosya simgesi üzerine getirin, sol tıkla açın.
 - Sağ tık veya `Esc` ile masaüstüne dönün.
 - `Yukarı` / `Aşağı` ya da `W` / `S` ile seçim yapın.
-- `Enter` ile seçili uygulamayı açın.
-- `1`, `2`, `3` ile Guard, Terminal veya Files uygulamasını açın.
+- `Tab` ile uygulama sütunu ve dosya ızgarası arasında geçin.
+- `Enter` ile seçili öğeyi açın.
+- `1`–`5` ile bir uygulamayı doğrudan açın.
 - `Ctrl+Alt+G` ile QEMU'nun yakaladığı fareyi serbest bırakın.
+
+### Fare çalışmıyorsa
+
+Üst çubuktaki `POINTER` göstergesine bakın. Bu sayı kaç işaretçi aygıtının
+bağlandığını söyler.
+
+QEMU ile gelen OVMF firmware'i hiçbir fare sürücüsü içermez: `EFI_SIMPLE_POINTER`
+ve `EFI_ABSOLUTE_POINTER` protokollerini yalnızca konsol birleştiricisinin boş
+sanal örnekleri olarak sunar, bu yüzden fareyi ne kadar oynatırsanız oynatın veri
+gelmez. Önizleme bu durumu algılar ve i8042 yardımcı portundan PS/2 faresini
+doğrudan sürer; göstergede `POINTER 1` görürsünüz.
+
+`NO POINTER DEVICE` yazıyorsa ne firmware bir aygıt sunuyor ne de bir i8042
+denetleyicisi var. Önizlemenin tamamı klavyeyle kullanılabilir.
+
+## Üretim çekirdeğini çalıştırma
+
+Önizleme bir çekirdek açmaz. Gerçek yükleyiciyi ve mikroçekirdeği QEMU'da
+çalıştırmak için:
+
+```powershell
+cargo xtask boot-run
+```
+
+Bu komut üretim UEFI yükleyicisini ve çekirdek ELF'ini derler, geçici bir EFI
+bölümüne yerleştirir ve QEMU'yu başlatır. Çekirdeğin tek çıktısı seri porttur;
+komut seri portu terminale bağlar, ekran penceresi açılmaz.
+
+Beklenen çıktı şu sırayla gelir: yükleyici bellek denetimi, çekirdek ELF'inin
+doğrulanması, boot servislerinden çıkış, devir, ardından çekirdeğin GDT, IDT,
+çerçeve ayırıcı ve sayfa tablosu satırları ve `[kernel] stage 1 complete`.
+
+Aynı önyüklemeyi otomatik doğrulamak için:
+
+```powershell
+cargo xtask boot-test
+```
+
+Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve on bir aşamanın
+sırasıyla göründüğünü doğrular. `cargo xtask test` içinde de çalışır; QEMU
+kurulu değilse uyarıyla atlanır.
+
+> Üretim yükleyicisi projenin kendi 8 GiB bellek tabanını uygular ve altındaki
+> bir platformu açmayı reddeder. Bu yüzden sanal makine 9 GiB ile başlatılır.
+
+> Çekirdek henüz bir init süreci başlatmaz; `stage 1 complete` satırından sonra
+> durur. Bu, tamamlanmış bir işletim sistemi değil, doğrulanabilir ilk dikey
+> dilimdir.
 
 ## Yalnızca derleme
 

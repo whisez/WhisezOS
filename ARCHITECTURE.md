@@ -174,11 +174,26 @@ particle system. Keystroke ripples are the `ripple_origin` uniform.
 
 ---
 
-## 3. Kernel — **IMPL**
+## 3. Kernel — **IMPL / partial**
 
-~11k lines of Rust plus ~900 of assembly. In kernel space: IPC, scheduler, memory
-manager, HAL. Nothing else. All drivers except the GPU, all filesystems, the
-network stack, USB, and input are user-space processes.
+~11k lines of Rust. In kernel space: IPC, scheduler, memory manager, HAL.
+Nothing else. All drivers except the GPU, all filesystems, the network stack,
+USB, and input are user-space processes.
+
+**What is in the bootable image today**, as distinct from what is written and
+tested. The kernel binary links `arch` and `boot_info` and nothing else: it
+boots on QEMU, installs its GDT, IDT, and TSS, brings up the serial console,
+builds a frame allocator from the handoff memory map, constructs its own page
+tables with the image mapped W^X by section, switches CR3, and halts.
+`cargo xtask boot-test` asserts that sequence from the serial log.
+
+The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
+and carry the bulk of the test suite, but they are written against platform
+modules (`thread`, `percpu`, `notify`, `compact`, `forensic`, `gpu`, `net`) that
+do not exist yet, so `verify/` compiles them against host stand-ins rather than
+the kernel linking them. They rejoin the image one at a time, each with the
+platform module it needs. Until then, "IMPL" here means implemented and tested,
+not implemented and running.
 
 ### 3.1 Capabilities — [`cap.rs`](kernel/spectre-kernel/src/cap.rs)
 

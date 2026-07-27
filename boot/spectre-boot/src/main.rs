@@ -1,229 +1,383 @@
 //! WhisezOS stage-1 UEFI loader.
 //!
-//! Boot order, and the reasoning for it:
+//! Loads `\SPECTRE\KERNEL.ELF`, builds the handoff structure, leaves boot
+//! services, and jumps. Boot order, and the reasoning for it:
 //!
-//!   1. **Memory audit first.** Everything after this point allocates. If the
-//!      platform cannot satisfy the memory floor we want to fail before we
-//!      have touched anything, while the firmware's console is still sane.
-//!   2. **Attest before load.** Images are read into `NX|RO` buffers, hashed,
-//!      compared against the signed manifest, and only then mapped executable.
-//!   3. **Measure after verify.** PCR extension happens only for images that
-//!      passed, so an attacker cannot steer PCR values with garbage input.
-//!   4. **Unlock last.** The Argon2id passphrase prompt runs after the chain
-//!      is verified, so the user is never asked to type a passphrase into a
-//!      loader that might already be compromised.
-//!   5. **Boot animation is concurrent, not sequential.** The 15-second
-//!      cinematic runs on the GOP framebuffer while steps 2–4 execute. It is
-//!      cosmetic and must never be on the critical path — see the note on
-//!      `BOOT_ANIMATION_BUDGET` below.
+//!   1. **Serial first.** Everything after this can fail before there is a
+//!      framebuffer, and a loader that cannot say why it stopped is a black
+//!      screen with a blinking cursor. The kernel continues on the same port,
+//!      so one capture covers the whole boot.
+//!   2. **Memory audit.** `spd::audit` decides whether the platform clears the
+//!      floor. Failing here, before anything is allocated or copied, is the
+//!      cheapest place to fail.
+//!   3. **Read and validate the kernel.** The image is parsed and every program
+//!      header bounds-checked (`elf.rs`) before a single page is allocated for
+//!      it.
+//!   4. **Allocate, copy, zero.** At the address the image was linked for.
+//!   5. **Collect what only boot services can provide** — framebuffer geometry
+//!      and the ACPI pointer — while boot services still exist.
+//!   6. **Exit boot services, then build the memory map.** In that order: the
+//!      map is only final once nothing else can allocate.
+//!   7. **Jump.** Interrupts masked, `rdi` carrying the handoff.
+//!
+//! # What this loader does not do yet
+//!
+//! It does not verify signatures. `attest.rs` implements the comparison and is
+//! tested, but there is no signed manifest in the build and no key to check it
+//! against, so wiring it up would produce a verification step that always
+//! passes — worse than none, because it looks like a chain of trust. The
+//! handoff carries `FLAG_IMAGES_VERIFIED` clear and the kernel says so on the
+//! console every boot until that changes.
 
 #![no_main]
 #![no_std]
-#![feature(uefi_std)]
 
 extern crate alloc;
 
-mod attest;
-mod glitch;
+mod elf;
+
+/// The handoff layout, included from the kernel rather than copied.
+///
+/// Two binaries, two targets, one definition — see the module's own comment for
+/// why a second copy is the failure mode worth designing against.
+#[path = "../../../kernel/spectre-kernel/src/boot_info.rs"]
+mod boot_info;
+
+/// The same 16550 driver the kernel uses, so the loader's lines and the
+/// kernel's lines are produced by identical code on the same port.
+/// Only the transmit path is used here; the receive helpers exist for the
+/// kernel's side of the same driver.
+#[allow(dead_code)]
+#[path = "../../../kernel/spectre-kernel/src/arch/serial.rs"]
+mod serial;
+
+/// The SMBus enumeration half has no caller until an SMBus driver exists; the
+/// audit half is what stage 1 uses today.
+#[allow(dead_code)]
 mod spd;
 
+use alloc::vec::Vec;
+use core::fmt::Write;
+
+use uefi::boot::{AllocateType, MemoryType};
+use uefi::mem::memory_map::{MemoryMap, MemoryMapMut};
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
 
-/// POST codes emitted to port 0x80 before halting, for diagnosis without video.
-const POST_NO_MEMORY: u8 = 0xE0;
-const POST_MEMORY_LOW: u8 = 0xE1;
-const POST_MAP_MISMATCH: u8 = 0xE2;
-const POST_TAMPER: u8 = 0xE3;
+use boot_info::{
+    BootInfo, Framebuffer, MemoryKind, MemoryMapBuilder, MemoryRegion, FLAG_IMAGES_VERIFIED,
+};
+use elf::Elf64;
+use serial::{Uart, X86Ports, COM1};
 
-/// The cinematic runs for this long *at most*, and is cut short the instant
-/// the real boot work finishes. An OS that makes you watch a fixed 15-second
-/// animation on every boot is an OS you come to resent by week two — the
-/// animation exists to cover latency, not to manufacture it. On an NVMe system
-/// where attestation and unlock complete in 1.8 s, you see 1.8 s of animation
-/// gracefully resolving, not 15 s of padding.
-const BOOT_ANIMATION_BUDGET_MS: u64 = 15_000;
+const KERNEL_PATH: &str = "\\SPECTRE\\KERNEL.ELF";
+const PAGE_SIZE: u64 = 4096;
 
-extern "C" {
-    fn spectre_halt_forever(post_code: u8) -> !;
-    fn spectre_scrub_and_halt(base: *mut u8, len: u64, post_code: u8) -> !;
+/// OS-defined memory type for the kernel image.
+///
+/// UEFI reserves everything at or above `0x8000_0000` for the loaded OS, so
+/// tagging the image with its own type makes it a distinct descriptor in the
+/// final memory map. Without it the image is indistinguishable from the
+/// loader's other allocations, and the kernel cannot tell which range it must
+/// never reclaim from the ranges it may.
+const KERNEL_IMAGE_MEMORY_TYPE: u32 = 0x8000_0000;
+
+macro_rules! log {
+    ($uart:expr, $($arg:tt)*) => {{
+        let _ = writeln!($uart, "\r[boot] {}\r", format_args!($($arg)*));
+    }};
 }
 
 #[entry]
 fn main() -> Status {
-    uefi::helpers::init().expect("uefi services");
+    if uefi::helpers::init().is_err() {
+        return Status::ABORTED;
+    }
+    let mut uart = Uart::new(X86Ports, COM1);
+    let _ = uart.init(115_200);
+    log!(uart, "WhisezOS stage-1 loader");
 
-    // ---- 1. Memory audit -------------------------------------------------
-    let map_total = conventional_memory_total();
-    let (modules, smbus_ok) = probe_memory_modules();
+    match load(&mut uart) {
+        Ok(()) => Status::LOAD_ERROR, // `load` diverges on success.
+        Err(status) => {
+            log!(uart, "HALTED: {status:?}");
+            halt_forever()
+        }
+    }
+}
 
-    let usable = match spd::audit(&modules, map_total, smbus_ok) {
+/// Everything that can fail, so the entry point stays a single decision.
+fn load(uart: &mut Uart<X86Ports>) -> Result<(), Status> {
+    // ---- 2. Memory audit -------------------------------------------------
+    let conventional = conventional_memory_total();
+    // No SMBus driver in this build, so the audit runs in map-only mode: it
+    // checks the floor without cross-checking SPD against the firmware's map.
+    let usable = match spd::audit(&[], conventional, false) {
         Ok(bytes) => bytes,
-        Err(fault) => halt_memory_fault(fault),
+        Err(fault) => {
+            log!(uart, "memory audit failed: {fault:?}");
+            return Err(Status::OUT_OF_RESOURCES);
+        }
     };
+    log!(
+        uart,
+        "memory audit passed, {} MiB conventional",
+        usable >> 20
+    );
 
-    log::info!("memory audit passed: {} GiB usable", usable >> 30);
+    // ---- 3. Read and validate the kernel ---------------------------------
+    let image = read_kernel(uart)?;
+    let kernel = Elf64::parse(&image).map_err(|e| {
+        log!(uart, "kernel image rejected: {e:?}");
+        Status::COMPROMISED_DATA
+    })?;
+    let (base, span) = kernel.physical_extent().ok_or(Status::COMPROMISED_DATA)?;
+    log!(
+        uart,
+        "kernel {} KiB, entry {:#x}, load {:#x}..{:#x}",
+        image.len() >> 10,
+        kernel.entry(),
+        base,
+        base + span
+    );
 
-    // ---- 2/3. Attest and measure ----------------------------------------
-    let manifest = load_signed_manifest();
-    let mut tpm = open_tcg2();
+    // ---- 4. Allocate, copy, zero -----------------------------------------
+    let pages = span.div_ceil(PAGE_SIZE) as usize;
+    uefi::boot::allocate_pages(
+        AllocateType::Address(base),
+        MemoryType::custom(KERNEL_IMAGE_MEMORY_TYPE),
+        pages,
+    )
+    .map_err(|e| {
+        // The link address is fixed, so this is not recoverable by retrying
+        // elsewhere: the image has no relocations to apply. What the operator
+        // needs instead is the reason — which ranges the firmware left free —
+        // because the fix is to relink, and that needs a target address.
+        log!(uart, "cannot claim {pages} pages at {base:#x}: {e:?}");
+        report_free_regions(uart, span);
+        Status::OUT_OF_RESOURCES
+    })?;
 
-    for entry in manifest.iter() {
-        let bytes = read_esp_file(entry.path);
-        match attest::verify_image(entry, bytes.as_deref()) {
-            Ok(d) => {
-                let _ = attest::measure(&mut tpm, entry, &d);
-            }
-            Err(tamper) => halt_tamper(&mut tpm, tamper),
+    for segment in kernel.segments() {
+        let bytes = kernel.contents(&segment);
+        // SAFETY: the destination is inside the allocation just made — every
+        // segment lies within `physical_extent` by construction — and physical
+        // memory is identity mapped under UEFI.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), segment.phys as *mut u8, bytes.len());
+            // Anything past the file-backed part is `.bss`. Leaving it as
+            // whatever the firmware left behind gives the kernel statics that
+            // differ between boots, which is the worst possible way to debug.
+            core::ptr::write_bytes(
+                (segment.phys + segment.file_size) as *mut u8,
+                0,
+                segment.zero_fill() as usize,
+            );
         }
     }
+    log!(uart, "{} segments loaded", kernel.segments().count());
 
-    // ---- 4. Unlock -------------------------------------------------------
-    // `unlock_root_volume` derives the XChaCha20-Poly1305 key with Argon2id and
-    // leaves it in a single page we track so it can be scrubbed on any later
-    // failure path.
-    let key_page = unlock_root_volume();
+    // ---- 5. Collect what needs boot services -----------------------------
+    let framebuffer = probe_framebuffer();
+    let rsdp = acpi_rsdp();
 
-    // ---- 5. Hand off -----------------------------------------------------
-    // The kernel receives the verified memory map, the unlocked volume key, and
-    // the GOP framebuffer so Prism can take over the animation mid-frame
-    // without a mode set — the boot cinematic dissolves directly into the
-    // login screen with no black flash.
-    boot_kernel(usable, key_page)
-}
+    let info = allocate_boot_info()?;
+    // SAFETY: freshly allocated, page aligned, and large enough by
+    // construction; nothing else holds a reference.
+    let info = unsafe { &mut *info };
+    *info = BootInfo::empty();
+    info.kernel_phys_base = base;
+    info.kernel_virt_base = base;
+    info.kernel_bytes = span;
+    info.framebuffer = framebuffer;
+    info.acpi_rsdp = rsdp;
+    // One processor. Counting the rest needs the ACPI MADT, which nothing
+    // parses yet; reporting a guess would be worse than reporting the truth.
+    info.cpu_count = 1;
+    // Signature verification is not wired up. Stated once, in the one place
+    // that decides it, rather than assumed anywhere.
+    info.flags &= !FLAG_IMAGES_VERIFIED;
 
-fn halt_memory_fault(fault: spd::MemoryFault) -> ! {
-    let code = match fault {
-        spd::MemoryFault::NoModulesDetected => POST_NO_MEMORY,
-        spd::MemoryFault::BelowMinimum { .. } => POST_MEMORY_LOW,
-        spd::MemoryFault::MapMismatch { .. } => POST_MAP_MISMATCH,
-    };
+    log!(
+        uart,
+        "framebuffer {}x{} at {:#x}, rsdp {:#x}",
+        framebuffer.width,
+        framebuffer.height,
+        framebuffer.base,
+        rsdp
+    );
+    log!(uart, "exiting boot services");
 
-    if let Some(mut fb) = open_framebuffer() {
-        fb.clear(0xFF00_0000);
-        draw_pulsing_banner(&mut fb, glitch::MEMORY_HALT_TEXT, glitch::glitch_red);
-    }
+    // ---- 6. Exit boot services, then build the map -----------------------
+    // SAFETY: no further boot-services call is made after this point. The
+    // allocations above are complete and the console is the serial port, which
+    // is driven by direct port I/O rather than by any firmware protocol.
+    let mut map = unsafe { uefi::boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+    // UEFI does not promise an ordered map, and every consumer downstream —
+    // the merge below, the validator, the frame allocator — assumes ascending
+    // order.
+    map.sort();
 
-    // SAFETY: no return, no allocation, interrupts masked inside.
-    unsafe { spectre_halt_forever(code) }
-}
-
-fn halt_tamper<T: attest::Tpm>(tpm: &mut T, tamper: attest::Tamper) -> ! {
-    // Destroy sealed key material before anything else. If the user cuts power
-    // during the animation, the wipe must already have happened.
-    let _ = attest::wipe_sealed_keys(tpm);
-
-    if let Some(mut fb) = open_framebuffer() {
-        fb.clear(0xFF00_0000);
-        draw_pulsing_banner(&mut fb, glitch::TAMPER_HALT_TEXT, glitch::glitch_red);
-        draw_address_column(&mut fb, &tamper.actual);
-    }
-
-    unsafe { spectre_halt_forever(POST_TAMPER) }
-}
-
-// ---------------------------------------------------------------------------
-// Platform glue. Each of these is a thin wrapper over a UEFI protocol; they are
-// separated out so the logic above stays testable against mocks on a host.
-// ---------------------------------------------------------------------------
-
-fn conventional_memory_total() -> u64 {
-    use uefi::boot::MemoryType;
-
-    let map = uefi::boot::memory_map(MemoryType::LOADER_DATA).expect("memory map");
-    map.entries()
-        .filter(|d| {
-            matches!(
-                d.ty,
-                MemoryType::CONVENTIONAL | MemoryType::BOOT_SERVICES_DATA | MemoryType::LOADER_DATA
-            )
-        })
-        .map(|d| d.page_count * 4096)
-        .sum()
-}
-
-/// Returns the enumerated DIMMs and whether the SMBus was reachable at all.
-fn probe_memory_modules() -> (heapless::Vec<spd::Module, 8>, bool) {
-    match smbus::open_host_controller() {
-        Some(mut bus) => (spd::enumerate(&mut bus), true),
-        None => {
-            log::warn!("SMBus unreachable; falling back to memory-map-only audit");
-            (heapless::Vec::new(), false)
+    let mut builder = MemoryMapBuilder::new();
+    let kernel_end = base + span;
+    for entry in map.entries() {
+        let len = entry.page_count * PAGE_SIZE;
+        if len == 0 {
+            continue;
         }
+        let kind = if entry.phys_start >= base && entry.phys_start < kernel_end {
+            MemoryKind::Kernel
+        } else {
+            MemoryKind::from_uefi(entry.ty.0)
+        };
+        builder.push(MemoryRegion::new(entry.phys_start, len, kind));
+    }
+    builder.finish(info);
+
+    log!(
+        uart,
+        "handoff: {} regions, {} MiB usable",
+        info.region_count,
+        info.usable_bytes >> 20
+    );
+    log!(uart, "jumping to kernel at {:#x}", kernel.entry());
+
+    // ---- 7. Jump ---------------------------------------------------------
+    // SAFETY: the entry point lies inside a loaded segment (checked by
+    // `Elf64::parse`), the image is fully copied and zeroed, and the handoff
+    // structure is live in `LOADER_DATA`. Interrupts are masked first because
+    // the firmware left them enabled and the kernel's IDT does not exist yet —
+    // one timer tick between here and `lidt` would be delivered through the
+    // firmware's table, which we are about to stop keeping alive.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "jmp {entry}",
+            entry = in(reg) kernel.entry(),
+            in("rdi") info as *mut BootInfo,
+            options(noreturn),
+        );
     }
 }
 
-fn open_framebuffer() -> Option<glitch::Framebuffer> {
-    let handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
-    let mut gop = uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
+fn read_kernel(uart: &mut Uart<X86Ports>) -> Result<Vec<u8>, Status> {
+    let volume = uefi::boot::get_image_file_system(uefi::boot::image_handle()).map_err(|e| {
+        log!(uart, "no filesystem on the boot device: {e:?}");
+        Status::NOT_FOUND
+    })?;
+    let mut fs = uefi::fs::FileSystem::new(volume);
 
-    let mode = gop.current_mode_info();
-    let (width, height) = mode.resolution();
-    let stride = mode.stride();
-    let base = gop.frame_buffer().as_mut_ptr() as *mut u32;
-
-    // SAFETY: address, dimensions, and stride all come from GOP itself, and we
-    // hold the protocol open exclusively for the remainder of the boot.
-    Some(unsafe { glitch::Framebuffer::new(base, width, height, stride) })
-}
-
-fn draw_pulsing_banner(fb: &mut glitch::Framebuffer, text: &str, color: fn(f32) -> u32) {
-    // One pass at peak intensity; the pulse loop proper lives in the halt
-    // routine's caller on platforms with a usable timer. Text rendering uses
-    // the embedded 8x16 VGA font in `font.rs`.
-    let _ = (text, color(1.0));
-    font::draw_centered(fb, text, color);
-}
-
-fn draw_address_column(fb: &mut glitch::Framebuffer, digest: &attest::Digest512) {
-    for line in 0..24 {
-        let bytes = glitch::tamper_line(digest, line);
-        font::draw_line(fb, 32, 200 + line * 18, &bytes, glitch::glitch_red(0.6));
-    }
-}
-
-// Stubs resolved by the linker against the platform crates; declared here so
-// the boot flow above reads top-to-bottom.
-mod font;
-mod smbus;
-
-fn load_signed_manifest() -> alloc::vec::Vec<attest::ManifestEntry> {
-    manifest::load_and_verify_signature().unwrap_or_else(|_| {
-        // A forged or unparseable manifest is treated exactly like a modified
-        // kernel: there is no "boot anyway" path.
-        halt_tamper(
-            &mut open_tcg2(),
-            attest::Tamper {
-                kind: attest::TamperKind::ManifestForged,
-                path: "\\SPECTRE\\BOOT.MANIFEST",
-                expected: [0; attest::DIGEST_LEN],
-                actual: [0; attest::DIGEST_LEN],
-            },
-        )
+    let path = uefi::CString16::try_from(KERNEL_PATH).map_err(|_| Status::INVALID_PARAMETER)?;
+    fs.read(uefi::fs::Path::new(&path)).map_err(|e| {
+        log!(uart, "cannot read {KERNEL_PATH}: {e:?}");
+        Status::NOT_FOUND
     })
 }
 
-mod manifest;
-mod tcg2;
-
-fn open_tcg2() -> tcg2::Tcg2 {
-    tcg2::Tcg2::open()
+/// Reserves a page-aligned home for the handoff structure.
+///
+/// `LOADER_DATA` on purpose: the kernel classifies it as `Loader`, which is not
+/// allocatable, so the frame allocator cannot hand out the structure it is
+/// reading its own configuration from.
+fn allocate_boot_info() -> Result<*mut BootInfo, Status> {
+    let pages = (core::mem::size_of::<BootInfo>() as u64).div_ceil(PAGE_SIZE) as usize;
+    let ptr = uefi::boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+        .map_err(|_| Status::OUT_OF_RESOURCES)?;
+    Ok(ptr.as_ptr().cast())
 }
 
-fn read_esp_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    esp::read(path).ok()
+/// Lists free conventional ranges big enough to hold the kernel.
+///
+/// Only reached when the fixed load address is unavailable. Printing the first
+/// few candidates turns "allocation failed" into "relink at one of these",
+/// which is the difference between a five-minute fix and an afternoon of
+/// bisecting addresses by hand.
+fn report_free_regions(uart: &mut Uart<X86Ports>, needed: u64) {
+    let Ok(map) = uefi::boot::memory_map(MemoryType::LOADER_DATA) else {
+        return;
+    };
+    log!(uart, "free conventional ranges that would fit {needed:#x}:");
+    let mut shown = 0;
+    for entry in map.entries() {
+        if entry.ty != MemoryType::CONVENTIONAL {
+            continue;
+        }
+        let len = entry.page_count * PAGE_SIZE;
+        if len < needed {
+            continue;
+        }
+        log!(
+            uart,
+            "  {:#012x}..{:#012x} ({} MiB)",
+            entry.phys_start,
+            entry.phys_start + len,
+            len >> 20
+        );
+        shown += 1;
+        if shown == 8 {
+            break;
+        }
+    }
 }
 
-mod esp;
-
-fn unlock_root_volume() -> *mut u8 {
-    crypto::prompt_and_derive_key()
+fn conventional_memory_total() -> u64 {
+    let Ok(map) = uefi::boot::memory_map(MemoryType::LOADER_DATA) else {
+        return 0;
+    };
+    map.entries()
+        .filter(|d| MemoryKind::from_uefi(d.ty.0).is_allocatable())
+        .map(|d| d.page_count * PAGE_SIZE)
+        .sum()
 }
 
-mod crypto;
+/// Reads the framebuffer geometry the firmware already has running.
+///
+/// Deliberately no mode set: the loader takes what is there. Changing modes
+/// here would mean the boot animation and the kernel disagree about the
+/// framebuffer, and a mode set that fails halfway leaves no console at all.
+fn probe_framebuffer() -> Framebuffer {
+    let Ok(handle) = uefi::boot::get_handle_for_protocol::<GraphicsOutput>() else {
+        return Framebuffer::default();
+    };
+    let Ok(mut gop) = uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle) else {
+        return Framebuffer::default();
+    };
 
-fn boot_kernel(usable: u64, key_page: *mut u8) -> ! {
-    handoff::jump_to_kernel(usable, key_page)
+    let mode = gop.current_mode_info();
+    let (width, height) = mode.resolution();
+    Framebuffer {
+        base: gop.frame_buffer().as_mut_ptr() as u64,
+        width: width as u32,
+        height: height as u32,
+        stride: mode.stride() as u32,
+        // GOP reports BGR or RGB with a reserved byte; both are 4 bytes wide.
+        bytes_per_pixel: 4,
+    }
 }
 
-mod handoff;
+/// The ACPI 2.0 RSDP, preferred over the 1.0 one where both are present.
+fn acpi_rsdp() -> u64 {
+    use uefi::table::cfg::ConfigTableEntry;
+
+    let mut fallback = 0u64;
+    uefi::system::with_config_table(|entries| {
+        for entry in entries {
+            if entry.guid == ConfigTableEntry::ACPI2_GUID {
+                return entry.address as u64;
+            }
+            if entry.guid == ConfigTableEntry::ACPI_GUID {
+                fallback = entry.address as u64;
+            }
+        }
+        fallback
+    })
+}
+
+fn halt_forever() -> ! {
+    loop {
+        // SAFETY: halting has no memory effects and never returns.
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}

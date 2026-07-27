@@ -1,0 +1,177 @@
+//! The hardware abstraction layer, and the bring-up sequence that uses it.
+//!
+//! The submodules split along one line: `addr`, `context`, `frame`, `gdt`,
+//! `idt`, `paging`, and `serial` are pure data structures and algorithms with no
+//! I/O, tested exhaustively on the host by `verify/`. `cpu`, `console`,
+//! `segments`, `interrupts`, and `memory` are the parts that touch the machine
+//! and can only be verified by booting.
+//!
+//! `early_init` is the ordering, and the order is not free:
+//!
+//!   1. **Console first.** Everything after this can fail, and a failure with no
+//!      way to report it is a black screen.
+//!   2. **Validate the handoff.** Every later step trusts the memory map. A
+//!      malformed one caught here costs a serial line; caught later it is a
+//!      frame allocator handing out the running kernel.
+//!   3. **GDT, then IDT.** Gate descriptors name a code selector, so the GDT has
+//!      to be live before the IDT can reference it.
+//!   4. **Frame allocator, then page tables.** Building a page table requires
+//!      somewhere to allocate the intermediate tables from.
+//!   5. **Switch CR3 last.** It is the only step that cannot report its own
+//!      failure: a page table that does not map the instruction after `mov cr3`
+//!      triple-faults with nothing on the wire.
+
+pub mod addr;
+pub mod console;
+pub mod context;
+pub mod cpu;
+pub mod frame;
+pub mod gdt;
+pub mod idt;
+pub mod interrupts;
+pub mod memory;
+pub mod paging;
+pub mod segments;
+pub mod serial;
+
+use crate::boot_info::BootInfo;
+use crate::kprintln;
+
+/// What went wrong during bring-up, in the order the steps run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitError {
+    BootInfo(crate::boot_info::BootInfoError),
+    Gdt(gdt::GdtError),
+    Idt(idt::IdtError),
+    Memory(memory::MemoryError),
+}
+
+/// Brings the processor up to a known state.
+///
+/// # Safety
+/// Called exactly once, on the bootstrap processor, with interrupts disabled and
+/// the loader's identity mapping still active.
+pub unsafe fn early_init(boot: &BootInfo) -> Result<(), InitError> {
+    console::init();
+    kprintln!("[kernel] WhisezOS microkernel, stage 1");
+
+    boot.validate().map_err(InitError::BootInfo)?;
+    report_handoff(boot);
+
+    // SAFETY: bring-up preconditions are the caller's; see the module comment
+    // for why the order below cannot be rearranged.
+    let layout = unsafe { segments::install() }.map_err(InitError::Gdt)?;
+    kprintln!(
+        "[kernel] gdt installed cs={:#06x} ds={:#06x} tss={:#06x}",
+        layout.kernel_code.0,
+        layout.kernel_data.0,
+        layout.tss.0
+    );
+
+    // SAFETY: the GDT is live, so the gates' code selector is valid.
+    unsafe { interrupts::install(&layout) }.map_err(InitError::Idt)?;
+    kprintln!("[kernel] idt installed, 256 vectors present");
+
+    report_protection_state();
+
+    // SAFETY: the handoff has been validated, so the regions are sorted,
+    // disjoint, and exclude the running kernel.
+    let stats = unsafe { memory::init(boot) }.map_err(InitError::Memory)?;
+    kprintln!(
+        "[kernel] frames total={} free={} ({} MiB usable)",
+        stats.total_frames,
+        stats.free_frames,
+        stats.usable_bytes >> 20
+    );
+
+    // SAFETY: `memory::init` built a table that maps all of physical memory,
+    // which necessarily includes the running code, the current stack, and the
+    // table itself.
+    let root = unsafe { memory::activate_kernel_tables() }.map_err(InitError::Memory)?;
+    kprintln!("[kernel] page tables active cr3={:#018x}", root);
+
+    Ok(())
+}
+
+fn report_handoff(boot: &BootInfo) {
+    kprintln!(
+        "[kernel] handoff v{} {} regions, {} MiB usable, {} cpu(s)",
+        boot.version,
+        boot.region_count,
+        boot.usable_bytes >> 20,
+        boot.cpu_count
+    );
+    kprintln!(
+        "[kernel] image phys={:#018x} size={} KiB",
+        boot.kernel_phys_base,
+        boot.kernel_bytes >> 10
+    );
+    if boot.framebuffer.is_present() {
+        kprintln!(
+            "[kernel] framebuffer {}x{} stride={} at {:#018x}",
+            boot.framebuffer.width,
+            boot.framebuffer.height,
+            boot.framebuffer.stride,
+            boot.framebuffer.base
+        );
+    } else {
+        kprintln!("[kernel] framebuffer absent, serial is the only console");
+    }
+    if boot.memory_map_truncated() {
+        kprintln!("[kernel] WARNING memory map truncated, unknown ranges treated as reserved");
+    }
+    // Said out loud every boot, on purpose. The loader does not verify
+    // signatures yet, and a chain that is not checked should not be silent
+    // about it.
+    if !boot.images_verified() {
+        kprintln!("[kernel] WARNING images are NOT signature-verified in this build");
+    }
+}
+
+/// Reports the protection features the page tables depend on.
+///
+/// `W^X` in `paging.rs` is enforced by the NX bit, which does nothing unless
+/// `EFER.NXE` is set; read-only kernel mappings do nothing unless `CR0.WP` is
+/// set. Printing the state each boot is how a firmware that left them off
+/// becomes visible rather than becoming a silently unenforced policy.
+fn report_protection_state() {
+    let cr0 = cpu::read_cr0();
+    let cr4 = cpu::read_cr4();
+    let efer = cpu::read_efer();
+    kprintln!(
+        "[kernel] protection wp={} nx={} smep={} smap={}",
+        yes_no(cr0 & cpu::CR0_WRITE_PROTECT != 0),
+        yes_no(efer & cpu::EFER_NO_EXECUTE != 0),
+        yes_no(cr4 & cpu::CR4_SMEP != 0),
+        yes_no(cr4 & cpu::CR4_SMAP != 0),
+    );
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+pub fn enable_interrupts() {
+    cpu::enable_interrupts();
+}
+
+pub fn disable_interrupts() {
+    cpu::disable_interrupts();
+}
+
+pub fn halt_forever() -> ! {
+    cpu::halt_forever()
+}
+
+/// Prints a panic message without taking the console lock.
+pub fn emergency_serial(info: &core::panic::PanicInfo<'_>) {
+    // SAFETY: the system is going down and the lock may be held by the code
+    // that panicked; see `console::emergency_write`.
+    unsafe {
+        console::emergency_write(format_args!("\r\n[kernel] panic: {info}\r\n"));
+    }
+}

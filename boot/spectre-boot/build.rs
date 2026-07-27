@@ -1,13 +1,8 @@
 fn main() {
-    if std::env::var_os("CARGO_FEATURE_PRODUCTION_LOADER").is_some() {
-        // The halt path must be assembly: it runs after we have deliberately
-        // invalidated the Rust runtime's assumptions (allocator torn down,
-        // boot services exited, possibly with a partial page table).
-        cc::Build::new()
-            .file("src/arch/x86_64/halt.S")
-            .flag("-ffreestanding")
-            .compile("spectre_halt");
-    }
-
-    println!("cargo:rerun-if-changed=src/arch/x86_64/halt.S");
+    // The halt path used to be hand-written assembly in a separate object,
+    // built here with `cc`. It is now a `core::arch::asm!` block in the loader
+    // itself: it is three instructions, and requiring a C toolchain on every
+    // developer's machine to assemble `cli; hlt; jmp` was a build dependency
+    // that bought nothing.
+    println!("cargo:rerun-if-changed=build.rs");
 }

@@ -3,14 +3,17 @@ name = "spectre-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
 
 # Target: x86_64-unknown-none, built with -Z build-std=core,alloc.
 # The kernel has no `std`, no unwinding, and no heap outside the slab allocator
 # in `vault.rs`.
 
 [dependencies]
-chacha20poly1305 = { workspace = true }
-zerocopy = { workspace = true }
+# Only what the modules this crate actually links need. `vault.rs` pulls in
+# chacha20poly1305 and zerocopy, and comes back with them when its platform
+# dependencies land; carrying the dependencies before the code that uses them
+# means every kernel build pays for crates it never links.
 bitflags = { workspace = true }
 spin = { workspace = true }
 
@@ -22,4 +25,12 @@ default = []
 forensic-dump = []
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+crate-type = ["rlib"]
+
+# The bootable image. Built by `cargo xtask kernel`, which supplies the linker
+# script — the entry point and the section symbols in `kernel.ld` are both load
+# bearing, so a plain `cargo build` of this target is not expected to produce a
+# usable image.
+[[bin]]
+name = "spectre-kernel"
+path = "src/main.rs"

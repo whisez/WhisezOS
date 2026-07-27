@@ -60,6 +60,18 @@ enum Cmd {
     },
     /// Run every test suite, including the host-side kernel logic tests.
     Test,
+    /// Boot the production loader and microkernel in QEMU, serial on stdio.
+    BootRun {
+        #[arg(long, default_value = "q35")]
+        machine: String,
+        /// Must clear the memory floor `spd::audit` enforces, which is 8 GiB of
+        /// *usable* memory. 9 GiB rather than 8: the firmware keeps a few
+        /// megabytes for itself, and the audit measures what is left.
+        #[arg(long, default_value = "9G")]
+        ram: String,
+    },
+    /// Boot the microkernel in QEMU headless and assert the serial log.
+    BootTest,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +87,8 @@ fn main() -> Result<()> {
         Cmd::Image { out } => build_image(&out),
         Cmd::Run { machine, ram, gpu } => run_demo_qemu(&machine, &ram, &gpu),
         Cmd::Test => run_tests(),
+        Cmd::BootRun { machine, ram } => run_kernel_qemu(&machine, &ram, None),
+        Cmd::BootTest => boot_test(),
     }
 }
 
@@ -192,14 +206,26 @@ fn build_bundle() -> Result<()> {
     Ok(())
 }
 
+/// Where the built kernel ELF lands.
+const KERNEL_ELF: &str = "target/x86_64-unknown-none/kernel/spectre-kernel";
+/// Where the built production loader lands.
+const LOADER_EFI: &str = "target/x86_64-unknown-uefi/release/spectre-boot.efi";
+
 fn build_kernel() -> Result<()> {
-    run(
+    // The linker script is not optional. It fixes the load address the loader
+    // allocates at and exports the section symbols `arch/memory.rs` uses to map
+    // the image W^X; a default link produces an ELF that loads nowhere useful
+    // and a kernel that cannot find its own text boundary.
+    let flags = "-C link-arg=-Tkernel/spectre-kernel/kernel.ld -C relocation-model=static";
+    run_with_env(
         "cargo",
         &[
             "build",
             "--profile",
             "kernel",
             "-p",
+            "spectre-kernel",
+            "--bin",
             "spectre-kernel",
             "--target",
             "x86_64-unknown-none",
@@ -208,7 +234,172 @@ fn build_kernel() -> Result<()> {
             "-Z",
             "build-std-features=compiler-builtins-mem",
         ],
+        &[("RUSTFLAGS", flags)],
     )
+}
+
+/// Stages an ESP holding the production loader and the kernel.
+///
+/// Layout mirrors the real disk image: the loader is the removable-media
+/// fallback path the firmware boots without an NVRAM entry, and the kernel sits
+/// where the loader looks for it.
+fn stage_boot_esp(dir: &Path) -> Result<()> {
+    build_boot()?;
+    build_kernel()?;
+
+    let efi = dir.join("EFI/BOOT");
+    let spectre = dir.join("SPECTRE");
+    std::fs::create_dir_all(&efi)?;
+    std::fs::create_dir_all(&spectre)?;
+    std::fs::copy(LOADER_EFI, efi.join("BOOTX64.EFI")).context("staging the loader")?;
+    std::fs::copy(KERNEL_ELF, spectre.join("KERNEL.ELF")).context("staging the kernel")?;
+    Ok(())
+}
+
+/// Boots the production loader and kernel in QEMU with the serial port visible.
+fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>) -> Result<()> {
+    let esp = Path::new("target/boot-esp");
+    stage_boot_esp(esp)?;
+
+    let qemu = find_qemu().context("QEMU not found")?;
+    let firmware_code = find_uefi_firmware(&qemu).context("UEFI firmware not found beside QEMU")?;
+    let firmware_vars = find_uefi_vars(&qemu).context("UEFI variable template not found")?;
+    let vars_copy = Path::new("target/BOOT_VARS.fd");
+    std::fs::copy(&firmware_vars, vars_copy)?;
+
+    let esp_path = std::fs::canonicalize(esp)?;
+    let fat_drive = format!("format=raw,file=fat:rw:{}", qemu_path(&esp_path));
+    let code_drive = format!(
+        "if=pflash,format=raw,unit=0,readonly=on,file={}",
+        qemu_path(&firmware_code)
+    );
+    let vars_drive = format!(
+        "if=pflash,format=raw,unit=1,file={}",
+        qemu_path(&std::fs::canonicalize(vars_copy)?)
+    );
+    let machine_arg = format!("{machine},smm=on");
+
+    // Headless when capturing, windowed when a person is watching. The kernel's
+    // only output is the serial port either way.
+    let (serial_arg, display) = match serial {
+        Some(path) => (
+            format!("file:{}", qemu_path(&std::path::absolute(path)?)),
+            "none",
+        ),
+        None => ("stdio".to_string(), "none"),
+    };
+
+    run_path(
+        &qemu,
+        &[
+            "-name",
+            "WhisezOS kernel",
+            "-machine",
+            &machine_arg,
+            "-smp",
+            "1",
+            "-m",
+            ram,
+            "-drive",
+            &code_drive,
+            "-drive",
+            &vars_drive,
+            "-drive",
+            &fat_drive,
+            "-serial",
+            &serial_arg,
+            "-display",
+            display,
+            "-boot",
+            "menu=off,strict=on",
+            // A kernel that triple-faults reboots forever otherwise, and the
+            // serial capture fills with repeated boots instead of showing the
+            // first failure.
+            "-no-reboot",
+            "-no-shutdown",
+        ],
+    )
+}
+
+/// Lines the boot must produce, in order.
+///
+/// This is the Phase 1 acceptance criterion in executable form. Each entry is a
+/// step that can fail silently on real hardware — a loader that cannot claim its
+/// load address, a GDT that faults on the far return, an IDT with a gap, a CR3
+/// switch onto a table that does not map the next instruction — and the only
+/// evidence any of them worked is that the next line appears.
+const EXPECTED_BOOT_LINES: &[&str] = &[
+    "[boot] WhisezOS stage-1 loader",
+    "[boot] memory audit passed",
+    "segments loaded",
+    "[boot] exiting boot services",
+    "[boot] jumping to kernel",
+    "[kernel] WhisezOS microkernel, stage 1",
+    "[kernel] gdt installed",
+    "[kernel] idt installed",
+    "[kernel] frames total=",
+    "[kernel] page tables active",
+    "[kernel] stage 1 complete",
+];
+
+/// Boots the kernel in QEMU and asserts the serial log.
+fn boot_test() -> Result<()> {
+    let log = Path::new("target/boot-serial.log");
+    if log.exists() {
+        std::fs::remove_file(log)?;
+    }
+
+    // QEMU is left running by `-no-shutdown` so a failure can be inspected, so
+    // the run is bounded from outside rather than waited on.
+    let child = std::thread::spawn(|| {
+        run_kernel_qemu("q35", "9G", Some(Path::new("target/boot-serial.log")))
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut captured = String::new();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        captured = std::fs::read_to_string(log).unwrap_or_default();
+        if captured.contains(EXPECTED_BOOT_LINES[EXPECTED_BOOT_LINES.len() - 1]) {
+            break;
+        }
+    }
+    kill_qemu();
+    let _ = child.join();
+
+    let mut cursor = 0usize;
+    for expected in EXPECTED_BOOT_LINES {
+        match captured[cursor..].find(expected) {
+            Some(at) => cursor += at + expected.len(),
+            None => {
+                eprintln!("--- captured serial log ---\n{captured}\n---");
+                bail!("boot log is missing, or has out of order, the line: {expected:?}");
+            }
+        }
+    }
+
+    println!(
+        "boot test passed: {} stages observed",
+        EXPECTED_BOOT_LINES.len()
+    );
+    Ok(())
+}
+
+fn kill_qemu() {
+    let name = if cfg!(windows) {
+        "qemu-system-x86_64.exe"
+    } else {
+        "qemu-system-x86_64"
+    };
+    let _ = if cfg!(windows) {
+        Command::new("taskkill")
+            .args(["/F", "/IM", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    } else {
+        Command::new("pkill").args(["-f", name]).status()
+    };
 }
 
 fn build_shaders() -> Result<()> {
@@ -429,10 +620,21 @@ fn run_demo_qemu(machine: &str, ram: &str, gpu: &str) -> Result<()> {
             gpu,
             "-device",
             "qemu-xhci",
+            // `usb-tablet` is an absolute pointing device. A relative
+            // `usb-mouse` only delivers motion once the VM has grabbed the host
+            // pointer, which is why the preview's cursor did not move: the
+            // firmware had nothing to report. The tablet needs no grab, and the
+            // preview binds EFI_ABSOLUTE_POINTER_PROTOCOL to read it. The mouse
+            // stays attached so the relative path is exercised too.
+            "-device",
+            "usb-tablet",
             "-device",
             "usb-mouse",
+            // No `show-cursor=on`: with an absolute device the host cursor
+            // tracks the guest cursor exactly, and drawing both leaves two
+            // overlapping arrows on screen.
             "-display",
-            "gtk,show-cursor=on,zoom-to-fit=on,grab-on-hover=off",
+            "gtk,zoom-to-fit=on,grab-on-hover=off",
             "-boot",
             "menu=off,strict=on",
             "-no-reboot",
@@ -446,6 +648,10 @@ fn run_tests() -> Result<()> {
     // production platform binaries, so the honest test boundary is explicit.
     run("cargo", &["test", "--manifest-path", "verify/Cargo.toml"])?;
     run("cargo", &["test", "-p", "whisez-guard"])?;
+
+    for package in ["whisez-guard", "xtask", "spectre-boot", "spectre-kernel"] {
+        run("cargo", &["fmt", "-p", package, "--", "--check"])?;
+    }
     run(
         "cargo",
         &["clippy", "-p", "whisez-guard", "--", "-D", "warnings"],
@@ -466,7 +672,64 @@ fn run_tests() -> Result<()> {
             "warnings",
         ],
     )?;
+    // The production loader and the kernel need `build-std`, so they are linted
+    // separately from the preview rather than in one invocation.
+    run_with_env(
+        "cargo",
+        &[
+            "clippy",
+            "-p",
+            "spectre-boot",
+            "--bin",
+            "spectre-boot",
+            "--features",
+            "production-loader",
+            "--target",
+            "x86_64-unknown-uefi",
+            "-Z",
+            "build-std=core,alloc,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[("RUSTFLAGS", "")],
+    )?;
+    run_with_env(
+        "cargo",
+        &[
+            "clippy",
+            "-p",
+            "spectre-kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "-Z",
+            "build-std=core,alloc,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[(
+            "RUSTFLAGS",
+            "-C link-arg=-Tkernel/spectre-kernel/kernel.ld -C relocation-model=static",
+        )],
+    )?;
+
     build_demo()?;
+    build_boot()?;
+    build_kernel()?;
+
+    // The boot test is the only thing here that proves the kernel runs rather
+    // than merely compiles, so it is not optional when it can be run at all.
+    // CI has no QEMU, hence the skip rather than a hard failure.
+    if find_qemu().is_some() {
+        boot_test()?;
+    } else {
+        eprintln!("warning: kernel boot test skipped because QEMU is not installed");
+    }
 
     if which("glslc").is_some() {
         build_shaders()?;

@@ -14,14 +14,11 @@ sha3 = { workspace = true }
 bitflags = { workspace = true }
 heapless = "0.9"
 
-[build-dependencies]
-cc = "1.2"
-
 [features]
 default = []
-# The architecture document describes the production loader, but several of
-# its platform modules are still specifications. Keep it explicitly gated so
-# the bootable preview remains honest and independently buildable.
+# The production loader loads and boots the real kernel; the preview is a
+# separate bin that boots nothing. Keeping them apart is what lets the preview
+# stay honest about being a preview.
 production-loader = []
 
 [[bin]]

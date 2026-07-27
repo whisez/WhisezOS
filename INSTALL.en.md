@@ -66,19 +66,74 @@ The command automatically:
 1. Builds the real UEFI application in release mode.
 2. Creates a private, temporary firmware-variable file for QEMU.
 3. Starts the virtual machine with EDK2/OVMF firmware.
-4. Displays the WhisezOS boot animation and desktop preview.
+4. Displays the WhisezOS boot animation, the staged setup rehearsal, and the
+   desktop preview.
+
+The setup screen runs for about a minute and walks through the production
+installation order. It **reads and writes no disk**. Press `Esc` to skip it.
 
 Closing the QEMU window stops the preview. Your computer's physical disk is not
 attached to the virtual machine during this process.
 
 ## Controls
 
-- Move the pointer to select a card, then left-click to open it.
+- Press `Esc` on the setup screen to skip the rehearsal.
+- Move the pointer over a card or file icon to select it, then left-click to open it.
 - Right-click or press `Esc` to return to the desktop.
 - Use `Up` / `Down` or `W` / `S` to change the selection.
-- Press `Enter` to open the selected application.
-- Press `1`, `2`, or `3` to open Guard, Terminal, or Files.
+- Press `Tab` to switch between the application column and the file grid.
+- Press `Enter` to open the selected item.
+- Press `1`–`5` to open an application directly.
 - Press `Ctrl+Alt+G` to release the pointer captured by QEMU.
+
+### If the mouse does not work
+
+Check the `POINTER` readout in the top bar. It reports how many pointing devices
+were bound.
+
+The OVMF firmware shipped with QEMU contains no mouse driver at all: it exposes
+`EFI_SIMPLE_POINTER` and `EFI_ABSOLUTE_POINTER` only as the console splitter's
+empty virtual instances, so no amount of mouse movement produces data. The
+preview detects this and drives the PS/2 mouse directly through the i8042
+auxiliary port instead; the readout then shows `POINTER 1`.
+
+`NO POINTER DEVICE` means neither the firmware offers a device nor is an i8042
+controller present. The whole preview remains usable from the keyboard.
+
+## Running the production kernel
+
+The preview does not boot a kernel. To run the real loader and microkernel in
+QEMU:
+
+```powershell
+cargo xtask boot-run
+```
+
+This builds the production UEFI loader and the kernel ELF, stages them on a
+temporary EFI system partition, and starts QEMU. The kernel's only output is the
+serial port, so the command attaches serial to the terminal and opens no display
+window.
+
+Expect, in order: the loader's memory audit, validation of the kernel ELF, the
+exit from boot services, the handoff, then the kernel's GDT, IDT, frame
+allocator, and page-table lines, ending with `[kernel] stage 1 complete`.
+
+To verify the same boot automatically:
+
+```powershell
+cargo xtask boot-test
+```
+
+This runs QEMU headless, captures the serial log, and asserts that eleven stages
+appear in order. It also runs as part of `cargo xtask test`, and is skipped
+with a warning when QEMU is not installed.
+
+> The production loader enforces the project's own 8 GiB memory floor and
+> refuses to boot a platform below it, which is why the VM is started with 9 GiB.
+
+> The kernel does not start an init process yet; it halts after
+> `stage 1 complete`. This is the first verifiable vertical slice, not a
+> finished operating system.
 
 ## Build only
 

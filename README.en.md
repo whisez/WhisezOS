@@ -27,11 +27,15 @@ defensive utility named **Whisez Guard**.
 | Component | Status | Details |
 |---|:---:|---|
 | UEFI preview | ✅ Working | Boots on QEMU/OVMF and displays the WhisezOS animation and desktop |
-| Mouse and keyboard | ✅ Working | Card selection, left-click to open, right-click to return, and keyboard shortcuts |
+| Mouse and keyboard | ✅ Working | Card and file selection, left-click to open, right-click to return, and keyboard shortcuts |
+| Setup screen | ✅ Working | A staged installation rehearsal with progress bars; it touches no disk |
 | Whisez Guard | ✅ Working | Windows security audit, offline scan, SHA3-256 baseline verification, and monitoring |
 | Build and packaging | ✅ Working | Produces an EFI application, Guard binary, and 4K wallpaper package with one command |
-| Automated tests | ✅ 234 tests | Kernel, file-system, boot-logic, and Guard tests |
-| Production kernel | 🚧 In progress | The core design exists; full hardware initialization and drivers are incomplete |
+| Automated tests | ✅ 330 tests | Kernel, file-system, boot-logic, and Guard tests |
+| Production loader | ✅ Working | Reads, validates, and loads the kernel ELF, then exits boot services and hands off |
+| Production kernel | ✅ Boots in QEMU | GDT, IDT, serial console, frame allocator, and its own page tables; `cargo xtask boot-test` proves it from the serial log |
+| Interrupt controller and timer | 🚧 In progress | APIC, timer tick, and context switching are not wired up yet |
+| User space | ❌ Not ready | No init process, IPC, or capability distribution starts from the kernel yet |
 | Desktop session | 🚧 In progress | A preview exists; the real kernel-to-desktop path is not complete |
 | Physical installation | ❌ Not ready | Requires a disk installer, hardware compatibility work, and a recovery path |
 
@@ -84,12 +88,21 @@ full instructions and troubleshooting, or switch to the
 
 ## Controls
 
-- Hover over a card to select it, then left-click to open it.
+On the setup screen:
+
+- Press `Esc` to skip the rehearsal and go straight to the desktop.
+
+On the desktop:
+
+- Hover over a card or file icon to select it, then left-click to open it.
 - Right-click or press `Esc` to return to the desktop.
-- Use `Up` / `Down` or `W` / `S` to select an application.
-- Press `Enter` to open the selected application.
-- Press `1`, `2`, or `3` to open Guard, Terminal, or Files directly.
-- If QEMU captures the pointer, press `Ctrl+Alt+G` to release it.
+- Use `Up` / `Down` or `W` / `S` to move the selection.
+- Press `Tab` to switch between the application column and the file grid.
+- Press `Enter` to open the selected item.
+- Press `1`–`5` to open an application directly.
+- The `POINTER` readout in the top bar reports how many pointing devices were
+  bound. `NO POINTER DEVICE` means the firmware provides none; the preview is
+  then fully usable from the keyboard.
 
 ## Whisez Guard
 

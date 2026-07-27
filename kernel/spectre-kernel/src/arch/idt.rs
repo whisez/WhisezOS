@@ -57,6 +57,12 @@ pub mod vector {
     /// faulting process, never as recoverable.
     pub const CONTROL_PROTECTION: u8 = 21;
 
+    /// Hypervisor injection exception (AMD SVM). Delivered to a guest by the
+    /// hypervisor, so it can arrive on a VM even though nothing in the guest
+    /// can raise it. Leaving it without a gate is how a kernel that works on
+    /// bare metal triple-faults under a hypervisor and nowhere else.
+    pub const HYPERVISOR_INJECTION: u8 = 28;
+
     /// First vector available for device interrupts. 32 vectors are reserved by
     /// the architecture; using any of them for a device is a bug that surfaces
     /// as random exceptions under load.
@@ -105,6 +111,11 @@ pub enum IdtError {
     NonCanonicalHandler(u64),
     /// Reserved vector used for a device interrupt.
     ReservedVector(u8),
+    /// A deliverable exception vector has no present gate. Loading such a table
+    /// turns that exception into a #GP, and a #GP during exception delivery
+    /// escalates to #DF and then to a silent triple fault, so the table is
+    /// refused rather than loaded.
+    MissingHandler(u8),
 }
 
 /// Interrupt gate vs trap gate.

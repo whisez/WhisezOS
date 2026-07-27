@@ -117,7 +117,7 @@ impl Context {
         trampoline: VirtAddr,
         mut writer: impl FnMut(u64, u64),
     ) -> Result<Context, ContextError> {
-        if stack_top.as_u64() % 16 != 0 {
+        if !stack_top.as_u64().is_multiple_of(16) {
             return Err(ContextError::MisalignedStack(stack_top.as_u64()));
         }
         if entry.as_u64() == 0 {

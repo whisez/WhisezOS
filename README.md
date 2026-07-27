@@ -27,11 +27,15 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Bileşen | Durum | Açıklama |
 |---|:---:|---|
 | UEFI önizlemesi | ✅ Çalışıyor | QEMU/OVMF üzerinde açılır, WhisezOS animasyonunu ve masaüstünü gösterir |
-| Fare ve klavye | ✅ Çalışıyor | Kart seçme, sol tıkla açma, sağ tıkla geri dönme ve klavye kısayolları |
+| Fare ve klavye | ✅ Çalışıyor | Kart ve dosya seçme, sol tıkla açma, sağ tıkla geri dönme ve klavye kısayolları |
+| Kurulum ekranı | ✅ Çalışıyor | Aşamalı, ilerleme çubuklu kurulum provası; hiçbir diske dokunmaz |
 | Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
 | Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
-| Otomatik testler | ✅ 234 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
-| Üretim çekirdeği | 🚧 Yapılıyor | Temel mimari mevcut; tam donanım başlatma ve sürücüler tamamlanmadı |
+| Otomatik testler | ✅ 330 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
+| Üretim yükleyicisi | ✅ Çalışıyor | Çekirdek ELF'ini okur, doğrular, yükler ve boot servislerinden çıkıp devreder |
+| Üretim çekirdeği | ✅ QEMU'da açılıyor | GDT, IDT, seri konsol, çerçeve ayırıcı ve kendi sayfa tabloları; `cargo xtask boot-test` seri günlükle kanıtlar |
+| Kesme denetleyicisi ve zamanlayıcı | 🚧 Yapılıyor | APIC, zamanlayıcı tick'i ve bağlam değiştirme henüz bağlanmadı |
+| Kullanıcı alanı | ❌ Hazır değil | Init süreci, IPC ve yetenek dağıtımı çekirdekten henüz başlatılmıyor |
 | Masaüstü oturumu | 🚧 Yapılıyor | Önizleme var; gerçek çekirdekten masaüstüne geçiş henüz tamamlanmadı |
 | Fiziksel kurulum | ❌ Hazır değil | Disk kurucusu, donanım uyumluluğu ve kurtarma yolu tamamlanmadan kullanılamaz |
 
@@ -82,12 +86,21 @@ değiştirmez. Ayrıntılı anlatım ve sorun çözümleri için
 
 ## Kontroller
 
-- Fareyi bir kartın üzerine getirerek seçin, sol tıkla açın.
+Kurulum ekranında:
+
+- `Esc` ile kurulum provasını atlayıp doğrudan masaüstüne geçin.
+
+Masaüstünde:
+
+- Fareyi bir kartın veya dosya simgesinin üzerine getirerek seçin, sol tıkla açın.
 - Sağ tık veya `Esc` ile masaüstüne dönün.
-- `Yukarı` / `Aşağı` ya da `W` / `S` ile uygulama seçin.
-- `Enter` ile seçili uygulamayı açın.
-- `1`, `2`, `3` ile Guard, Terminal veya Files uygulamasını doğrudan açın.
-- QEMU fareyi yakalarsa `Ctrl+Alt+G` ile serbest bırakın.
+- `Yukarı` / `Aşağı` ya da `W` / `S` ile seçimi değiştirin.
+- `Tab` ile uygulama sütunu ile dosya ızgarası arasında geçiş yapın.
+- `Enter` ile seçili öğeyi açın.
+- `1`–`5` ile bir uygulamayı doğrudan açın.
+- Üst çubuktaki `POINTER` göstergesi kaç işaretçi aygıtının bağlandığını söyler.
+  `NO POINTER DEVICE` yazıyorsa firmware hiçbir fare sağlamıyor demektir;
+  bu durumda önizleme klavyeyle tam olarak kullanılabilir.
 
 ## Whisez Guard
 
