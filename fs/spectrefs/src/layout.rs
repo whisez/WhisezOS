@@ -170,7 +170,7 @@ impl Uberblock {
         // SAFETY: `Uberblock` is `repr(C)` with no padding-dependent semantics
         // and no pointers; reading it as bytes is well-defined.
         let bytes = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, len) };
-        hash::blake3(bytes)
+        blake3(bytes)
     }
 
     /// Which slot the next commit writes to.
@@ -379,12 +379,7 @@ pub fn prune_plan(snapshots: &[Snapshot]) -> heapless::Vec<ObjectId, 64> {
     doomed
 }
 
-mod hash {
-    pub fn blake3(_bytes: &[u8]) -> [u8; 32] {
-        [0; 32]
-    }
-}
-pub use hash::blake3;
+pub use crate::blake3::blake3;
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +547,79 @@ mod tests {
         let slots = [Some(good), Some(torn), None, None];
         let picked = Uberblock::select_newest_valid(&slots).unwrap();
         assert_eq!(picked.txg, 10, "selected a torn uberblock");
+    }
+
+    #[test]
+    fn changing_any_field_invalidates_the_checksum() {
+        // The property the whole filesystem rests on, and one that nothing here
+        // tested until the checksum was real. `hash::blake3` used to return
+        // zeros, so every uberblock's checksum was zero, every checksum matched
+        // every uberblock, and a test that flipped a field would have passed.
+        //
+        // The torn-write test above survived the stub only because it used
+        // `[0xFF; 32]` as its bad checksum — it proved that an obviously wrong
+        // value is rejected, never that a right one depends on the contents.
+        let base = Uberblock {
+            magic: MAGIC,
+            version: VERSION,
+            _pad: 0,
+            volume_id: 1,
+            txg: 10,
+            object_root: BlockPtr::SPARSE_PTR,
+            snapshot_root: BlockPtr::SPARSE_PTR,
+            dedup_root: BlockPtr::SPARSE_PTR,
+            timestamp_ms: 1234,
+            self_checksum: [0; 32],
+        };
+        let sealed = Uberblock {
+            self_checksum: base.compute_checksum(),
+            ..base
+        };
+        assert!(sealed.verify_checksum());
+
+        let mutations = [
+            Uberblock {
+                volume_id: 2,
+                ..sealed
+            },
+            Uberblock { txg: 11, ..sealed },
+            Uberblock {
+                timestamp_ms: 1235,
+                ..sealed
+            },
+            Uberblock {
+                version: VERSION + 1,
+                ..sealed
+            },
+        ];
+        for (index, mutated) in mutations.iter().enumerate() {
+            assert!(
+                !mutated.verify_checksum(),
+                "mutation {index} kept a checksum that was computed before it"
+            );
+        }
+    }
+
+    #[test]
+    fn two_different_uberblocks_do_not_share_a_checksum() {
+        // A hash that collided on everything would pass the test above only if
+        // the mutation happened to change the result. This is the same claim
+        // from the other direction.
+        let base = Uberblock {
+            magic: MAGIC,
+            version: VERSION,
+            _pad: 0,
+            volume_id: 1,
+            txg: 10,
+            object_root: BlockPtr::SPARSE_PTR,
+            snapshot_root: BlockPtr::SPARSE_PTR,
+            dedup_root: BlockPtr::SPARSE_PTR,
+            timestamp_ms: 0,
+            self_checksum: [0; 32],
+        };
+        let other = Uberblock { txg: 11, ..base };
+        assert_ne!(base.compute_checksum(), other.compute_checksum());
+        assert_ne!(base.compute_checksum(), [0u8; 32]);
     }
 
     #[test]

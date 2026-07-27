@@ -82,6 +82,9 @@ pub mod heuristic;
 #[path = "../../userland/winbridge/src/pe.rs"]
 pub mod pe;
 
+#[path = "../../fs/spectrefs/src/blake3.rs"]
+pub mod blake3;
+
 #[path = "../../fs/spectrefs/src/layout.rs"]
 pub mod layout;
 

@@ -577,6 +577,7 @@ fn boot_test() -> Result<()> {
     if log.exists() {
         std::fs::remove_file(log)?;
     }
+    blank_disk_sector()?;
 
     // QEMU is left running by `-no-shutdown` so a failure can be inspected, so
     // the run is bounded from outside rather than waited on.
