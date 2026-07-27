@@ -21,12 +21,14 @@
 
 use spin::Mutex;
 
+use crate::abi::SyscallError;
 use crate::arch::addr::{PagingMode, PhysAddr, VirtAddr};
 use crate::arch::gdt::GdtLayout;
 use crate::arch::trap::TrapFrame;
 use crate::arch::user::{UserProcess, MAX_USER_REGIONS};
 use crate::arch::{cpu, memory, segments};
 use crate::kprintln;
+use crate::portauth::{Grants, PortRange};
 use crate::roundrobin::{self, Slot};
 use crate::usercopy::UserRegion;
 
@@ -64,6 +66,12 @@ struct Process {
     regions: [UserRegion; MAX_USER_REGIONS],
     region_count: usize,
     exit_code: u64,
+    /// The ports this process may reach with `in` and `out`.
+    ///
+    /// Part of the process rather than of the TSS, because there is one TSS on
+    /// one processor and it describes whichever process is running. The switch
+    /// makes the bitmap match this.
+    ports: Grants,
     /// DMA buffers this process holds, which is both its next slot number and
     /// the limit it is checked against.
     dma_regions: u64,
@@ -89,6 +97,7 @@ impl Process {
         regions: [UserRegion::new(0, 0); MAX_USER_REGIONS],
         region_count: 0,
         exit_code: 0,
+        ports: Grants::NONE,
         dma_regions: 0,
         devices_mapped: 0,
     };
@@ -283,6 +292,7 @@ pub fn admit(image: &UserProcess, argument: u64, second: u64, third: u64) -> Opt
         regions,
         region_count: supplied.len(),
         exit_code: 0,
+        ports: Grants::NONE,
         dma_regions: 0,
         devices_mapped: 0,
     };
@@ -355,6 +365,25 @@ pub fn record_dma_mapping(base: u64, length: u64) -> Option<u64> {
     process.region_count += 1;
     process.dma_regions += 1;
     Some(slot)
+}
+
+/// Adds a port range to the running process and makes it take effect now.
+///
+/// Applying it immediately as well as recording it matters: the process is
+/// about to return from the system call into ring 3 and use the ports, and the
+/// next context switch — which is what would otherwise apply it — may be
+/// milliseconds away.
+pub fn grant_ports(range: PortRange) -> Result<(), SyscallError> {
+    let mut table = TABLE.lock();
+    let current = table.current;
+    table.slots[current].ports.add(range)?;
+    let grants = table.slots[current].ports;
+    drop(table);
+
+    // SAFETY: a system call arrives with interrupts disabled, on the processor
+    // whose TSS this is.
+    unsafe { segments::apply_io_permissions(&grants) };
+    Ok(())
 }
 
 /// How many DMA buffers the running process already holds.
@@ -453,6 +482,7 @@ unsafe fn resume_next() -> ! {
     table.slots[next].state = State::Running;
     let frame = table.slots[next].frame;
     let root = table.slots[next].root;
+    let ports = table.slots[next].ports;
     drop(table);
 
     let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
@@ -464,6 +494,10 @@ unsafe fn resume_next() -> ! {
             stack,
             PagingMode::Level4,
         ));
+        // The other TSS field that describes the running process rather than
+        // the machine. A bitmap left holding the last process's grants is that
+        // process's device handed to whoever is scheduled next.
+        segments::apply_io_permissions(&ports);
         cpu::write_cr3(root.as_u64());
         crate::arch::trap::enter_frame(&frame)
     }
@@ -643,6 +677,7 @@ pub fn on_tick(frame: &mut TrapFrame) {
     table.slots[next].state = State::Running;
     *frame = table.slots[next].frame;
     let root = table.slots[next].root;
+    let ports = table.slots[next].ports;
     drop(table);
 
     let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
@@ -655,6 +690,10 @@ pub fn on_tick(frame: &mut TrapFrame) {
             stack,
             PagingMode::Level4,
         ));
+        // The other TSS field that describes the running process rather than
+        // the machine. A bitmap left holding the last process's grants is that
+        // process's device handed to whoever is scheduled next.
+        segments::apply_io_permissions(&ports);
         cpu::write_cr3(root.as_u64());
     }
 }
@@ -704,6 +743,7 @@ pub unsafe fn run() -> ! {
     table.slots[first].state = State::Running;
     let frame = table.slots[first].frame;
     let root = table.slots[first].root;
+    let ports = table.slots[first].ports;
     drop(table);
 
     let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
@@ -713,6 +753,10 @@ pub unsafe fn run() -> ! {
             stack,
             PagingMode::Level4,
         ));
+        // The other TSS field that describes the running process rather than
+        // the machine. A bitmap left holding the last process's grants is that
+        // process's device handed to whoever is scheduled next.
+        segments::apply_io_permissions(&ports);
         cpu::write_cr3(root.as_u64());
         crate::arch::trap::enter_frame(&frame)
     }

@@ -43,6 +43,7 @@ use spin::Mutex;
 
 use crate::abi::SyscallError;
 use crate::boot_info::BootInfo;
+use crate::portauth::PortRange;
 
 /// Devices the kernel can describe.
 pub const MAX_DEVICES: usize = 8;
@@ -102,6 +103,12 @@ struct Entry {
     info: DeviceInfo,
     /// Where it actually is. Never leaves the kernel.
     phys: u64,
+    /// The ports this device is reached through, if it is reached that way.
+    ///
+    /// Kernel-side like the rest: a process asks for its device, not for a port
+    /// number, so it cannot express a request for ports belonging to anything
+    /// else. What it gets is decided here.
+    ports: Option<PortRange>,
     /// The interrupt line this device raises, if it raises one.
     ///
     /// Kernel-side like `phys`, and for the same reason: a line number is a
@@ -114,6 +121,7 @@ impl Entry {
     const EMPTY: Self = Self {
         info: DeviceInfo::EMPTY,
         phys: 0,
+        ports: None,
         line: None,
     };
 
@@ -159,6 +167,7 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
                     bytes_per_pixel: boot.framebuffer.bytes_per_pixel,
                 },
                 phys: boot.framebuffer.base,
+                ports: None,
                 line: None,
             };
             table.len = 1;
@@ -184,6 +193,7 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
             bytes_per_pixel: 0,
         },
         phys: 0,
+        ports: Some(TICKER_PORTS),
         line: Some(TICKER_LINE),
     };
     table.len = slot + 1;
@@ -196,6 +206,24 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
 /// Line zero because it is the first, and because `arch::start_device_interrupt`
 /// takes the same number — one place decides, and both ends read it from here.
 pub const TICKER_LINE: usize = 0;
+
+/// The ports the ticker is driven through: the CMOS index and data registers.
+///
+/// Two ports, which is as narrow as the hardware allows and wider than it
+/// sounds — the RTC shares these with the whole CMOS, so this grant also
+/// carries every CMOS byte and the NMI mask. `portauth.rs` says so at length;
+/// the short version is that it is a property of a machine from 1984 and not
+/// something this code can divide more finely.
+pub const TICKER_PORTS: PortRange = PortRange::new(0x70, 2);
+
+/// The ports device `index` is driven through.
+///
+/// Kernel-only, like `extent` and `line`.
+pub fn ports(grant: u64, index: u64) -> Result<PortRange, SyscallError> {
+    lookup(grant, index)?
+        .ports
+        .ok_or(SyscallError::NotPermitted)
+}
 
 /// Checks a grant and an index together.
 ///
@@ -280,6 +308,24 @@ mod tests {
         let info = describe(GRANT, 0).unwrap();
         assert_eq!(info.kind, DeviceKind::Ticker as u32);
         assert_eq!(line(GRANT, 0), Ok(TICKER_LINE));
+    }
+
+    #[test]
+    fn a_device_reached_only_by_mmio_has_no_ports_to_grant() {
+        // The framebuffer is a window, not a register file behind an index
+        // port. Asking for its ports must be refused rather than answered with
+        // the ticker's, which is what a shared default would do.
+        init(&boot_with_framebuffer(), GRANT);
+        assert_eq!(ports(GRANT, 0), Err(SyscallError::NotPermitted));
+        assert_eq!(ports(GRANT, 1), Ok(TICKER_PORTS));
+    }
+
+    #[test]
+    fn the_tickers_ports_are_grantable() {
+        // The denylist in `portauth` is the other half of this: a device whose
+        // ports the kernel keeps for itself could be listed here and would then
+        // be refused at the grant. The RTC is not one of those.
+        assert_eq!(crate::portauth::forbidden_reason(&TICKER_PORTS), None);
     }
 
     #[test]

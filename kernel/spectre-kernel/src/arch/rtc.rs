@@ -17,18 +17,27 @@
 //! fires, which looks exactly like a broken delivery path. IRQ 8 is not
 //! conventionally overridden, so pin 8 is the pin.
 //!
-//! # The kernel acknowledges this device, and should not
+//! # What is left here, and what left
 //!
-//! Register C has to be read after every interrupt or the RTC raises no further
-//! ones, so the handler reads it. That is a driver's job being done in ring 0,
-//! and it is here because reading a port from ring 3 needs an I/O permission
-//! bitmap in the TSS that has to be swapped on every context switch — a separate
-//! mechanism, and the next one.
+//! This file used to acknowledge the device: register C has to be read after
+//! every interrupt or the RTC raises no further ones, and the interrupt handler
+//! did it because ring 3 could not. `portauth.rs` is what removed that. The
+//! driver holds ports 0x70 and 0x71 and reads register C itself, and the
+//! kernel reads it for nobody — which is why three wakes in the boot log mean
+//! something one wake would not: the second and third exist only because a
+//! process outside the kernel serviced the device.
 //!
-//! What this commit does deliver is the half that mechanism cannot provide on
-//! its own: the interrupt itself arriving in a process that is not the kernel.
-//! When port authority lands, the acknowledgement moves out of here and this
-//! file becomes what it should be, which is nothing.
+//! What remains is arming: setting the rate in register A and the enable in
+//! register B, once, when a process claims the line. That did not move with the
+//! acknowledgement because it is not per-interrupt work — it happens inside
+//! `unmask_device_line`, which also programs the I/O APIC, and splitting one
+//! "start delivering" step across two privilege levels would reintroduce
+//! exactly the ordering race that step exists to avoid. A driver that armed the
+//! device before claiming the line would latch an interrupt against a masked
+//! pin and never see another.
+//!
+//! So this file is a page shorter than it was and will get shorter again when
+//! there is a way to arm a device and claim its line as one operation.
 
 use super::cpu::{inb, outb};
 
@@ -107,10 +116,10 @@ unsafe fn enable_nmi() {
 /// Returns the rate it was set to.
 ///
 /// # Safety
-/// Called once during bring-up, with interrupts disabled, before the line is
-/// unmasked at the I/O APIC. Arming the device first and routing it second is
-/// the safe order: an interrupt from a device nothing routed is discarded, while
-/// a routed line into an unarmed device is merely quiet.
+/// Called with interrupts disabled, from `unmask_device_line`, immediately
+/// before the line is unmasked at the I/O APIC. That order is not incidental:
+/// an interrupt from an armed device whose line is masked is discarded and its
+/// flag latched, and the read of register C below is what clears the latch.
 pub unsafe fn start_periodic() -> u32 {
     // SAFETY: interrupts are off, as required, and each pair below is one
     // uninterrupted index-then-data access.
@@ -132,20 +141,6 @@ pub unsafe fn start_periodic() -> u32 {
         enable_nmi();
     }
     HZ
-}
-
-/// Acknowledges an interrupt, permitting the next one.
-///
-/// # Safety
-/// Called from the RTC's interrupt handler, where interrupts are off by virtue
-/// of the gate.
-pub unsafe fn acknowledge() {
-    // SAFETY: reading register C is the architectural acknowledgement and has no
-    // other effect. NMI is left as this found it — the handler is short and
-    // re-enabling here would race the interrupted code's own CMOS access.
-    unsafe {
-        let _ = read(REG_C);
-    }
 }
 
 /// Stops the periodic interrupt.

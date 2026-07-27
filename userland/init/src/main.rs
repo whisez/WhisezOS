@@ -25,7 +25,8 @@ mod abi;
 
 use abi::{
     decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO,
-    SYS_EXIT, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE,
+    SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -259,13 +260,76 @@ const TICKER_DEVICE: u64 = 1;
 /// spending two more wakes on.
 const INTERRUPTS_TO_AWAIT: u64 = 3;
 
+/// The CMOS index and data ports, which is the whole of the RTC's interface.
+const CMOS_INDEX: u16 = 0x70;
+const CMOS_DATA: u16 = 0x71;
+/// Register C. Reading it is what permits the device's next interrupt.
+const CMOS_REG_C: u8 = 0x0C;
+/// Bit 7 of the index port suppresses NMI for the duration of the access.
+const CMOS_NMI_DISABLE: u8 = 0x80;
+
+/// Reads one CMOS register, from ring 3.
+///
+/// This is the point of the whole exercise. Two instructions the CPU would
+/// refuse — `#GP` on `out`, before the port is even decoded — unless the I/O
+/// permission bitmap in the TSS has these two bits clear, which it does only
+/// because the kernel was asked for this device and agreed.
+///
+/// # Safety
+/// The process must hold a port grant covering `CMOS_INDEX` and `CMOS_DATA`.
+/// Without it these instructions fault, which is the mechanism working.
+unsafe fn cmos_read(register: u8) -> u8 {
+    let value: u8;
+    // SAFETY: the caller guarantees the grant. `nomem` is not used: the ports
+    // have side effects the compiler must not assume away, and the index write
+    // must not be reordered past the data read.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") CMOS_INDEX,
+            in("al") register | CMOS_NMI_DISABLE,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "in al, dx",
+            in("dx") CMOS_DATA,
+            out("al") value,
+            options(nostack, preserves_flags),
+        );
+    }
+    value
+}
+
 /// Blocks until the granted device interrupts, three times over.
 ///
-/// This is the first time a process outside the kernel is woken by hardware.
-/// Everything else in this file runs because the process asked for it; this runs
-/// because a device asked.
+/// This is the first time a process outside the kernel is woken by hardware,
+/// and — since the port grant — the first time one services the device that
+/// woke it. The kernel no longer reads register C on anybody's behalf, so the
+/// acknowledgement below is not a formality: without it the RTC considers its
+/// interrupt outstanding and raises no second one, and this loop would block
+/// forever on the next call.
 fn await_interrupts(pid: u64, grant: u64) {
     let mut seen = 0u64;
+
+    // The ports first. A driver that waits before it can service the device
+    // gets one interrupt and then waits forever.
+    match call(SYS_GRANT_PORTS, grant, TICKER_DEVICE) {
+        Ok(count) if count >= 2 => {}
+        Ok(_) => {
+            say(pid, &[b"port grant was too small to drive the device"]);
+            exit(18);
+        }
+        Err(SyscallError::NotPermitted) => {
+            // The expected answer for every process that is not the driver.
+            say(pid, &[b"no interrupt grant, as expected"]);
+            return;
+        }
+        Err(error) => {
+            say(pid, &[b"port grant failed: ", error.name().as_bytes()]);
+            exit(19);
+        }
+    }
+    say(pid, &[b"granted the rtc's ports, driving it from ring 3"]);
 
     for _ in 0..INTERRUPTS_TO_AWAIT {
         match call(SYS_IRQ_WAIT, grant, TICKER_DEVICE) {
@@ -277,11 +341,14 @@ fn await_interrupts(pid: u64, grant: u64) {
                     exit(16);
                 }
                 seen += count;
-            }
-            Err(SyscallError::NotPermitted) => {
-                // The expected answer for every process that is not the driver.
-                say(pid, &[b"no interrupt grant, as expected"]);
-                return;
+
+                // Service the device. Nothing in the kernel does this now, so
+                // the next interrupt exists only because of this read.
+                // SAFETY: the port grant above succeeded, which is exactly the
+                // condition these instructions need.
+                unsafe {
+                    cmos_read(CMOS_REG_C);
+                }
             }
             Err(error) => {
                 say(pid, &[b"irq wait failed: ", error.name().as_bytes()]);

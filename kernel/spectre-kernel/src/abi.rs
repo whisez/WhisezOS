@@ -97,6 +97,16 @@ pub const SYS_ALLOC_DMA: u64 = 8;
 /// identical empty events would only add a depth to overflow. See `irq.rs`.
 pub const SYS_IRQ_WAIT: u64 = 9;
 
+/// Permit this process to use a granted device's ports.
+/// `(grant, index) -> ports permitted`.
+///
+/// The last thing a driver needs that the kernel was doing for it. A device
+/// with no MMIO window — the RTC, the i8042, the legacy serial port — is
+/// reached through `in` and `out` or not at all, and until this existed that
+/// meant a fragment of every such driver lived in ring 0. See `portauth.rs`,
+/// including for what the kernel will not hand over at any price.
+pub const SYS_GRANT_PORTS: u64 = 10;
+
 /// Longest message body, in either direction.
 ///
 /// The kernel holds one buffer of this size per endpoint, so it bounds kernel
@@ -340,7 +350,7 @@ mod tests {
         assert_eq!((SYS_LOG, SYS_EXIT, SYS_PING), (0, 1, 2));
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
         assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
-        assert_eq!((SYS_ALLOC_DMA, SYS_IRQ_WAIT), (8, 9));
+        assert_eq!((SYS_ALLOC_DMA, SYS_IRQ_WAIT, SYS_GRANT_PORTS), (8, 9, 10));
     }
 
     #[test]

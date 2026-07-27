@@ -514,6 +514,12 @@ const REQUIRED_LINES: &[&str] = &[
     // them, because a delivery path that fires once and then stops — line left
     // masked, device left unacknowledged — passes a one-interrupt test.
     "[kernel] rtc",
+    // Port authority: the driver is granted the RTC's two ports and services
+    // the device itself. The kernel no longer reads register C for anybody, so
+    // the second and third interrupts exist only because ring 3 acknowledged
+    // the first — three wakes is the proof, one would not have been.
+    "[kernel] pid 1 granted 2 port(s) from 0x70",
+    "[init 1] granted the rtc's ports, driving it from ring 3",
     "[init 1] woken by hardware 3 time(s)",
     // And a process with no grant cannot wait on a line it was not given, which
     // is what stops "wait for an interrupt" from being a way to observe a

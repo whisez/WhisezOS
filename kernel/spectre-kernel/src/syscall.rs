@@ -18,7 +18,7 @@
 
 use crate::abi::{
     SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
-    SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
@@ -70,6 +70,7 @@ pub fn handle(
         SYS_MAP_DEVICE => sys_map_device(a0, a1),
         SYS_ALLOC_DMA => sys_alloc_dma(a0, a1, a2),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1, frame),
+        SYS_GRANT_PORTS => sys_grant_ports(a0, a1),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -269,6 +270,25 @@ fn sys_irq_wait(grant: u64, index: u64, frame: &TrapFrame) -> Result<u64, Syscal
         // handler writes the count into this frame's `rax` when it wakes it.
         irq::Wait::Block => unsafe { task::block_current(frame) },
     }
+}
+
+/// `SYS_GRANT_PORTS(grant, index) -> ports permitted`.
+///
+/// The process names a device and receives whatever ports that device is
+/// reached through. It never names a port, which is the same rule as
+/// `SYS_MAP_DEVICE` and for the same reason: a call that took a port number
+/// would be a call whose safety depended on the kernel checking arithmetic
+/// against an argument chosen to defeat the check.
+fn sys_grant_ports(grant: u64, index: u64) -> Result<u64, SyscallError> {
+    let range = device::ports(grant, index)?;
+    task::grant_ports(range)?;
+    kprintln!(
+        "[kernel] pid {} granted {} port(s) from {:#x}",
+        task::current_pid(),
+        range.len,
+        range.base
+    );
+    Ok(u64::from(range.len))
 }
 
 /// `SYS_EXIT(code)`.

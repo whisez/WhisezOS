@@ -399,15 +399,16 @@ extern "x86-interrupt" fn line_3(_frame: InterruptFrame) {
 /// woken driver waits up to one tick, which is 10 ms and is a scheduling policy
 /// question rather than a correctness one.
 ///
-/// It also does not read the device. That is the driver's job, and the only
-/// reason the acknowledgement below is here at all is that reading a port from
-/// ring 3 needs authority that does not exist yet — see `arch/rtc.rs`.
+/// It also does not read the device. That is the driver's job, and now that
+/// `SYS_GRANT_PORTS` exists the driver can do it — which it must. A device that
+/// is not serviced raises no further interrupt, so a driver that claims a line
+/// and never touches its device gets exactly one wake and then waits forever.
+///
+/// That is not a trap this kernel sets; it is how the hardware works, and every
+/// real driver is built around it. The alternative — the kernel servicing the
+/// device on the driver's behalf — is the thing this whole line of work exists
+/// to remove.
 fn device_line(line: usize) {
-    // Before the EOI, because the device will not raise another interrupt until
-    // it is acknowledged and the LAPIC will not deliver one until it is.
-    // SAFETY: an interrupt gate cleared IF, so this access cannot be interposed.
-    unsafe { super::rtc::acknowledge() };
-
     match crate::irq::on_interrupt(line) {
         crate::irq::Delivery::Wake { pid, count } => {
             crate::task::wake(pid, crate::abi::encode(Ok(count)));

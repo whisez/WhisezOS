@@ -15,6 +15,7 @@
 use super::addr::{PagingMode, VirtAddr};
 use super::cpu::{self, DescriptorTablePointer};
 use super::gdt::{ist, GdtBuilder, GdtError, GdtLayout, Tss};
+use crate::portauth::{self, Grants, BITMAP_BYTES};
 
 /// Size of each dedicated fault stack.
 ///
@@ -38,7 +39,40 @@ static mut DEBUG_STACK: FaultStack = FaultStack([0; FAULT_STACK_BYTES]);
 struct GdtStorage([u64; GdtBuilder::CAPACITY]);
 
 static mut GDT: GdtStorage = GdtStorage([0; GdtBuilder::CAPACITY]);
-static mut TSS: Tss = Tss::new();
+
+/// The TSS, with the I/O permission bitmap the CPU consults on `in` and `out`.
+///
+/// One allocation, because the bitmap is not a separate structure — the CPU
+/// finds it at `iomap_base` bytes past the TSS and reads it as part of the same
+/// segment, so the descriptor's limit has to cover both. Splitting them into
+/// two statics would work only if the linker happened to place them adjacently,
+/// which is not a thing to rely on.
+#[repr(C, packed(4))]
+struct TssWithBitmap {
+    tss: Tss,
+    /// A clear bit permits the port. Starts all-ones: everything denied.
+    bitmap: [u8; BITMAP_BYTES],
+    /// The terminator the SDM requires past the end of the bitmap.
+    ///
+    /// The CPU may read the byte after the bit it wants when a port access
+    /// straddles a byte boundary — a 16-bit `out` to the last port covered
+    /// touches this. All-ones means "denied", which is the answer that keeps
+    /// the edge case from permitting something by reading off the end.
+    terminator: u8,
+}
+
+static mut TSS_STORAGE: TssWithBitmap = TssWithBitmap {
+    tss: Tss::new(),
+    bitmap: [0xFF; BITMAP_BYTES],
+    terminator: 0xFF,
+};
+
+/// Which ranges the bitmap currently permits.
+///
+/// The switch needs it: making the bitmap match the incoming process means
+/// knowing what the outgoing one had, and re-denying only that is a handful of
+/// bit operations rather than rewriting a bitmap on every context switch.
+static ACTIVE_GRANTS: spin::Mutex<Grants> = spin::Mutex::new(Grants::NONE);
 
 /// Top of a static stack. Stacks grow downwards, so the CPU wants the address
 /// one past the end.
@@ -56,7 +90,14 @@ fn stack_top(stack: *mut FaultStack) -> VirtAddr {
 pub unsafe fn install() -> Result<GdtLayout, GdtError> {
     // SAFETY: single-threaded bring-up before any other processor is started,
     // so these statics have no concurrent access.
-    let tss = unsafe { &mut *core::ptr::addr_of_mut!(TSS) };
+    let storage = unsafe { &mut *core::ptr::addr_of_mut!(TSS_STORAGE) };
+    let tss = &mut storage.tss;
+
+    // Where the CPU looks for the bitmap, measured from the base of the TSS.
+    // Until this is set the field holds the TSS size, which is past the old
+    // limit and denies every port — the previous behaviour, and still the
+    // behaviour for every process that is granted nothing.
+    tss.iomap_base = core::mem::size_of::<Tss>() as u16;
 
     tss.set_ist(
         ist::DOUBLE_FAULT,
@@ -69,9 +110,18 @@ pub unsafe fn install() -> Result<GdtLayout, GdtError> {
     )?;
     tss.set_ist(ist::DEBUG, stack_top(core::ptr::addr_of_mut!(DEBUG_STACK)))?;
 
-    let tss_base =
-        VirtAddr::from_indices_sign_extended(core::ptr::addr_of!(TSS) as u64, PagingMode::Level4);
-    let (builder, layout) = GdtBuilder::build(tss_base)?;
+    let tss_base = VirtAddr::from_indices_sign_extended(
+        core::ptr::addr_of!(TSS_STORAGE) as u64,
+        PagingMode::Level4,
+    );
+    // The limit covers the bitmap and its terminator. A limit that stopped at
+    // the TSS would leave `iomap_base` pointing past the segment, which the CPU
+    // reads as "no bitmap, deny everything" — the grants would be written and
+    // silently have no effect.
+    let (builder, layout) = GdtBuilder::build_with_tss_limit(
+        tss_base,
+        core::mem::size_of::<TssWithBitmap>() as u32 - 1,
+    )?;
 
     // SAFETY: as above — exclusive during bring-up.
     let gdt = unsafe { &mut *core::ptr::addr_of_mut!(GDT) };
@@ -121,6 +171,56 @@ static mut RING3_STACK: FaultStack = FaultStack([0; FAULT_STACK_BYTES]);
 /// by any other thread.
 pub unsafe fn set_kernel_stack(stack_top: VirtAddr) {
     // SAFETY: the caller guarantees exclusivity of the TSS update.
-    let tss = unsafe { &mut *core::ptr::addr_of_mut!(TSS) };
-    tss.privilege_stack_table[0] = stack_top.as_u64();
+    let storage = unsafe { &mut *core::ptr::addr_of_mut!(TSS_STORAGE) };
+    storage.tss.privilege_stack_table[0] = stack_top.as_u64();
+}
+
+/// Makes the I/O bitmap say what `grants` says, and nothing more.
+///
+/// Called on every context switch, next to the `RSP0` update and for the same
+/// reason: there is one TSS on one processor, and it describes whichever process
+/// is running. A bitmap left holding the last process's grants is that process's
+/// device handed to the next one to be scheduled.
+///
+/// # Why this is not a memcpy
+///
+/// Rewriting all 128 bytes every switch would be simpler and is what a first
+/// version would do. It is also 128 bytes of write traffic per switch to change
+/// two bits. Denying what the last process had and permitting what this one has
+/// touches only the ports actually involved, which is a handful — and the cost
+/// scales with grants held rather than with the size of the port space.
+///
+/// # Safety
+/// Called with interrupts disabled, on the processor whose TSS this is.
+pub unsafe fn apply_io_permissions(grants: &Grants) {
+    let mut active = ACTIVE_GRANTS.lock();
+    if *active == *grants {
+        return;
+    }
+
+    // SAFETY: the caller guarantees exclusivity.
+    let storage = unsafe { &mut *core::ptr::addr_of_mut!(TSS_STORAGE) };
+
+    // Deny first, then permit. The other order would briefly permit the union
+    // of both processes' ports, which on one processor with interrupts off
+    // nothing could observe — but "nothing could observe it" is a weaker
+    // property than "it never happens", and this costs nothing.
+    for range in active.ranges() {
+        for port in range.base..range.base.saturating_add(range.len) {
+            let index = usize::from(port);
+            if index < portauth::PORT_SPACE {
+                storage.bitmap[index / 8] |= 1u8 << (index % 8);
+            }
+        }
+    }
+    for range in grants.ranges() {
+        for port in range.base..range.base.saturating_add(range.len) {
+            let index = usize::from(port);
+            if index < portauth::PORT_SPACE {
+                storage.bitmap[index / 8] &= !(1u8 << (index % 8));
+            }
+        }
+    }
+
+    *active = *grants;
 }

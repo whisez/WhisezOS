@@ -267,9 +267,18 @@ pub struct Tss {
     pub interrupt_stack_table: [u64; 7],
     _reserved2: u64,
     _reserved3: u16,
-    /// Offset of the I/O permission bitmap. Set past the TSS limit to deny all
-    /// port access from ring 3, which is what we want — user-space drivers
-    /// reach hardware through capability-mediated MMIO, never through `in`/`out`.
+    /// Offset of the I/O permission bitmap, measured from the base of the TSS.
+    ///
+    /// This used to be pinned past the segment limit, denying every port, on the
+    /// grounds that user-space drivers reach hardware through MMIO rather than
+    /// `in`/`out`. That is the right default and was the wrong absolute: the
+    /// RTC, the i8042, and the legacy serial port have no MMIO window, so the
+    /// choice was never between port access and something cleaner — it was
+    /// between a driver in ring 3 holding two ports and the same work done in
+    /// ring 0. See `portauth.rs`.
+    ///
+    /// It still denies everything by default. A bitmap of all-ones permits no
+    /// port, and a process is granted bits only through `SYS_GRANT_PORTS`.
     pub iomap_base: u16,
 }
 
@@ -356,6 +365,20 @@ impl GdtBuilder {
     /// The order is not stylistic. `user_data` must precede `user_code` — see
     /// the SYSRET note at the top of this file.
     pub fn build(tss_base: VirtAddr) -> Result<(Self, GdtLayout), GdtError> {
+        Self::build_with_tss_limit(tss_base, core::mem::size_of::<Tss>() as u32 - 1)
+    }
+
+    /// Build the standard layout, with a TSS longer than the structure itself.
+    ///
+    /// The limit is a parameter because the I/O permission bitmap lives past the
+    /// end of the `Tss` struct and is part of the same segment. A limit that
+    /// stops at the struct leaves `iomap_base` pointing outside the segment,
+    /// which the CPU reads as "no bitmap" and denies every port — so a grant
+    /// would be written and silently do nothing.
+    pub fn build_with_tss_limit(
+        tss_base: VirtAddr,
+        tss_limit: u32,
+    ) -> Result<(Self, GdtLayout), GdtError> {
         let mut b = GdtBuilder::new();
 
         let kernel_code = b.push(Descriptor::kernel_code())?;
@@ -367,7 +390,7 @@ impl GdtBuilder {
         let user_data = b.push(Descriptor::user_data())?;
         let user_code = b.push(Descriptor::user_code())?;
 
-        let (tss_low, tss_high) = Descriptor::tss(tss_base, core::mem::size_of::<Tss>() as u32 - 1);
+        let (tss_low, tss_high) = Descriptor::tss(tss_base, tss_limit);
         let tss = b.push(tss_low)?;
         b.push(tss_high)?;
 
@@ -531,6 +554,31 @@ mod tests {
         // would make the CPU read it as a data segment.
         assert_eq!(low.0 & (1 << 44), 0, "S bit set on a TSS descriptor");
         assert!(low.is_present());
+    }
+
+    #[test]
+    fn a_tss_limit_can_reach_past_the_struct_to_cover_an_io_bitmap() {
+        // The bitmap lives after the `Tss` struct and is part of the same
+        // segment. A limit that stopped at the struct would leave `iomap_base`
+        // pointing outside the segment, which the CPU reads as "no bitmap" and
+        // denies every port — so a grant would be written and silently do
+        // nothing, which is the failure that looks like a driver bug.
+        let extended = core::mem::size_of::<Tss>() as u32 + 128;
+        let (low, _) = Descriptor::tss(tss_base(), extended - 1);
+
+        let encoded = (low.0 & 0xFFFF) | ((low.0 >> 32) & 0xF_0000);
+        assert_eq!(encoded, u64::from(extended - 1));
+        assert!(encoded > core::mem::size_of::<Tss>() as u64);
+    }
+
+    #[test]
+    fn the_default_build_denies_every_port() {
+        // No bitmap means `iomap_base` sits at the segment limit, and the CPU
+        // treats a port whose bit is outside the segment as denied. This is
+        // what every process that was granted nothing runs with.
+        let tss = Tss::new();
+        let iomap = tss.iomap_base;
+        assert_eq!(u32::from(iomap), core::mem::size_of::<Tss>() as u32);
     }
 
     #[test]

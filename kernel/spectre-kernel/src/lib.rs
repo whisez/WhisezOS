@@ -68,6 +68,7 @@ pub mod dma;
 pub mod elf;
 pub mod font;
 pub mod irq;
+pub mod portauth;
 pub mod rendezvous;
 pub mod roundrobin;
 pub mod syscall;
