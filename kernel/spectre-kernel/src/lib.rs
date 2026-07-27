@@ -64,6 +64,7 @@ pub mod arch;
 pub mod boot_info;
 pub mod channel;
 pub mod elf;
+pub mod font;
 pub mod rendezvous;
 pub mod roundrobin;
 pub mod syscall;

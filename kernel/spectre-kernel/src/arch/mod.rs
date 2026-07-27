@@ -27,6 +27,7 @@ pub mod console;
 pub mod context;
 pub mod cpu;
 pub mod frame;
+pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
@@ -68,6 +69,17 @@ pub unsafe fn early_init(boot: &BootInfo) -> Result<Platform, InitError> {
     kprintln!("[kernel] WhisezOS microkernel, stage 1");
 
     boot.validate().map_err(InitError::BootInfo)?;
+
+    // The screen comes up as early as the handoff allows, so everything after
+    // this appears on it as well as on the wire. It cannot come first: the
+    // geometry it needs is the thing `validate` has just checked.
+    // SAFETY: the framebuffer is the one the firmware left running, described
+    // by a handoff that has passed validation, and physical memory is identity
+    // mapped by the loader's tables.
+    if unsafe { framebuffer::init(&boot.framebuffer) } {
+        kprintln!("[kernel] screen console up");
+    }
+
     report_handoff(boot);
 
     // SAFETY: bring-up preconditions are the caller's; see the module comment

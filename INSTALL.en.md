@@ -110,9 +110,11 @@ cargo xtask boot-run
 ```
 
 This builds the production UEFI loader and the kernel ELF, stages them on a
-temporary EFI system partition, and starts QEMU. The kernel's only output is the
-serial port, so the command attaches serial to the terminal and opens no display
-window.
+temporary EFI system partition, and starts QEMU. **A window opens**: the kernel
+draws its own log onto the framebuffer the firmware left running — warnings in
+amber, failures in red, completed stages in green. The same lines go to the
+serial port, which the command attaches to the terminal. The serial log is the
+full record; the screen is the one a person can watch.
 
 Expect, in order: the loader's memory audit, validation of the kernel ELF, the
 exit from boot services, the handoff, then the kernel's GDT, IDT, frame

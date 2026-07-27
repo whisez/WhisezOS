@@ -31,8 +31,9 @@ defensive utility named **Whisez Guard**.
 | Setup screen | ✅ Working | A staged installation rehearsal with progress bars; it touches no disk |
 | Whisez Guard | ✅ Working | Windows security audit, offline scan, SHA3-256 baseline verification, and monitoring |
 | Build and packaging | ✅ Working | Produces an EFI application, Guard binary, and 4K wallpaper package with one command |
-| Automated tests | ✅ 386 tests | Kernel, file-system, boot-logic, and Guard tests |
+| Automated tests | ✅ 393 tests | Kernel, file-system, boot-logic, and Guard tests |
 | Production loader | ✅ Working | Reads, validates, and loads the kernel ELF, then exits boot services and hands off |
+| Kernel screen console | ✅ Working | The kernel draws its own log to the framebuffer the firmware left running; `cargo xtask boot-run` shows it in a window |
 | Production kernel | ✅ Boots in QEMU | GDT, IDT, serial console, frame allocator, and its own page tables; `cargo xtask boot-test` proves it from the serial log |
 | Interrupt controller and timer | ✅ Working | x2APIC, a 100 Hz LAPIC timer calibrated against the PIT, and full-register context switching |
 | User space | ✅ First process runs | `init` starts in ring 3 in its own address space, calls back through `syscall`, and has its boundary violations refused |

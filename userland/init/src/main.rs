@@ -86,6 +86,29 @@ fn tag(pid: u64, out: &mut [u8; 10]) -> &[u8] {
     &out[..text.len()]
 }
 
+/// Emits one tagged line in a single system call.
+///
+/// Building the line first is not tidiness. A process can be preempted between
+/// two calls, so writing a prefix and then a message as separate calls lets
+/// another process interleave inside the line — which it did, and the result
+/// was output that read as though the kernel had scrambled it. One call per
+/// line is the only way to make a line atomic without a lock user space does
+/// not have.
+fn say(pid: u64, parts: &[&[u8]]) {
+    let mut line = [0u8; 192];
+    let mut len = 0usize;
+
+    let mut prefix = [0u8; 10];
+    for chunk in core::iter::once(tag(pid, &mut prefix) as &[u8]).chain(parts.iter().copied()) {
+        let take = chunk.len().min(line.len() - len - 1);
+        line[len..len + take].copy_from_slice(&chunk[..take]);
+        len += take;
+    }
+    line[len] = b'\n';
+    len += 1;
+    log_bytes(&line[..len]);
+}
+
 /// Clients the server answers before it stops. Two of the three processes are
 /// clients; the third owns the endpoint.
 const CLIENTS: usize = 2;
@@ -103,18 +126,12 @@ fn call(number: u64, a0: u64, a1: u64) -> Result<u64, SyscallError> {
 }
 
 fn expect_refused(pid: u64, what: &str, expected: SyscallError, result: Result<u64, SyscallError>) {
-    let mut prefix = [0u8; 10];
-    log_bytes(tag(pid, &mut prefix));
     match result {
         Err(error) if error == expected => {
-            log("refused as expected: ");
-            log(what);
-            log("\n");
+            say(pid, &[b"refused as expected: ", what.as_bytes()]);
         }
         _ => {
-            log("SECURITY CHECK FAILED: ");
-            log(what);
-            log("\n");
+            say(pid, &[b"SECURITY CHECK FAILED: ", what.as_bytes()]);
             exit(2);
         }
     }
@@ -148,24 +165,21 @@ fn spin(iterations: u64) {
 
 #[no_mangle]
 pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
-    let mut prefix = [0u8; 10];
-    log_bytes(tag(pid, &mut prefix));
-    log("hello from ring 3\n");
+    say(pid, &[b"hello from ring 3"]);
 
     // The round trip. Printing could be faked by a kernel that never left ring
     // 0; a value the kernel transformed and returned could not.
     let sent = 0x0123_4567_89AB_CDEF ^ pid;
     match call(SYS_PING, sent, 0) {
         Ok(reply) if reply == sent ^ PING_COOKIE => {
-            log_bytes(tag(pid, &mut prefix));
-            log("ping round trip ok, reply ");
             let mut buffer = [0u8; 18];
-            log_bytes(hex(reply, &mut buffer));
-            log("\n");
+            say(
+                pid,
+                &[b"ping round trip ok, reply ", hex(reply, &mut buffer)],
+            );
         }
         _ => {
-            log_bytes(tag(pid, &mut prefix));
-            log("PING FAILED\n");
+            say(pid, &[b"PING FAILED"]);
             exit(1);
         }
     }
@@ -198,10 +212,8 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
     // process asked for anything.
     for round in 0..ROUNDS {
         spin(SPIN);
-        log_bytes(tag(pid, &mut prefix));
-        log("round ");
-        let digit = [b'0' + (round % 10) as u8, b'\n'];
-        log_bytes(&digit);
+        let digit = [b'0' + (round % 10) as u8];
+        say(pid, &[b"round ", &digit]);
     }
 
     // --- talking to another process ---------------------------------------
@@ -213,8 +225,7 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
         }
     }
 
-    log_bytes(tag(pid, &mut prefix));
-    log("all checks passed\n");
+    say(pid, &[b"all checks passed"]);
     exit(0);
 }
 
@@ -230,7 +241,6 @@ const EXPECTED_REPLY: &[u8] = b"WHISEZ-PONG";
 
 /// Answers one request per client, then stops.
 fn serve(pid: u64, endpoint: u64) -> ! {
-    let mut prefix = [0u8; 10];
     let mut buffer = [0u8; 64];
 
     for _ in 0..CLIENTS {
@@ -244,18 +254,12 @@ fn serve(pid: u64, endpoint: u64) -> ! {
         ) {
             Ok(len) => len as usize,
             Err(error) => {
-                log_bytes(tag(pid, &mut prefix));
-                log("receive failed: ");
-                log(error.name());
-                log("\n");
+                say(pid, &[b"receive failed: ", error.name().as_bytes()]);
                 exit(4);
             }
         };
 
-        log_bytes(tag(pid, &mut prefix));
-        log("served request: ");
-        log_bytes(&buffer[..len]);
-        log("\n");
+        say(pid, &[b"served request: ", &buffer[..len]]);
 
         // The transformation the client checks for. A server that replied with
         // the request unchanged would be indistinguishable from a kernel that
@@ -274,24 +278,18 @@ fn serve(pid: u64, endpoint: u64) -> ! {
             0,
             0,
         ) {
-            log_bytes(tag(pid, &mut prefix));
-            log("reply failed: ");
-            log(error.name());
-            log("\n");
+            say(pid, &[b"reply failed: ", error.name().as_bytes()]);
             exit(5);
         }
     }
 
-    log_bytes(tag(pid, &mut prefix));
-    log("served every client\n");
-    log_bytes(tag(pid, &mut prefix));
-    log("all checks passed\n");
+    say(pid, &[b"served every client"]);
+    say(pid, &[b"all checks passed"]);
     exit(0)
 }
 
 /// Sends one request and checks the answer.
 fn request(pid: u64, endpoint: u64) {
-    let mut prefix = [0u8; 10];
     let mut reply = [0u8; 64];
 
     let len = match call5(
@@ -304,21 +302,18 @@ fn request(pid: u64, endpoint: u64) {
     ) {
         Ok(len) => len as usize,
         Err(error) => {
-            log_bytes(tag(pid, &mut prefix));
-            log("call failed: ");
-            log(error.name());
-            log("\n");
+            say(pid, &[b"call failed: ", error.name().as_bytes()]);
             exit(6);
         }
     };
 
-    log_bytes(tag(pid, &mut prefix));
     if &reply[..len] == EXPECTED_REPLY {
-        log("ipc round trip ok, server answered ");
-        log_bytes(&reply[..len]);
-        log("\n");
+        say(
+            pid,
+            &[b"ipc round trip ok, server answered ", &reply[..len]],
+        );
     } else {
-        log("IPC REPLY WRONG\n");
+        say(pid, &[b"IPC REPLY WRONG"]);
         exit(7);
     }
 
@@ -326,12 +321,16 @@ fn request(pid: u64, endpoint: u64) {
     // however it was obtained.
     match call5(SYS_RECEIVE, endpoint, reply.as_mut_ptr() as u64, 8, 0, 0) {
         Err(SyscallError::BadEndpoint) => {
-            log_bytes(tag(pid, &mut prefix));
-            log("refused as expected: receiving on an endpoint it does not own\n");
+            say(
+                pid,
+                &[b"refused as expected: receiving on an endpoint it does not own"],
+            );
         }
         _ => {
-            log_bytes(tag(pid, &mut prefix));
-            log("SECURITY CHECK FAILED: received on another process's endpoint\n");
+            say(
+                pid,
+                &[b"SECURITY CHECK FAILED: received on another endpoint"],
+            );
             exit(8);
         }
     }

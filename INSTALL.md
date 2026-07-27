@@ -110,8 +110,10 @@ cargo xtask boot-run
 ```
 
 Bu komut üretim UEFI yükleyicisini ve çekirdek ELF'ini derler, geçici bir EFI
-bölümüne yerleştirir ve QEMU'yu başlatır. Çekirdeğin tek çıktısı seri porttur;
-komut seri portu terminale bağlar, ekran penceresi açılmaz.
+bölümüne yerleştirir ve QEMU'yu başlatır. **Bir pencere açılır**: çekirdek kendi
+günlüğünü firmware'in bıraktığı framebuffer'a çizer — uyarılar amber, hatalar
+kırmızı, tamamlanan aşamalar yeşil. Aynı satırlar seri porttan da akar ve
+terminale bağlanır; seri günlük tam kayıttır, ekran bakılabilir olandır.
 
 Beklenen çıktı şu sırayla gelir: yükleyici bellek denetimi, çekirdek ELF'inin
 doğrulanması, boot servislerinden çıkış, devir, ardından çekirdeğin GDT, IDT,

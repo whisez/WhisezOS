@@ -50,6 +50,10 @@ pub fn _print(args: fmt::Arguments<'_>) {
     if let Some(uart) = CONSOLE.lock().as_mut() {
         let _ = uart.write_fmt(args);
     }
+    // The same line on the screen, when there is one. Serial is the record and
+    // works when nothing else does; the framebuffer is what a person can look
+    // at, and it costs one extra formatting pass to have both.
+    super::framebuffer::write(args);
 }
 
 /// Writes without taking the console lock. For the panic path only.

@@ -321,14 +321,16 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>) -> Result<()
     );
     let machine_arg = format!("{machine},smm=on");
 
-    // Headless when capturing, windowed when a person is watching. The kernel's
-    // only output is the serial port either way.
+    // Headless when capturing, windowed when a person is watching. The kernel
+    // draws its console to the framebuffer as well as the serial port, so the
+    // window is not decoration — it is the same log, on the display the
+    // firmware left running.
     let (serial_arg, display) = match serial {
         Some(path) => (
             format!("file:{}", qemu_path(&std::path::absolute(path)?)),
             "none",
         ),
-        None => ("stdio".to_string(), "none"),
+        None => ("stdio".to_string(), "gtk,zoom-to-fit=on"),
     };
 
     run_path(
