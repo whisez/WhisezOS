@@ -110,6 +110,9 @@ pub mod abi;
 #[path = "../../kernel/spectre-kernel/src/roundrobin.rs"]
 pub mod roundrobin;
 
+#[path = "../../kernel/spectre-kernel/src/vmspace.rs"]
+pub mod vmspace;
+
 #[path = "../../kernel/spectre-kernel/src/usercopy.rs"]
 pub mod usercopy;
 

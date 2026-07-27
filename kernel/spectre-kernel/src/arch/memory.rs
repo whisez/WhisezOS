@@ -52,6 +52,9 @@ pub enum MemoryError {
     NotInitialised,
     /// The linker symbols bounding the kernel image are inconsistent.
     BadKernelExtent,
+    /// A teardown returned frames the allocator does not own, which means the
+    /// walk left the address space it was destroying.
+    ForeignFrameReleased(u64),
 }
 
 impl From<FrameError> for MemoryError {
@@ -144,6 +147,11 @@ pub struct IdentityAccess<'a> {
     allocator: &'a mut FrameAllocator<'static>,
     /// Frames handed out, for reporting what a mapping cost.
     frames_allocated: u64,
+    /// Frames returned by a teardown.
+    frames_released: u64,
+    /// Frames a teardown tried to return that the allocator does not own. Any
+    /// value but zero means the walk left the address space it was destroying.
+    foreign_frames: u64,
 }
 
 impl IdentityAccess<'_> {
@@ -179,6 +187,21 @@ impl IdentityAccess<'_> {
         *table = PageTable::new();
         self.frames_allocated += 1;
         Some(frame)
+    }
+}
+
+impl crate::vmspace::FrameSink for IdentityAccess<'_> {
+    fn release(&mut self, frame: PhysAddr) {
+        // A frame outside the allocator's range was never its to give, so it is
+        // counted rather than returned. It should not happen — every frame in a
+        // user address space came from here — and a count that is not zero at
+        // the end of a teardown says the walk found something it should not
+        // have.
+        if self.allocator.free(frame).is_err() {
+            self.foreign_frames += 1;
+        } else {
+            self.frames_released += 1;
+        }
     }
 }
 
@@ -268,6 +291,8 @@ pub unsafe fn activate_kernel_tables() -> Result<PhysAddr, MemoryError> {
     let mut access = IdentityAccess {
         allocator,
         frames_allocated: 0,
+        frames_released: 0,
+        foreign_frames: 0,
     };
     let root = access.alloc_table().ok_or(MemoryError::OutOfFrames)?;
 
@@ -341,8 +366,37 @@ pub fn with_table_access<R>(
     let mut access = IdentityAccess {
         allocator,
         frames_allocated: 0,
+        frames_released: 0,
+        foreign_frames: 0,
     };
     f(&mut access)
+}
+
+/// Top-level index whose subtree is the kernel's, shared into every address
+/// space and never owned by the process holding a reference to it.
+pub const SHARED_TOP_INDICES: [u16; 1] = [0];
+
+/// Frees everything a user address space owns.
+///
+/// # Safety
+/// `root` must not be the table in `CR3`, and no other processor may be running
+/// on it. Freeing the page tables under a live `CR3` leaves the processor
+/// walking memory the allocator is entitled to hand out and overwrite; the
+/// resulting fault happens later, somewhere unrelated.
+pub unsafe fn destroy_address_space(
+    root: PhysAddr,
+) -> Result<crate::vmspace::Reclaimed, MemoryError> {
+    with_table_access(|access| {
+        let reclaimed =
+            crate::vmspace::destroy(access, root, &SHARED_TOP_INDICES, PagingMode::Level4)
+                .map_err(MemoryError::Page)?;
+        if access.foreign_frames != 0 {
+            // The walk handed back something the allocator never owned, which
+            // means it left the address space it was destroying.
+            return Err(MemoryError::ForeignFrameReleased(access.foreign_frames));
+        }
+        Ok(reclaimed)
+    })
 }
 
 /// Allocates one physical frame from the early allocator.

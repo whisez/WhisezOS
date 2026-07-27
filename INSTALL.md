@@ -129,23 +129,34 @@ iç içe geçmesi, işlemcinin 100 Hz LAPIC zamanlayıcısı tarafından elden
 alındığının kanıtıdır — hiçbiri kendi isteğiyle sırasını devretmez. Çekirdek
 sonunda kaç tick ve kaç bağlam değişimi olduğunu yazar.
 
+Bir süreç çıktığında çekirdek adres uzayını yürüyerek yıkar ve çerçevelerini
+geri alır (`reaped pid=...`). Boşalan yuvaya, geri kazanılan çerçevelerden
+üçüncü bir süreç kurulur (`respawned pid=...`) — bir yuvanın "boş" işaretlenmesi
+tek başına bir şey kanıtlamaz, o çerçevelerden kurulup ring 3'te koşan bir süreç
+kanıtlar. En sonda çekirdek boş çerçeve sayısını hiç süreç yokken ölçtüğü
+değerle karşılaştırır ve `frames balanced` yazar; eşit değilse sızıntı ya da
+fazla serbest bırakma olarak raporlar.
+
 Aynı önyüklemeyi otomatik doğrulamak için:
 
 ```powershell
 cargo xtask boot-test
 ```
 
-Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve yirmi sekiz aşamanın
-sırasıyla göründüğünü doğrular. Ayrıca çekirdeğin yazdığı bağlam değişimi
-sayısını okur ve sıfırsa testi düşürür — çünkü tüm satırlar, zamanlayıcı hiç
-çalışmasa bile aynı sırada görünebilirdi. `cargo xtask test` içinde de çalışır;
-QEMU kurulu değilse uyarıyla atlanır.
+Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve kırk bir aşamanın
+göründüğünü doğrular. Yalnızca nedensel olarak sıralı olanlar sırayla aranır;
+farklı süreçlerin satırları eşzamanlıdır ve her açılışta farklı iç içe geçer, o
+yüzden onlar için tek dürüst kontrol varlıklarıdır. Ayrıca çekirdeğin yazdığı
+bağlam değişimi sayısını okur ve sıfırsa testi düşürür — tüm satırlar,
+zamanlayıcı hiç çalışmasa bile görünebilirdi — ve çerçeve dengesi raporunu
+kontrol eder. `cargo xtask test` içinde de çalışır; QEMU kurulu değilse uyarıyla
+atlanır.
 
 > Üretim yükleyicisi projenin kendi 8 GiB bellek tabanını uygular ve altındaki
 > bir platformu açmayı reddeder. Bu yüzden sanal makine 9 GiB ile başlatılır.
 
-> Her iki süreç de çıktıktan sonra sistem durur: süreç yıkımı, engelleyen
-> çağrılar ve gerçek IPC henüz yok. Bu, tamamlanmış bir işletim sistemi değil,
+> Tüm süreçler çıkıp geri alındıktan sonra sistem durur: engelleyen çağrılar ve
+> gerçek IPC henüz yok. Bu, tamamlanmış bir işletim sistemi değil,
 > doğrulanabilir bir dikey dilimdir.
 
 > Sanal makine `-cpu qemu64,+x2apic` ile başlatılır. QEMU'nun varsayılan CPU

@@ -130,23 +130,34 @@ interleaving is the proof that the processor was taken away by the 100 Hz LAPIC
 timer — neither process ever yields. The kernel reports the tick and context
 switch counts at the end.
 
+When a process exits, the kernel walks its address space, frees its frames, and
+says so (`reaped pid=...`). A third process is then built out of those reclaimed
+frames in the slot that was freed (`respawned pid=...`) — a slot merely marked
+free proves nothing; a process built from those frames and running in ring 3
+does. At the end the kernel compares the free frame count against what it
+measured before any process existed and prints `frames balanced`, or reports a
+leak or an over-release if the two differ.
+
 To verify the same boot automatically:
 
 ```powershell
 cargo xtask boot-test
 ```
 
-This runs QEMU headless, captures the serial log, and asserts that twenty-eight stages
-appear in order. It also reads the context switch count the kernel prints and
-fails if it is zero — every line would appear in that order even if the timer
-had never fired. It runs as part of `cargo xtask test` too, and is skipped with
-a warning when QEMU is not installed.
+This runs QEMU headless, captures the serial log, and asserts that forty-one stages
+appear. Only the causally ordered ones are checked in order; lines from
+different processes are concurrent and interleave differently on every boot, so
+presence is the only honest assertion about them. It also reads the context
+switch count the kernel prints and fails if it is zero — every line would appear
+even if the timer had never fired — and checks the frame balance report. It runs
+as part of `cargo xtask test` too, and is skipped with a warning when QEMU is
+not installed.
 
 > The production loader enforces the project's own 8 GiB memory floor and
 > refuses to boot a platform below it, which is why the VM is started with 9 GiB.
 
-> The system halts once both processes exit: there is no process teardown, no
-> blocking call, and no real IPC yet. This is a verifiable vertical slice, not a
+> The system halts once every process has exited and been reaped: there is no
+> blocking call and no real IPC yet. This is a verifiable vertical slice, not a
 > finished operating system.
 
 > The VM is started with `-cpu qemu64,+x2apic`. QEMU's default CPU model has no

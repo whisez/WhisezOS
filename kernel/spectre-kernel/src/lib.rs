@@ -67,6 +67,7 @@ pub mod roundrobin;
 pub mod syscall;
 pub mod task;
 pub mod usercopy;
+pub mod vmspace;
 
 pub use boot_info::BootInfo;
 
@@ -102,7 +103,20 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     };
     kprintln!("[kernel] init image {} KiB", image.len() >> 10);
 
-    task::init(platform.gdt, arch::fault_stack_top());
+    task::init(platform.gdt, arch::fault_stack_top(), platform.kernel_root);
+
+    // The number every teardown is measured against. Taken before the first
+    // process exists, so once the last one has been reaped the free count must
+    // be exactly this again.
+    let baseline = arch::memory::free_frames();
+    task::set_baseline_free_frames(baseline);
+    kprintln!("[kernel] {baseline} frames free before any process");
+
+    // One respawn, into whichever slot the first reap empties. It is what turns
+    // "the frames were counted back" into "the frames were usable again".
+    // SAFETY: the image lives in loader memory, which the frame allocator never
+    // issues, so it outlives every process built from it.
+    unsafe { task::arm_respawn(image, platform.kernel_root, 1, 3) };
 
     // Two processes from one image. They share no memory — each gets its own
     // address space built from the same bytes — and tell themselves apart only

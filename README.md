@@ -31,12 +31,13 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Kurulum ekranı | ✅ Çalışıyor | Aşamalı, ilerleme çubuklu kurulum provası; hiçbir diske dokunmaz |
 | Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
 | Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
-| Otomatik testler | ✅ 361 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
+| Otomatik testler | ✅ 368 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
 | Üretim yükleyicisi | ✅ Çalışıyor | Çekirdek ELF'ini okur, doğrular, yükler ve boot servislerinden çıkıp devreder |
 | Üretim çekirdeği | ✅ QEMU'da açılıyor | GDT, IDT, seri konsol, çerçeve ayırıcı ve kendi sayfa tabloları; `cargo xtask boot-test` seri günlükle kanıtlar |
 | Kesme denetleyicisi ve zamanlayıcı | ✅ Çalışıyor | x2APIC, PIT ile kalibre edilmiş 100 Hz LAPIC zamanlayıcısı ve tam yazmaç bağlam değiştirme |
 | Kullanıcı alanı | ✅ İlk süreç çalışıyor | `init` kendi adres uzayında ring 3'te açılıyor, `syscall` ile çekirdeğe dönüyor ve sınır ihlalleri reddediliyor |
-| Süreç yönetimi | 🚧 Yapılıyor | Round-robin ile önalımlı çalışıyor; süreç yıkımı, engelleyen çağrılar ve gerçek IPC henüz yok |
+| Süreç yönetimi | ✅ Çalışıyor | Önalımlı round-robin, süreç yıkımı ve slot geri kazanımı; çekirdek her açılışta çerçeve sızıntısı olmadığını doğruluyor |
+| IPC | ❌ Hazır değil | `SYS_PING` gerçek mesajlaşmanın yerini tutan bir vekil; `ipc.rs` henüz bağlanmadı |
 | Masaüstü oturumu | 🚧 Yapılıyor | Önizleme var; gerçek çekirdekten masaüstüne geçiş henüz tamamlanmadı |
 | Fiziksel kurulum | ❌ Hazır değil | Disk kurucusu, donanım uyumluluğu ve kurtarma yolu tamamlanmadan kullanılamaz |
 

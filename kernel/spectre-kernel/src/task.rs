@@ -25,7 +25,7 @@ use crate::arch::addr::{PagingMode, PhysAddr, VirtAddr};
 use crate::arch::gdt::GdtLayout;
 use crate::arch::trap::TrapFrame;
 use crate::arch::user::{UserProcess, MAX_USER_REGIONS};
-use crate::arch::{cpu, segments};
+use crate::arch::{cpu, memory, segments};
 use crate::kprintln;
 use crate::roundrobin::{self, Slot};
 use crate::usercopy::UserRegion;
@@ -41,8 +41,9 @@ pub enum State {
     /// Runnable, not currently on a processor.
     Ready,
     Running,
-    /// Called `SYS_EXIT`. Never scheduled again, and the slot is not reused:
-    /// there is no process teardown yet, so reusing it would leak its frames.
+    /// Called `SYS_EXIT`, and waiting to be reaped. The next tick frees its
+    /// address space and returns the slot to `Empty`; until then it must not be
+    /// scheduled, because its frame describes a process that has finished.
     Exited,
 }
 
@@ -111,12 +112,105 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     switches: 0,
 });
 
-/// Selectors for the initial frames, and the stack the CPU switches to on a
-/// ring 3 → 0 transition.
-static PLATFORM: Mutex<Option<(GdtLayout, u64)>> = Mutex::new(None);
+/// Selectors for the initial frames, the stack the CPU switches to on a ring 3
+/// → 0 transition, and the kernel's own top-level table.
+static PLATFORM: Mutex<Option<(GdtLayout, u64, PhysAddr)>> = Mutex::new(None);
 
-pub fn init(layout: GdtLayout, ring0_stack_top: u64) {
-    *PLATFORM.lock() = Some((layout, ring0_stack_top));
+pub fn init(layout: GdtLayout, ring0_stack_top: u64, kernel_root: PhysAddr) {
+    *PLATFORM.lock() = Some((layout, ring0_stack_top, kernel_root));
+}
+
+/// What the kernel needs to build another process after one has been reaped.
+///
+/// Keeping the image address rather than a slice because this is read from an
+/// interrupt handler, where a borrow of something owned by `run` would have no
+/// lifetime to speak of. The bytes live in `Loader` memory, which the frame
+/// allocator never hands out.
+#[derive(Debug, Clone, Copy)]
+struct Spawner {
+    image_phys: u64,
+    image_len: usize,
+    kernel_root: PhysAddr,
+    /// Processes still to be created. Bounded so the demonstration terminates;
+    /// a real system would spawn on request rather than on a budget.
+    remaining: u32,
+    next_argument: u64,
+}
+
+static SPAWNER: Mutex<Option<Spawner>> = Mutex::new(None);
+
+/// Free frames before any process existed, for the leak check at the end.
+static BASELINE_FREE_FRAMES: Mutex<u64> = Mutex::new(0);
+
+/// Arms the respawn path.
+///
+/// # Safety
+/// `image` must remain valid and mapped for the life of the system, which holds
+/// because it is in loader memory the allocator does not issue.
+pub unsafe fn arm_respawn(
+    image: &'static [u8],
+    kernel_root: PhysAddr,
+    count: u32,
+    first_argument: u64,
+) {
+    *SPAWNER.lock() = Some(Spawner {
+        image_phys: image.as_ptr() as u64,
+        image_len: image.len(),
+        kernel_root,
+        remaining: count,
+        next_argument: first_argument,
+    });
+}
+
+/// Records how much memory was free before any process was built.
+pub fn set_baseline_free_frames(frames: u64) {
+    *BASELINE_FREE_FRAMES.lock() = frames;
+}
+
+/// Builds one more process, if the budget allows and a slot is free.
+///
+/// Called after a reap, which is the only time a slot becomes free — so this is
+/// also the proof that a reclaimed slot and reclaimed frames are usable again,
+/// rather than merely accounted for.
+fn try_spawn() {
+    let plan = {
+        let mut guard = SPAWNER.lock();
+        let Some(spawner) = guard.as_mut() else {
+            return;
+        };
+        if spawner.remaining == 0 {
+            return;
+        }
+        spawner.remaining -= 1;
+        let argument = spawner.next_argument;
+        spawner.next_argument += 1;
+        (
+            spawner.image_phys,
+            spawner.image_len,
+            spawner.kernel_root,
+            argument,
+        )
+    };
+    let (phys, len, kernel_root, argument) = plan;
+
+    // SAFETY: the image is in loader memory, identity mapped and never
+    // reclaimed; `arm_respawn` recorded a slice that was live then and cannot
+    // have been freed since.
+    let image = unsafe { core::slice::from_raw_parts(phys as *const u8, len) };
+
+    // SAFETY: the frame allocator is up, physical memory is identity mapped,
+    // and `on_tick` put the kernel's own table in CR3 before calling here.
+    let process = match unsafe { crate::arch::user::load(image, kernel_root) } {
+        Ok(process) => process,
+        Err(error) => {
+            kprintln!("[kernel] respawn failed: {error:?}");
+            return;
+        }
+    };
+    match admit(&process, argument) {
+        Some(pid) => kprintln!("[kernel] respawned pid={pid} into a reclaimed slot"),
+        None => kprintln!("[kernel] respawn found no free slot"),
+    }
 }
 
 /// Adds a loaded image to the table and builds the frame that will start it.
@@ -126,7 +220,7 @@ pub fn init(layout: GdtLayout, ring0_stack_top: u64) {
 /// the whole of a process's initial environment right now, and it is how two
 /// instances of the same image tell themselves apart.
 pub fn admit(image: &UserProcess, argument: u64) -> Option<u64> {
-    let (layout, _) = (*PLATFORM.lock())?;
+    let (layout, _, _) = (*PLATFORM.lock())?;
     let mut table = TABLE.lock();
     let slot = table.slots.iter().position(|p| p.state == State::Empty)?;
 
@@ -191,10 +285,84 @@ pub fn exit_current(code: u64) -> u64 {
     process.pid
 }
 
+/// Frees the address space of every exited process and empties its slot.
+///
+/// Must not run while any of those spaces is in `CR3`, which is why `on_tick`
+/// switches to the kernel's own table before calling it. Returns the number of
+/// frames recovered.
+///
+/// The table lock is dropped before each teardown. Destroying an address space
+/// takes the frame allocator's lock, and holding the process table across that
+/// is the one nesting order that could deadlock once a second processor exists.
+fn reap() -> u64 {
+    let mut recovered = 0u64;
+    loop {
+        let victim = {
+            let mut table = TABLE.lock();
+            match table.slots.iter().position(|p| p.state == State::Exited) {
+                Some(slot) => {
+                    let root = table.slots[slot].root;
+                    let pid = table.slots[slot].pid;
+                    // Emptied before the walk, not after: if the teardown
+                    // faults, the slot must not still name memory that is
+                    // half freed.
+                    table.slots[slot] = Process::EMPTY;
+                    Some((pid, root))
+                }
+                None => None,
+            }
+        };
+        let Some((pid, root)) = victim else {
+            return recovered;
+        };
+
+        // SAFETY: `on_tick` switched to the kernel's table before calling this,
+        // and this is a single processor, so nothing is running on `root`.
+        match unsafe { memory::destroy_address_space(root) } {
+            Ok(reclaimed) => {
+                recovered += reclaimed.total();
+                kprintln!(
+                    "[kernel] reaped pid={pid}, freed {} frames ({} data, {} tables)",
+                    reclaimed.total(),
+                    reclaimed.leaf_frames,
+                    reclaimed.table_frames
+                );
+            }
+            Err(error) => {
+                // Not recoverable and not survivable: the walk has already
+                // freed an unknown amount, so the allocator's idea of what is
+                // in use no longer matches reality.
+                kprintln!("[kernel] TEARDOWN FAILED for pid={pid}: {error:?}");
+                crate::arch::halt_forever();
+            }
+        }
+    }
+}
+
 /// Chooses the next process and rewrites `frame` to resume it.
 ///
 /// Called from the timer interrupt, with interrupts disabled.
 pub fn on_tick(frame: &mut TrapFrame) {
+    // Move off whatever address space was interrupted, first thing. The process
+    // that just exited may be the one whose tables are about to be freed, and
+    // `CR3` pointing at a freed table is a fault with no connection to the code
+    // that caused it. Every address space maps the kernel identically, so this
+    // changes nothing about the instructions that follow.
+    if let Some((_, _, kernel_root)) = *PLATFORM.lock() {
+        // SAFETY: the kernel's own table maps the running code and stack, and
+        // is never freed.
+        unsafe { cpu::write_cr3(kernel_root.as_u64()) };
+    }
+
+    let exited = {
+        let table = TABLE.lock();
+        table.slots.iter().any(|p| p.state == State::Exited)
+    };
+    if exited {
+        reap();
+        try_spawn();
+    }
+
     let mut table = TABLE.lock();
     table.ticks += 1;
 
@@ -209,6 +377,7 @@ pub fn on_tick(frame: &mut TrapFrame) {
         let (ticks, switches) = (table.ticks, table.switches);
         drop(table);
         kprintln!("[kernel] all processes exited after {ticks} ticks, {switches} switches");
+        report_frame_balance();
         kprintln!("[kernel] stage 2 complete");
         kprintln!("[kernel] nothing left to schedule, halting");
         crate::arch::halt_forever();
@@ -223,7 +392,7 @@ pub fn on_tick(frame: &mut TrapFrame) {
     let root = table.slots[next].root;
     drop(table);
 
-    let stack = PLATFORM.lock().map_or(0, |(_, stack)| stack);
+    let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
     // SAFETY: single processor, interrupts disabled. The kernel stack is
     // static, and switching address spaces is safe because every one of them
     // maps the kernel's identity range at the same top-level entry — so the
@@ -234,6 +403,34 @@ pub fn on_tick(frame: &mut TrapFrame) {
             PagingMode::Level4,
         ));
         cpu::write_cr3(root.as_u64());
+    }
+}
+
+/// Compares free memory now against what was free before any process existed.
+///
+/// The whole point of teardown, stated as a number. Every frame a process was
+/// given came from the allocator and every one should have gone back, so the
+/// two counts must be identical — not close. A difference in either direction
+/// is a bug: fewer frames means a leak, more means the walk freed something
+/// that was never the process''s.
+fn report_frame_balance() {
+    let baseline = *BASELINE_FREE_FRAMES.lock();
+    let now = memory::free_frames();
+    if baseline == 0 {
+        return;
+    }
+    if now == baseline {
+        kprintln!("[kernel] frames balanced: {now} free, no leak across process teardown");
+    } else if now < baseline {
+        kprintln!(
+            "[kernel] FRAME LEAK: {} frames never returned ({baseline} before, {now} after)",
+            baseline - now
+        );
+    } else {
+        kprintln!(
+            "[kernel] FRAME OVER-RELEASE: {} more frames than there were ({baseline} before, {now} after)",
+            now - baseline
+        );
     }
 }
 
@@ -256,7 +453,7 @@ pub unsafe fn run() -> ! {
     let root = table.slots[first].root;
     drop(table);
 
-    let stack = PLATFORM.lock().map_or(0, |(_, stack)| stack);
+    let stack = PLATFORM.lock().map_or(0, |(_, stack, _)| stack);
     // SAFETY: as documented above.
     unsafe {
         segments::set_kernel_stack(VirtAddr::from_indices_sign_extended(

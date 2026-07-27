@@ -194,14 +194,25 @@ exit. `cargo xtask boot-test` asserts that whole sequence from the serial log,
 and separately reads the kernel's context-switch counter, because every line
 would appear in the same order even if the timer had never fired.
 
+A process that exits is reaped on the next tick: `vmspace.rs` walks its address
+space, frees every frame it owned, and returns the slot to the table. The walk
+takes the shared top-level indices as an argument rather than knowing them,
+because the one entry it must not follow is the kernel's own identity map —
+shared into every address space, and freeing it hands the kernel's page tables
+to the allocator. Both directions are tested on the host: every frame comes back
+exactly once, and nothing under a shared entry is touched.
+
+The boot proves it end to end. A third process is built from the reclaimed
+frames in the reclaimed slot, and the kernel compares free memory against what
+was free before any process existed — the counts must be identical, and the boot
+test fails on either a leak or an over-release.
+
 `task.rs` is not `sched.rs`: it is a fixed table and a rotating index, with the
 selection policy split into `roundrobin.rs` so its fairness is testable on the
 host. The real scheduler still waits on `thread` and `percpu`.
 
-What is *not* there: no process teardown — an exited slot is never reused,
-because freeing its frames needs an address-space destructor — no blocking
-system call, and no real IPC. `SYS_PING` stands in for an IPC round trip. The
-system halts once every process has exited.
+What is *not* there: no blocking system call, and no real IPC. `SYS_PING` stands
+in for an IPC round trip. The system halts once every process has exited.
 
 The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
 and carry the bulk of the test suite, but they are written against platform

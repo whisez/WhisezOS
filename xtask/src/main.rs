@@ -391,28 +391,65 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     "[kernel] syscall enabled=true",
     "[kernel] stage 1 complete",
     // Stage 2: two processes, in ring 3, in separate address spaces.
+    "[kernel] init image",
+    // The number the frame-balance check is measured against. The count comes
+    // first in the line, so the match starts after it.
+    "frames free before any process",
     "[kernel] init mapped pid=1",
     "[kernel] init mapped pid=2",
     "[kernel] lapic id=",
     "[kernel] entering ring 3",
-    // Printed by the first process, through SYS_LOG, from ring 3.
+    "[kernel] stage 2 complete",
+];
+
+/// Lines that must be caused by an earlier one, in that order.
+///
+/// A reclaimed slot cannot be filled before it is reclaimed, and a process
+/// cannot print before it has been created. Everything else about the ordering
+/// between processes is a race, and asserting on it makes the test fail on a
+/// fast host and pass on a slow one.
+/// Which process exits first is itself a race, so the chain names none of them.
+const TEARDOWN_CHAIN: &[&str] = &[
+    // An address space is walked and its frames go back.
+    "[kernel] reaped pid=",
+    // The slot it freed is filled. A slot merely marked free proves nothing; a
+    // process built out of the reclaimed frames and running in ring 3 does.
+    "into a reclaimed slot",
+    "[init 3] hello from ring 3",
+    "[init 3] all checks passed",
+];
+
+/// Lines that must appear, in any order.
+///
+/// Three processes running concurrently interleave differently on every boot,
+/// so the only honest assertion about them is presence.
+const REQUIRED_LINES: &[&str] = &[
+    // Printed from ring 3, through SYS_LOG, by each process.
     "[init 1] hello from ring 3",
+    "[init 2] hello from ring 3",
     // The round trip. Printing could be faked by a kernel that never left ring
     // 0; a value the kernel transformed and returned could not.
     "[init 1] ping round trip ok",
-    // Each of these would be a privilege escalation if it had succeeded.
+    "[init 2] ping round trip ok",
+    "[init 3] ping round trip ok",
+    // Each of these would be a privilege escalation if it had succeeded, and
+    // each is checked per process — a boundary that holds for the first process
+    // and not the second is not a boundary.
     "[init 1] refused as expected: reading kernel memory through SYS_LOG",
     "[init 1] refused as expected: a length past the end of the buffer limit",
     "[init 1] refused as expected: an unassigned syscall number",
-    // The second process only ever runs because the first was preempted: it
-    // is admitted before either starts and nothing yields.
-    "[init 2] hello from ring 3",
+    "[init 2] refused as expected: reading kernel memory through SYS_LOG",
+    "[init 2] refused as expected: a length past the end of the buffer limit",
     "[init 2] refused as expected: an unassigned syscall number",
+    "[init 3] refused as expected: reading kernel memory through SYS_LOG",
     "[init 1] all checks passed",
-    "[kernel] pid 1 exited with code 0",
     "[init 2] all checks passed",
+    // Both original processes exit and are reaped, whichever order they do it
+    // in, and so does the one built from the reclaimed frames.
+    "[kernel] pid 1 exited with code 0",
     "[kernel] pid 2 exited with code 0",
-    "[kernel] stage 2 complete",
+    "[kernel] reaped pid=1, freed",
+    "[kernel] reaped pid=2, freed",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.
@@ -440,23 +477,39 @@ fn boot_test() -> Result<()> {
     kill_qemu();
     let _ = child.join();
 
-    let mut cursor = 0usize;
-    for expected in EXPECTED_BOOT_LINES {
-        match captured[cursor..].find(expected) {
-            Some(at) => cursor += at + expected.len(),
-            None => {
-                eprintln!("--- captured serial log ---\n{captured}\n---");
-                bail!("boot log is missing, or has out of order, the line: {expected:?}");
-            }
+    if let Err(error) = check_log(&captured) {
+        eprintln!("--- captured serial log ---\n{captured}\n---");
+        return Err(error);
+    }
+
+    let stages = EXPECTED_BOOT_LINES.len() + TEARDOWN_CHAIN.len() + REQUIRED_LINES.len();
+    println!("boot test passed: {stages} stages observed");
+    Ok(())
+}
+
+fn check_log(captured: &str) -> Result<()> {
+    check_ordered(captured, EXPECTED_BOOT_LINES, "boot sequence")?;
+    check_ordered(captured, TEARDOWN_CHAIN, "teardown chain")?;
+
+    for expected in REQUIRED_LINES {
+        if !captured.contains(expected) {
+            bail!("boot log is missing the line: {expected:?}");
         }
     }
 
-    check_preemption(&captured)?;
+    check_preemption(captured)?;
+    check_frame_balance(captured)
+}
 
-    println!(
-        "boot test passed: {} stages observed",
-        EXPECTED_BOOT_LINES.len()
-    );
+/// Checks that `lines` appear, in the order given.
+fn check_ordered(captured: &str, lines: &[&str], what: &str) -> Result<()> {
+    let mut cursor = 0usize;
+    for expected in lines {
+        match captured[cursor..].find(expected) {
+            Some(at) => cursor += at + expected.len(),
+            None => bail!("{what}: missing, or out of order, the line: {expected:?}"),
+        }
+    }
     Ok(())
 }
 
@@ -492,6 +545,35 @@ fn check_preemption(log: &str) -> Result<()> {
     }
     println!("preemption confirmed: {ticks} ticks, {switches} switches");
     Ok(())
+}
+
+/// Asserts that every frame a process was given came back.
+///
+/// The kernel compares free memory against what was free before any process
+/// existed and says which of the three answers it got. Only one of them is
+/// acceptable, and the other two have to fail the build rather than scroll past
+/// — a leak is invisible until a long-running system runs out of memory, and an
+/// over-release is invisible until the allocator hands the same frame to two
+/// processes.
+fn check_frame_balance(log: &str) -> Result<()> {
+    if let Some(at) = log.find("[kernel] FRAME LEAK") {
+        bail!("frames leaked across teardown: {}", first_line(&log[at..]));
+    }
+    if let Some(at) = log.find("[kernel] FRAME OVER-RELEASE") {
+        bail!(
+            "teardown freed frames it did not own: {}",
+            first_line(&log[at..])
+        );
+    }
+    let Some(at) = log.find("[kernel] frames balanced") else {
+        bail!("boot log never reported the frame balance");
+    };
+    println!("teardown confirmed: {}", first_line(&log[at..]));
+    Ok(())
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim_end()
 }
 
 fn kill_qemu() {
