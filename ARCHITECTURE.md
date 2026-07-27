@@ -182,17 +182,26 @@ USB, and input are user-space processes.
 
 **What is in the bootable image today**, as distinct from what is written and
 tested. The kernel binary links `arch`, `boot_info`, `abi`, `elf`, `usercopy`,
-and `syscall`. It boots on QEMU, installs its GDT, IDT, and TSS, brings up the
-serial console, builds a frame allocator from the handoff memory map,
-constructs its own page tables with the image mapped W^X by section, switches
-CR3, installs the `SYSCALL`/`SYSRET` MSRs, maps `init` into a user address
-space, and enters ring 3. `init` calls back through `syscall`, has three
-deliberate boundary violations refused, and exits. `cargo xtask boot-test`
-asserts that whole sequence from the serial log.
+`roundrobin`, `syscall`, and `task`. It boots on QEMU, installs its GDT, IDT,
+and TSS, brings up the serial console, builds a frame allocator from the handoff
+memory map, constructs its own page tables with the image mapped W^X by section,
+switches CR3, installs the `SYSCALL`/`SYSRET` MSRs, masks the legacy 8259s,
+brings up the x2APIC and calibrates its timer against the PIT, then builds two
+processes from the same `init` image — each in its own address space — and
+enters ring 3. Both call back through `syscall`, have three deliberate boundary
+violations refused each, and are preempted mid-loop by the timer until they
+exit. `cargo xtask boot-test` asserts that whole sequence from the serial log,
+and separately reads the kernel's context-switch counter, because every line
+would appear in the same order even if the timer had never fired.
 
-What is *not* there: no interrupt controller, no timer, no preemption, no
-process table, and no real IPC. `SYS_PING` stands in for an IPC round trip, and
-the system halts when `init` exits because there is nothing to schedule next.
+`task.rs` is not `sched.rs`: it is a fixed table and a rotating index, with the
+selection policy split into `roundrobin.rs` so its fairness is testable on the
+host. The real scheduler still waits on `thread` and `percpu`.
+
+What is *not* there: no process teardown — an exited slot is never reused,
+because freeing its frames needs an address-space destructor — no blocking
+system call, and no real IPC. `SYS_PING` stands in for an IPC round trip. The
+system halts once every process has exited.
 
 The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
 and carry the bulk of the test suite, but they are written against platform

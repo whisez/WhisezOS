@@ -98,6 +98,12 @@ pub struct UserProcess {
 }
 
 impl UserProcess {
+    /// The top-level page table this process runs on.
+    #[must_use]
+    pub const fn root(&self) -> PhysAddr {
+        self.root
+    }
+
     /// The ranges this process may hand the kernel as pointers.
     #[must_use]
     pub fn regions(&self) -> &[UserRegion] {

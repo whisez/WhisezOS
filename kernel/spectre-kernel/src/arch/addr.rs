@@ -80,6 +80,11 @@ pub enum AddrError {
 
 impl PhysAddr {
     /// Construct, rejecting addresses wider than the architectural limit.
+    /// Physical zero. Never a valid allocation — the frame allocator reserves
+    /// frame 0 precisely so a null physical address stays distinguishable from
+    /// a real one — so it doubles as the empty value for a table root.
+    pub const ZERO: PhysAddr = PhysAddr(0);
+
     pub const fn new(addr: u64) -> Result<Self, AddrError> {
         if addr >> MAX_PHYS_BITS != 0 {
             return Err(AddrError::PhysTooWide(addr));

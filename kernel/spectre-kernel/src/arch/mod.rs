@@ -22,6 +22,7 @@
 //!      triple-faults with nothing on the wire.
 
 pub mod addr;
+pub mod apic;
 pub mod console;
 pub mod context;
 pub mod cpu;
@@ -31,9 +32,11 @@ pub mod idt;
 pub mod interrupts;
 pub mod memory;
 pub mod paging;
+pub mod pic;
 pub mod segments;
 pub mod serial;
 pub mod syscall;
+pub mod trap;
 pub mod user;
 
 use crate::boot_info::BootInfo;
@@ -186,10 +189,32 @@ pub fn halt_forever() -> ! {
     cpu::halt_forever()
 }
 
+/// Waits for one interrupt, leaving the interrupt flag alone.
+pub fn halt_once() {
+    cpu::halt_once();
+}
+
 /// Top of the stack the CPU switches to when a fault arrives from ring 3.
 #[must_use]
 pub fn fault_stack_top() -> u64 {
     segments::ring3_kernel_stack_top()
+}
+
+/// Masks the legacy controllers and starts the LAPIC timer.
+///
+/// The two are one step because the order between them is not optional: the
+/// 8259s power up delivering IRQs at vectors 8 through 15, which are exception
+/// vectors, so anything that enables interrupts before they are masked reports
+/// a double fault the first time the clock ticks.
+///
+/// # Safety
+/// Called once, after the IDT is installed, with interrupts disabled.
+pub unsafe fn start_timer() -> Result<apic::TimerInfo, apic::ApicError> {
+    // SAFETY: bring-up, interrupts disabled, IDT live.
+    unsafe {
+        pic::disable();
+        apic::init()
+    }
 }
 
 /// Prints a panic message without taking the console lock.

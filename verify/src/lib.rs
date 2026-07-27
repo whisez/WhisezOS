@@ -107,6 +107,9 @@ pub mod boot_info;
 #[path = "../../kernel/spectre-kernel/src/abi.rs"]
 pub mod abi;
 
+#[path = "../../kernel/spectre-kernel/src/roundrobin.rs"]
+pub mod roundrobin;
+
 #[path = "../../kernel/spectre-kernel/src/usercopy.rs"]
 pub mod usercopy;
 

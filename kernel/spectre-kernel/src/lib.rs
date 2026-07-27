@@ -27,8 +27,13 @@
 //!
 //! # What this crate actually links today
 //!
-//! Only `arch` and `boot_info`. That is the honest state of the tree, and the
-//! module list above describes the design rather than the build.
+//! `arch`, `boot_info`, `abi`, `elf`, `usercopy`, `roundrobin`, `syscall`, and
+//! `task`. That is the honest state of the tree, and the module list above
+//! describes the design rather than the build.
+//!
+//! `task` in particular is not `sched`: it is a fixed table and a rotating
+//! index, enough to preempt two processes with a timer. `sched.rs` is the
+//! three-class scheduler the architecture calls for.
 //!
 //! `cap`, `sched`, `vault`, `ipc`, and `gamemode` are real, complete, and
 //! covered by several hundred tests — but they are written against platform
@@ -58,7 +63,9 @@ pub mod abi;
 pub mod arch;
 pub mod boot_info;
 pub mod elf;
+pub mod roundrobin;
 pub mod syscall;
+pub mod task;
 pub mod usercopy;
 
 pub use boot_info::BootInfo;
@@ -95,27 +102,55 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     };
     kprintln!("[kernel] init image {} KiB", image.len() >> 10);
 
-    // SAFETY: the early allocator is up, physical memory is identity mapped,
-    // and `platform.kernel_root` is the table currently in CR3.
-    let process = match unsafe { arch::user::load(image, platform.kernel_root) } {
-        Ok(process) => process,
-        Err(error) => {
-            kprintln!("[kernel] INIT REJECTED: {error:?}");
-            arch::halt_forever();
+    task::init(platform.gdt, arch::fault_stack_top());
+
+    // Two processes from one image. They share no memory — each gets its own
+    // address space built from the same bytes — and tell themselves apart only
+    // by the argument the kernel puts in `rdi`. Two is the smallest number that
+    // makes a scheduler observable: with one, "preempted and resumed" and
+    // "never interrupted" produce the same output.
+    for argument in 1..=2u64 {
+        // SAFETY: the early allocator is up, physical memory is identity
+        // mapped, and `platform.kernel_root` is the table currently in CR3.
+        let process = match unsafe { arch::user::load(image, platform.kernel_root) } {
+            Ok(process) => process,
+            Err(error) => {
+                kprintln!("[kernel] INIT REJECTED: {error:?}");
+                arch::halt_forever();
+            }
+        };
+        match task::admit(&process, argument) {
+            Some(pid) => kprintln!(
+                "[kernel] init mapped pid={pid} entry={:#018x} stack={:#018x} regions={}",
+                process.entry,
+                process.stack_top,
+                process.regions().len()
+            ),
+            None => {
+                kprintln!("[kernel] process table full");
+                arch::halt_forever();
+            }
         }
-    };
-    kprintln!(
-        "[kernel] init mapped, entry={:#018x} stack={:#018x} regions={}",
-        process.entry,
-        process.stack_top,
-        process.regions().len()
-    );
+    }
 
-    arch::user::set_current(process);
+    // The timer is started last. Once it is running, the next thing that
+    // happens is a context switch, and there is no point being able to switch
+    // before there is more than one thing to switch to.
+    // SAFETY: the IDT is installed and the legacy PICs are about to be masked
+    // by this call's own preamble; interrupts are still disabled.
+    match unsafe { arch::start_timer() } {
+        Ok(info) => arch::apic::report(&info),
+        Err(error) => {
+            // Not fatal. Without a timer there is no preemption, so the first
+            // process runs until it makes a system call — which is a degraded
+            // system, and is reported as one rather than looking like success.
+            kprintln!("[kernel] WARNING no timer ({error:?}), running without preemption");
+        }
+    }
+
     kprintln!("[kernel] entering ring 3");
-
-    // SAFETY: `process` came from `load` against the active kernel table and
-    // the syscall MSRs are installed, which is what init needs on its first
-    // instruction.
-    unsafe { arch::user::enter(&process, &platform.gdt, arch::fault_stack_top()) }
+    // SAFETY: both processes were loaded against the active kernel table, the
+    // syscall MSRs are installed, and interrupts are still masked — they come
+    // on through the first frame's RFLAGS, in ring 3.
+    unsafe { task::run() }
 }

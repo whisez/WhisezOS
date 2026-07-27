@@ -147,12 +147,27 @@ pub unsafe fn install(layout: &GdtLayout) -> Result<(), IdtError> {
         GateKind::Trap,
     )?;
 
-    // Device vectors. Nothing is wired to an interrupt controller yet, so all
-    // of them land on one handler that reports and continues rather than
-    // leaving 224 gates absent.
+    // Device vectors. Everything the kernel has not asked for lands on one
+    // handler that reports and continues, rather than leaving 224 gates absent
+    // — an absent gate is a #GP, and a #GP during delivery is a triple fault.
     for v in vector::FIRST_DEVICE..=u8::MAX {
         idt.set_device_handler(v, handler_addr(unexpected_device as *const () as usize), cs)?;
     }
+
+    // The two the kernel does ask for. The timer's entry is hand-written rather
+    // than an `x86-interrupt` handler because it has to be able to resume a
+    // different process than the one it interrupted, which needs the whole
+    // register file — see `arch/trap.rs`.
+    idt.set_device_handler(
+        vector::LAPIC_TIMER,
+        handler_addr(super::trap::timer_entry as *const () as usize),
+        cs,
+    )?;
+    idt.set_device_handler(
+        vector::SPURIOUS,
+        handler_addr(spurious as *const () as usize),
+        cs,
+    )?;
 
     if let Some(missing) = idt.missing_exception_vectors().next() {
         return Err(IdtError::MissingHandler(missing));
@@ -328,6 +343,15 @@ extern "x86-interrupt" fn hypervisor_injection(frame: InterruptFrame) -> ! {
     // that owns the machine.
     fatal("#HV hypervisor injection", &frame, None)
 }
+
+/// The LAPIC's spurious vector.
+///
+/// Raised when an interrupt is withdrawn between being signalled and being
+/// delivered, which is normal and not an error. It is the one vector that must
+/// *not* be acknowledged: the APIC never set the in-service bit for it, so an
+/// EOI here would acknowledge whatever interrupt is genuinely in service and
+/// lose it.
+extern "x86-interrupt" fn spurious(_frame: InterruptFrame) {}
 
 extern "x86-interrupt" fn unexpected_device(frame: InterruptFrame) {
     // No interrupt controller is programmed yet, so nothing should arrive here.

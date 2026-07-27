@@ -118,11 +118,17 @@ Expect, in order: the loader's memory audit, validation of the kernel ELF, the
 exit from boot services, the handoff, then the kernel's GDT, IDT, frame
 allocator, and page-table lines, ending with `[kernel] stage 1 complete`.
 
-Stage 2 follows: the kernel maps the `init` image into its own user address
-space and enters ring 3. Every line beginning `[init]` is written from user
-space through `syscall`. Three of them are deliberate violations that are
-expected to be refused — reading kernel memory, a length past the limit, and an
-unassigned syscall number.
+Stage 2 follows: the kernel builds **two processes** from the same `init` image,
+each in its own address space, and enters ring 3. Every line beginning
+`[init 1]` or `[init 2]` is written from user space through `syscall`. Each
+process attempts three deliberate violations that are expected to be refused:
+reading kernel memory, a length past the limit, and an unassigned syscall
+number.
+
+The last section is a loop that never enters the kernel. The output
+interleaving is the proof that the processor was taken away by the 100 Hz LAPIC
+timer — neither process ever yields. The kernel reports the tick and context
+switch counts at the end.
 
 To verify the same boot automatically:
 
@@ -130,16 +136,24 @@ To verify the same boot automatically:
 cargo xtask boot-test
 ```
 
-This runs QEMU headless, captures the serial log, and asserts that twenty-two stages
-appear in order. It also runs as part of `cargo xtask test`, and is skipped
-with a warning when QEMU is not installed.
+This runs QEMU headless, captures the serial log, and asserts that twenty-eight stages
+appear in order. It also reads the context switch count the kernel prints and
+fails if it is zero — every line would appear in that order even if the timer
+had never fired. It runs as part of `cargo xtask test` too, and is skipped with
+a warning when QEMU is not installed.
 
 > The production loader enforces the project's own 8 GiB memory floor and
 > refuses to boot a platform below it, which is why the VM is started with 9 GiB.
 
-> The system halts once `init` exits. There is no scheduler, no process table,
-> and no real IPC yet, so there is nothing else to run. This is the second
-> verifiable vertical slice, not a finished operating system.
+> The system halts once both processes exit: there is no process teardown, no
+> blocking call, and no real IPC yet. This is a verifiable vertical slice, not a
+> finished operating system.
+
+> The VM is started with `-cpu qemu64,+x2apic`. QEMU's default CPU model has no
+> x2APIC, and the kernel drives the local APIC through its MSR interface rather
+> than the memory-mapped one, so without it no timer can be set up. The boot
+> still succeeds in that case, but with no preemption, which the kernel reports
+> as a warning.
 
 ## Build only
 

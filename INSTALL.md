@@ -117,11 +117,17 @@ Beklenen çıktı şu sırayla gelir: yükleyici bellek denetimi, çekirdek ELF'
 doğrulanması, boot servislerinden çıkış, devir, ardından çekirdeğin GDT, IDT,
 çerçeve ayırıcı ve sayfa tablosu satırları ve `[kernel] stage 1 complete`.
 
-Ardından ikinci aşama gelir: çekirdek `init` imajını kendi kullanıcı adres
-uzayına haritalar ve ring 3'e geçer. `[init]` ile başlayan satırlar kullanıcı
-alanından, `syscall` üzerinden yazılır. Üç tanesi kasıtlı ihlaldir ve
-reddedilmeleri beklenir — çekirdek belleğini okutmaya çalışmak, sınırı aşan bir
-uzunluk vermek ve tanımsız bir syscall numarası çağırmak.
+Ardından ikinci aşama gelir: çekirdek aynı `init` imajından **iki ayrı süreç**
+kurar — her biri kendi adres uzayında — ve ring 3'e geçer. `[init 1]` ve
+`[init 2]` ile başlayan satırlar kullanıcı alanından, `syscall` üzerinden
+yazılır. Her süreçte üç kasıtlı ihlal denenir ve reddedilmeleri beklenir:
+çekirdek belleğini okutmak, sınırı aşan bir uzunluk vermek ve tanımsız bir
+syscall numarası çağırmak.
+
+Son bölümde iki süreç çekirdeğe hiç girmeyen bir döngü çalıştırır. Çıktının
+iç içe geçmesi, işlemcinin 100 Hz LAPIC zamanlayıcısı tarafından elden
+alındığının kanıtıdır — hiçbiri kendi isteğiyle sırasını devretmez. Çekirdek
+sonunda kaç tick ve kaç bağlam değişimi olduğunu yazar.
 
 Aynı önyüklemeyi otomatik doğrulamak için:
 
@@ -129,16 +135,23 @@ Aynı önyüklemeyi otomatik doğrulamak için:
 cargo xtask boot-test
 ```
 
-Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve yirmi iki aşamanın
-sırasıyla göründüğünü doğrular. `cargo xtask test` içinde de çalışır; QEMU
-kurulu değilse uyarıyla atlanır.
+Bu komut QEMU'yu başsız çalıştırır, seri günlüğü yakalar ve yirmi sekiz aşamanın
+sırasıyla göründüğünü doğrular. Ayrıca çekirdeğin yazdığı bağlam değişimi
+sayısını okur ve sıfırsa testi düşürür — çünkü tüm satırlar, zamanlayıcı hiç
+çalışmasa bile aynı sırada görünebilirdi. `cargo xtask test` içinde de çalışır;
+QEMU kurulu değilse uyarıyla atlanır.
 
 > Üretim yükleyicisi projenin kendi 8 GiB bellek tabanını uygular ve altındaki
 > bir platformu açmayı reddeder. Bu yüzden sanal makine 9 GiB ile başlatılır.
 
-> `init` çıktıktan sonra sistem durur. Zamanlayıcı, süreç tablosu ve gerçek IPC
-> henüz yok, dolayısıyla çalıştırılacak ikinci bir şey de yok. Bu, tamamlanmış
-> bir işletim sistemi değil, doğrulanabilir ikinci dikey dilimdir.
+> Her iki süreç de çıktıktan sonra sistem durur: süreç yıkımı, engelleyen
+> çağrılar ve gerçek IPC henüz yok. Bu, tamamlanmış bir işletim sistemi değil,
+> doğrulanabilir bir dikey dilimdir.
+
+> Sanal makine `-cpu qemu64,+x2apic` ile başlatılır. QEMU'nun varsayılan CPU
+> modelinde x2APIC yoktur; çekirdek yerel APIC'i MMIO yerine MSR arayüzünden
+> sürdüğü için onsuz zamanlayıcı kurulamaz. Bu durumda önyükleme yine başarılı
+> olur ama önalım olmaz ve çekirdek bunu uyarı olarak yazar.
 
 ## Yalnızca derleme
 

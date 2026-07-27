@@ -117,10 +117,19 @@ pub unsafe fn init(layout: &GdtLayout) {
         cpu::write_msr(cpu::MSR_STAR, star);
         cpu::write_msr(cpu::MSR_LSTAR, syscall_entry as *const () as u64);
         cpu::write_msr(cpu::MSR_SFMASK, sfmask);
-        // While kernel code runs, `GS` base is zero and the per-CPU pointer is
-        // parked in KERNEL_GS_BASE; `swapgs` on entry brings it into `GS`.
-        cpu::write_msr(cpu::MSR_GS_BASE, 0);
-        cpu::write_msr(cpu::MSR_KERNEL_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
+        // The invariant every `swapgs` in the kernel maintains:
+        //
+        //   executing kernel code — GS = per-CPU, KERNEL_GS = the process's
+        //   executing user code   — GS = the process's, KERNEL_GS = per-CPU
+        //
+        // This runs in the kernel, so it establishes the first of the two. The
+        // mirror image looks equally plausible and is wrong: the path into ring
+        // 3 swaps on the way out, so starting from the user configuration
+        // leaves ring 3 running with the per-CPU pointer in `GS`, and the first
+        // `syscall` swaps it away to zero — turning `gs:[8]` into a write to
+        // absolute address 8.
+        cpu::write_msr(cpu::MSR_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
+        cpu::write_msr(cpu::MSR_KERNEL_GS_BASE, 0);
         cpu::write_msr(
             cpu::MSR_EFER,
             cpu::read_msr(cpu::MSR_EFER) | cpu::EFER_SYSCALL_ENABLE,

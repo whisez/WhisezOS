@@ -7,6 +7,57 @@
 
 use super::gdt::SegmentSelector;
 
+/// # Safety
+/// Reading an I/O port can have side effects on the device behind it. `port`
+/// must be one the caller understands.
+pub unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: the caller guarantees the port.
+    unsafe {
+        core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// # Safety
+/// As `inb`, and a write is rather more likely to have an effect.
+pub unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: the caller guarantees the port and the value.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// One leaf of `cpuid`.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuidResult {
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}
+
+/// Executes `cpuid` for `leaf` with `ECX` zero.
+#[must_use]
+pub fn cpuid(leaf: u32) -> CpuidResult {
+    let (eax, ebx, ecx, edx);
+    // SAFETY: `cpuid` has no side effects. `rbx` is LLVM's reserved register,
+    // so it is exchanged around the instruction rather than named directly.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "xchg {tmp:r}, rbx",
+            tmp = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inlateout("ecx") 0 => ecx,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    CpuidResult { eax, ebx, ecx, edx }
+}
+
 /// Operand for `lgdt` and `lidt`.
 ///
 /// `packed(2)` is not cosmetic: the CPU reads a 2-byte limit immediately
@@ -233,6 +284,17 @@ pub fn interrupts_enabled() -> bool {
         core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(nomem, preserves_flags));
     }
     rflags & (1 << 9) != 0
+}
+
+/// Waits for the next interrupt.
+///
+/// Unlike `halt_forever`, this leaves interrupts as it found them: the caller
+/// wants to be woken.
+pub fn halt_once() {
+    // SAFETY: halting has no memory effects.
+    unsafe {
+        core::arch::asm!("hlt", options(nomem, nostack));
+    }
 }
 
 /// Stops this processor for good.

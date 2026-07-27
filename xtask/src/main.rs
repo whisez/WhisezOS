@@ -338,6 +338,13 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>) -> Result<()
             "WhisezOS kernel",
             "-machine",
             &machine_arg,
+            // QEMU's default CPU model predates x2APIC, and the kernel drives
+            // the local APIC through its MSR interface rather than the
+            // memory-mapped one — see `arch/apic.rs` for why. Without this the
+            // boot still succeeds, but with no timer and therefore no
+            // preemption, which the kernel reports as the degradation it is.
+            "-cpu",
+            "qemu64,+x2apic",
             "-smp",
             "1",
             "-m",
@@ -383,20 +390,28 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     "[kernel] page tables active",
     "[kernel] syscall enabled=true",
     "[kernel] stage 1 complete",
-    // Stage 2: a real process, in ring 3, calling back into the kernel.
-    "[kernel] init mapped",
+    // Stage 2: two processes, in ring 3, in separate address spaces.
+    "[kernel] init mapped pid=1",
+    "[kernel] init mapped pid=2",
+    "[kernel] lapic id=",
     "[kernel] entering ring 3",
-    // Printed by init, through SYS_LOG, from ring 3.
-    "[init] hello from ring 3",
+    // Printed by the first process, through SYS_LOG, from ring 3.
+    "[init 1] hello from ring 3",
     // The round trip. Printing could be faked by a kernel that never left ring
     // 0; a value the kernel transformed and returned could not.
-    "[init] ping round trip ok",
+    "[init 1] ping round trip ok",
     // Each of these would be a privilege escalation if it had succeeded.
-    "[init] refused as expected: reading kernel memory through SYS_LOG",
-    "[init] refused as expected: a length past the end of the buffer limit",
-    "[init] refused as expected: an unassigned syscall number",
-    "[init] all checks passed",
-    "[kernel] init exited with code 0",
+    "[init 1] refused as expected: reading kernel memory through SYS_LOG",
+    "[init 1] refused as expected: a length past the end of the buffer limit",
+    "[init 1] refused as expected: an unassigned syscall number",
+    // The second process only ever runs because the first was preempted: it
+    // is admitted before either starts and nothing yields.
+    "[init 2] hello from ring 3",
+    "[init 2] refused as expected: an unassigned syscall number",
+    "[init 1] all checks passed",
+    "[kernel] pid 1 exited with code 0",
+    "[init 2] all checks passed",
+    "[kernel] pid 2 exited with code 0",
     "[kernel] stage 2 complete",
 ];
 
@@ -436,10 +451,46 @@ fn boot_test() -> Result<()> {
         }
     }
 
+    check_preemption(&captured)?;
+
     println!(
         "boot test passed: {} stages observed",
         EXPECTED_BOOT_LINES.len()
     );
+    Ok(())
+}
+
+/// Asserts that the processes were actually preempted.
+///
+/// Substring checks cannot tell "the scheduler switched" from "the first
+/// process happened to finish and the second then ran": both produce every line
+/// the list above looks for, in that order. The kernel prints the counter it
+/// keeps, and this reads it — a switch count of zero means the timer never
+/// fired, which is a system that still boots and passes every other check while
+/// having quietly lost preemption.
+fn check_preemption(log: &str) -> Result<()> {
+    const MARKER: &str = "all processes exited after ";
+    let Some(at) = log.find(MARKER) else {
+        bail!("boot log never reported the scheduler summary");
+    };
+    let tail = &log[at + MARKER.len()..];
+    let numbers: Vec<u64> = tail
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .take(2)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    let [ticks, switches] = numbers[..] else {
+        bail!("could not read the tick and switch counts from the summary");
+    };
+    if ticks == 0 {
+        bail!("the timer never fired: {ticks} ticks");
+    }
+    if switches == 0 {
+        bail!("no context switch happened in {ticks} ticks");
+    }
+    println!("preemption confirmed: {ticks} ticks, {switches} switches");
     Ok(())
 }
 
