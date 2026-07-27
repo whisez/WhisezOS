@@ -64,6 +64,9 @@ struct Process {
     regions: [UserRegion; MAX_USER_REGIONS],
     region_count: usize,
     exit_code: u64,
+    /// Device mappings this process has taken, so a second request for the same
+    /// device does not map it twice.
+    devices_mapped: u64,
 }
 
 impl State {
@@ -83,6 +86,7 @@ impl Process {
         regions: [UserRegion::new(0, 0); MAX_USER_REGIONS],
         region_count: 0,
         exit_code: 0,
+        devices_mapped: 0,
     };
 
     fn regions(&self) -> &[UserRegion] {
@@ -225,7 +229,9 @@ fn try_spawn() {
             return;
         }
     };
-    match admit(&process, argument, endpoint) {
+    // A respawned process is an ordinary client: it gets the endpoint and no
+    // device grant. Authority is not inherited by occupying a slot.
+    match admit(&process, argument, endpoint, 0) {
         Some(pid) => kprintln!("[kernel] respawned pid={pid} into a reclaimed slot"),
         None => kprintln!("[kernel] respawn found no free slot"),
     }
@@ -237,7 +243,7 @@ fn try_spawn() {
 /// process entered this way sees it as the first parameter of `_start`. It is
 /// the whole of a process's initial environment right now, and it is how two
 /// instances of the same image tell themselves apart.
-pub fn admit(image: &UserProcess, argument: u64, second: u64) -> Option<u64> {
+pub fn admit(image: &UserProcess, argument: u64, second: u64, third: u64) -> Option<u64> {
     let (layout, _, _) = (*PLATFORM.lock())?;
     let mut table = TABLE.lock();
     let slot = table.slots.iter().position(|p| p.state == State::Empty)?;
@@ -257,6 +263,9 @@ pub fn admit(image: &UserProcess, argument: u64, second: u64) -> Option<u64> {
     // process's initial environment: who it is, and the one endpoint it was
     // introduced to. A process cannot name any other.
     frame.rsi = second;
+    // Third argument register. Zero for every process that was not given a
+    // device grant, which is what makes "holds nothing" the default.
+    frame.rdx = third;
 
     let mut regions = [UserRegion::new(0, 0); MAX_USER_REGIONS];
     let supplied = image.regions();
@@ -270,6 +279,7 @@ pub fn admit(image: &UserProcess, argument: u64, second: u64) -> Option<u64> {
         regions,
         region_count: supplied.len(),
         exit_code: 0,
+        devices_mapped: 0,
     };
     Some(pid)
 }
@@ -285,6 +295,35 @@ pub fn with_current_regions<R>(f: impl FnOnce(&[UserRegion]) -> R) -> R {
         // call that cannot have come from anywhere legitimate.
         f(&[])
     }
+}
+
+/// Records a device mapping the running process has just been given.
+///
+/// The range joins its permitted regions, because a driver passing a pointer
+/// into its framebuffer to another system call is doing something ordinary, and
+/// the pointer validator has no other way to know the range is his.
+///
+/// Returns the slot the mapping used, or `None` when the process has taken as
+/// many as its region table holds.
+pub fn record_device_mapping(base: u64, length: u64) -> Option<u64> {
+    let mut table = TABLE.lock();
+    let current = table.current;
+    let process = &mut table.slots[current];
+    if process.region_count == MAX_USER_REGIONS {
+        return None;
+    }
+    let slot = process.devices_mapped;
+    process.regions[process.region_count] = UserRegion::new(base, length);
+    process.region_count += 1;
+    process.devices_mapped += 1;
+    Some(slot)
+}
+
+/// How many devices the running process has already mapped.
+#[must_use]
+pub fn devices_mapped() -> u64 {
+    let table = TABLE.lock();
+    table.slots[table.current].devices_mapped
 }
 
 /// The running process's top-level page table.
@@ -559,7 +598,7 @@ pub fn on_tick(frame: &mut TrapFrame) {
 /// given came from the allocator and every one should have gone back, so the
 /// two counts must be identical — not close. A difference in either direction
 /// is a bug: fewer frames means a leak, more means the walk freed something
-/// that was never the process''s.
+/// that was never the process's.
 fn report_frame_balance() {
     let baseline = *BASELINE_FREE_FRAMES.lock();
     let now = memory::free_frames();

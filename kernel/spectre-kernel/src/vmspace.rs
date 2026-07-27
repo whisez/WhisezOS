@@ -26,7 +26,7 @@
 #![allow(dead_code)]
 
 use crate::arch::addr::{PagingMode, PhysAddr};
-use crate::arch::paging::{PageError, TableAccess};
+use crate::arch::paging::{PageError, PageFlags, TableAccess};
 
 /// Where reclaimed frames go.
 ///
@@ -50,6 +50,9 @@ pub struct Reclaimed {
     pub leaf_frames: u64,
     /// Frames that held page tables, including the top-level table itself.
     pub table_frames: u64,
+    /// Device frames left alone. Counted, not freed — they belong to hardware,
+    /// and the count is what makes "left alone" observable rather than assumed.
+    pub device_frames: u64,
 }
 
 impl Reclaimed {
@@ -91,8 +94,12 @@ pub fn destroy<A: TableAccess + FrameSink>(
             // A leaf at the top level would be a 512 GiB page, which nothing
             // here maps. Treat it as data rather than as a table, because
             // walking it would read process memory as page-table entries.
-            access.release(entry.frame());
-            out.leaf_frames += 1;
+            if entry.flags().contains(PageFlags::DEVICE) {
+                out.device_frames += 1;
+            } else {
+                access.release(entry.frame());
+                out.leaf_frames += 1;
+            }
             continue;
         }
         free_subtree(access, entry.frame(), top - 1, &mut out)?;
@@ -128,8 +135,16 @@ fn free_subtree<A: TableAccess + FrameSink>(
         // decides. Asking `is_leaf` at level 1 is what reports a huge bit set
         // where it cannot be, which is corruption rather than a large page.
         if level == 1 || entry.is_leaf(level)? {
-            access.release(entry.frame());
-            out.leaf_frames += 1;
+            // A device frame was never the allocator's to give and must not be
+            // handed back: "freeing" a framebuffer marks a thousand frames
+            // available while the display is still reading from them, and the
+            // allocator then issues them to the next process.
+            if entry.flags().contains(PageFlags::DEVICE) {
+                out.device_frames += 1;
+            } else {
+                access.release(entry.frame());
+                out.leaf_frames += 1;
+            }
             continue;
         }
 
@@ -306,6 +321,65 @@ mod tests {
                 .contains(&shared_entry.frame().as_u64()),
             "expected the unprotected walk to free the shared subtree"
         );
+    }
+
+    #[test]
+    fn a_device_mapping_is_counted_and_left_alone() {
+        // The bug this exists for, caught by the boot test's frame accounting:
+        // a framebuffer mapped into a process is a thousand frames the
+        // allocator never issued, and returning them marks memory free that
+        // hardware is still reading from.
+        let mut world = World::new();
+        let root = build(&mut world, 0x1000_0000_0000, 2);
+        let owned = world.handed_out.clone();
+
+        let device_frame = PhysAddr::new(0x8000_0000).unwrap();
+        map_page(
+            &mut world,
+            root,
+            virt(0x2000_0000_0000),
+            device_frame,
+            user_rw() | PageFlags::DEVICE,
+            PageSize::Small,
+            MODE,
+        )
+        .unwrap();
+
+        let reclaimed = destroy(&mut world, root, &[], MODE).unwrap();
+        assert_eq!(reclaimed.device_frames, 1);
+        assert_eq!(reclaimed.leaf_frames, 2, "only the process's own pages");
+        assert!(
+            !world.released_set().contains(&device_frame.as_u64()),
+            "released a device frame"
+        );
+        // Everything the process did own still came back, including the tables
+        // that held the device mapping.
+        for frame in owned {
+            assert!(world.released_set().contains(&frame), "leaked {frame:#x}");
+        }
+    }
+
+    #[test]
+    fn the_tables_holding_a_device_mapping_are_still_freed() {
+        // The mapping is not ours; the page tables describing it are.
+        let mut world = World::new();
+        let root = world.alloc();
+        map_page(
+            &mut world,
+            root,
+            virt(0x2000_0000_0000),
+            PhysAddr::new(0x8000_0000).unwrap(),
+            user_rw() | PageFlags::DEVICE,
+            PageSize::Small,
+            MODE,
+        )
+        .unwrap();
+
+        let reclaimed = destroy(&mut world, root, &[], MODE).unwrap();
+        assert_eq!(reclaimed.device_frames, 1);
+        assert_eq!(reclaimed.leaf_frames, 0);
+        // Root plus the three levels below it.
+        assert_eq!(reclaimed.table_frames, 4);
     }
 
     #[test]

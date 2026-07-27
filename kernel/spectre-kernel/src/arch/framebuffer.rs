@@ -52,6 +52,19 @@ const MARGIN: usize = 12;
 /// Height of the banner across the top.
 const HEADER_HEIGHT: usize = 34;
 
+/// Rows at the bottom the kernel console will not touch.
+///
+/// This is the first line drawn between kernel and user space, and it is drawn
+/// in pixels. A user-space display driver maps this same framebuffer and writes
+/// to it; with no compositor and nothing arbitrating, the only thing keeping
+/// the two from scrolling over each other is an agreement about who writes
+/// where. The kernel takes the top and leaves this band alone.
+///
+/// A placeholder for the arrangement that replaces it — the compositor owning
+/// the display outright, and this console being what it falls back to — but a
+/// placeholder that is honest about which side owns which pixels.
+pub const USER_BAND_HEIGHT: usize = 104;
+
 const CELL_WIDTH: usize = GLYPH_WIDTH * SCALE;
 const CELL_HEIGHT: usize = GLYPH_HEIGHT * SCALE + LINE_GAP;
 
@@ -134,7 +147,9 @@ impl Console {
     }
 
     const fn rows(&self) -> usize {
-        (self.height.saturating_sub(HEADER_HEIGHT + LINE_GAP)) / CELL_HEIGHT
+        self.height
+            .saturating_sub(HEADER_HEIGHT + LINE_GAP + USER_BAND_HEIGHT)
+            / CELL_HEIGHT
     }
 
     fn put(&mut self, x: usize, y: usize, colour: u32) {
@@ -155,7 +170,17 @@ impl Console {
     }
 
     fn clear(&mut self) {
-        self.fill(0, 0, self.width, self.height, colour::BACKGROUND);
+        // Only the kernel's own area. The band below belongs to whichever
+        // process was granted the display, and clearing it here would erase
+        // that process's work.
+        let (w, h) = (self.width, self.height);
+        self.fill(
+            0,
+            0,
+            w,
+            h.saturating_sub(USER_BAND_HEIGHT),
+            colour::BACKGROUND,
+        );
     }
 
     fn draw_header(&mut self) {

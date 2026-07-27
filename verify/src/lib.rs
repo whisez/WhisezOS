@@ -107,6 +107,9 @@ pub mod boot_info;
 #[path = "../../kernel/spectre-kernel/src/abi.rs"]
 pub mod abi;
 
+#[path = "../../kernel/spectre-kernel/src/device.rs"]
+pub mod device;
+
 #[path = "../../kernel/spectre-kernel/src/font.rs"]
 pub mod font;
 

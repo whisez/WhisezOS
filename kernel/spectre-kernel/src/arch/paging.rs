@@ -54,6 +54,15 @@ bitflags::bitflags! {
         /// Software bit: page is donated via IPC and must not be freed by the
         /// sender's address space teardown.
         const DONATED         = 1 << 11;
+        /// Software bit: the frame belongs to a device, not to this address
+        /// space.
+        ///
+        /// Bit 52 rather than one of the low software bits because those are
+        /// spoken for, and bits 52 through 58 are available above the address
+        /// field. Teardown must not return these frames to the allocator: they
+        /// were never allocated, and "freeing" a framebuffer marks a thousand
+        /// frames available that the display is still reading from.
+        const DEVICE          = 1 << 52;
         const NO_EXECUTE      = 1 << 63;
     }
 }

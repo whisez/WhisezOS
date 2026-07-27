@@ -63,6 +63,7 @@ pub mod abi;
 pub mod arch;
 pub mod boot_info;
 pub mod channel;
+pub mod device;
 pub mod elf;
 pub mod font;
 pub mod rendezvous;
@@ -128,6 +129,13 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     };
     kprintln!("[kernel] endpoint created for pid=1");
 
+    // The device grant. Drawn from the same generator as endpoint handles, and
+    // handed to exactly one process — the display driver — so every other
+    // process holds zero and zero never matches.
+    let grant = channel::issue_token();
+    let devices = device::init(boot, grant);
+    kprintln!("[kernel] {devices} device(s) listed, grant issued to pid=1");
+
     // One respawn, into whichever slot the first reap empties. It is what turns
     // "the frames were counted back" into "the frames were usable again".
     // SAFETY: the image lives in loader memory, which the frame allocator never
@@ -149,7 +157,9 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
                 arch::halt_forever();
             }
         };
-        match task::admit(&process, argument, endpoint) {
+        // Only the first process is a driver. The grant is what says so.
+        let device_grant = if argument == 1 { grant } else { 0 };
+        match task::admit(&process, argument, endpoint, device_grant) {
             Some(pid) => kprintln!(
                 "[kernel] init mapped pid={pid} entry={:#018x} stack={:#018x} regions={}",
                 process.entry,

@@ -136,6 +136,15 @@ fn next_handle(table: &mut Table) -> u64 {
     }
 }
 
+/// Issues a token from the same generator endpoint handles come from.
+///
+/// Shared so there is one place that decides what an unguessable name looks
+/// like, and one place to change when it stops being a xorshift.
+pub fn issue_token() -> u64 {
+    let mut table = TABLE.lock();
+    next_handle(&mut table)
+}
+
 /// Creates an endpoint owned by `owner`, returning its handle.
 pub fn create(owner: u64) -> Option<u64> {
     let mut table = TABLE.lock();

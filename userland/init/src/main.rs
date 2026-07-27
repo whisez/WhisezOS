@@ -24,8 +24,8 @@
 mod abi;
 
 use abi::{
-    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_EXIT, SYS_LOG, SYS_PING,
-    SYS_RECEIVE, SYS_REPLY,
+    decode, SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_LOG,
+    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -164,7 +164,7 @@ fn spin(iterations: u64) {
 }
 
 #[no_mangle]
-pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
+pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
     say(pid, &[b"hello from ring 3"]);
 
     // The round trip. Printing could be faked by a kernel that never left ring
@@ -216,6 +216,11 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
         say(pid, &[b"round ", &digit]);
     }
 
+    // --- driving a device -------------------------------------------------
+    // Only the process the kernel gave a grant to gets past the first call.
+    // Everything else here holds zero, and zero never matches.
+    drive_display(pid, grant);
+
     // --- talking to another process ---------------------------------------
     if endpoint != 0 {
         if pid == SERVER_ROLE {
@@ -232,6 +237,172 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64) -> ! {
 /// The process that owns the endpoint. Given the endpoint by the kernel at
 /// spawn; every other process is a client.
 const SERVER_ROLE: u64 = 1;
+
+/// What `SYS_DEVICE_INFO` writes. The layout is the kernel's `DeviceInfo`, and
+/// like the syscall numbers it is one definition compiled by both sides — this
+/// copy exists because the kernel's is behind a module user space does not
+/// include, and the `assert` below is what keeps them the same size.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DeviceInfo {
+    kind: u32,
+    _pad: u32,
+    length: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    bytes_per_pixel: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<DeviceInfo>() == 32);
+
+/// `DeviceKind::Framebuffer`.
+const DEVICE_FRAMEBUFFER: u32 = 1;
+
+/// Maps the framebuffer and draws on it, from ring 3.
+///
+/// This is the first time anything outside the kernel touches hardware. The
+/// process never names a physical address: it asks for device zero, and the
+/// kernel — which is the only thing that knows where device zero is — maps it.
+fn drive_display(pid: u64, grant: u64) {
+    let mut info = DeviceInfo {
+        kind: 0,
+        _pad: 0,
+        length: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        bytes_per_pixel: 0,
+    };
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+
+    match call5(SYS_DEVICE_INFO, grant, 0, (&raw mut info) as u64, size, 0) {
+        Ok(_) => {}
+        Err(SyscallError::NotPermitted) => {
+            // The expected answer for every process that is not the driver.
+            say(pid, &[b"no device grant, as expected"]);
+            return;
+        }
+        Err(error) => {
+            say(pid, &[b"device info failed: ", error.name().as_bytes()]);
+            exit(9);
+        }
+    }
+
+    if info.kind != DEVICE_FRAMEBUFFER || info.bytes_per_pixel != 4 {
+        say(pid, &[b"device 0 is not a framebuffer this driver knows"]);
+        return;
+    }
+
+    let base = match call5(SYS_MAP_DEVICE, grant, 0, 0, 0, 0) {
+        Ok(base) => base,
+        Err(error) => {
+            say(pid, &[b"map failed: ", error.name().as_bytes()]);
+            exit(10);
+        }
+    };
+
+    let mut digits = [0u8; 18];
+    say(
+        pid,
+        &[
+            b"framebuffer mapped from ring 3 at ",
+            hex(base, &mut digits),
+        ],
+    );
+
+    draw_banner(base, &info);
+    say(
+        pid,
+        &[b"drew to the framebuffer without entering the kernel"],
+    );
+}
+
+/// Paints a band across the bottom of the screen.
+///
+/// Deliberately somewhere the kernel's own console does not write, so what
+/// appears is unambiguously the work of a user-space process rather than a
+/// kernel line that happened to scroll past.
+fn draw_banner(base: u64, info: &DeviceInfo) {
+    let height = info.height as usize;
+    let width = info.width as usize;
+    let stride = info.stride as usize;
+    let band_height = 96usize;
+    if height < band_height + 8 || width == 0 {
+        return;
+    }
+    let top = height - band_height;
+
+    for y in 0..band_height {
+        // A vertical gradient, so a band that is drawn but wrong is still
+        // obviously drawn.
+        let level = (y * 255 / band_height) as u32;
+        let colour = (level / 5) << 16 | (level / 2) << 8 | (0x40 + level / 2);
+        for x in 0..width {
+            // SAFETY: the mapping covers `stride * height` pixels and both
+            // indices are inside it. The kernel mapped this range for this
+            // process; nothing else in the address space overlaps it.
+            unsafe {
+                let pixel = (base as *mut u32).add((top + y) * stride + x);
+                pixel.write_volatile(colour);
+            }
+        }
+    }
+
+    let text = b"USER SPACE DREW THIS";
+    draw_text(base, stride, 24, top + 36, text, 0x00FF_FFFF);
+}
+
+/// The same 5x7 shapes the kernel console uses, at three times the size.
+///
+/// A copy of the outline rather than the table: a user-space process has no
+/// business including a kernel module, and this draws twenty characters once.
+fn draw_text(base: u64, stride: usize, x0: usize, y0: usize, text: &[u8], colour: u32) {
+    const SCALE: usize = 3;
+    for (index, &byte) in text.iter().enumerate() {
+        let rows = kernel_glyph(byte);
+        for (row, bits) in rows.iter().copied().enumerate() {
+            for column in 0..5usize {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                for sy in 0..SCALE {
+                    for sx in 0..SCALE {
+                        let x = x0 + index * 6 * SCALE + column * SCALE + sx;
+                        let y = y0 + row * SCALE + sy;
+                        // SAFETY: inside the mapped framebuffer; the caller
+                        // bounded `y0` against the band it just filled.
+                        unsafe {
+                            (base as *mut u32)
+                                .add(y * stride + x)
+                                .write_volatile(colour);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Just the letters this banner needs.
+const fn kernel_glyph(c: u8) -> [u8; 7] {
+    match c {
+        b'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        b'C' => [0x0f, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0f],
+        b'D' => [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
+        b'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
+        b'H' => [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        b'I' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f],
+        b'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
+        b'R' => [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
+        b'S' => [0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e],
+        b'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a],
+        b' ' => [0; 7],
+        _ => [0x1f, 0x11, 0x02, 0x04, 0x08, 0x00, 0x08],
+    }
+}
 
 /// Requests the server answers. Chosen so the reply is a transformation the
 /// client can check rather than an echo, which a kernel that lost the message

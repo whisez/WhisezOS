@@ -398,6 +398,7 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // first in the line, so the match starts after it.
     "frames free before any process",
     "[kernel] endpoint created for pid=1",
+    "device(s) listed, grant issued to pid=1",
     "[kernel] init mapped pid=1",
     "[kernel] init mapped pid=2",
     "[kernel] lapic id=",
@@ -470,6 +471,16 @@ const REQUIRED_LINES: &[&str] = &[
     "[init 2] refused as expected: receiving on an endpoint it does not own",
     "[init 3] refused as expected: receiving on an endpoint it does not own",
     "ipc exchanges completed",
+    // The first time anything outside the kernel touches hardware: a process
+    // asks for device zero, the kernel maps it, and the process writes pixels
+    // without entering the kernel again.
+    "[kernel] device 0 mapped for pid 1",
+    "[init 1] framebuffer mapped from ring 3",
+    "[init 1] drew to the framebuffer without entering the kernel",
+    // And a process that was given no grant cannot even ask what device zero
+    // is, let alone map it.
+    "[init 2] no device grant, as expected",
+    "[init 3] no device grant, as expected",
 ];
 
 /// Boots the kernel in QEMU and asserts the serial log.

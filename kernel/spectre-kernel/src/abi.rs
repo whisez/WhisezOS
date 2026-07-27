@@ -66,6 +66,18 @@ pub const SYS_RECEIVE: u64 = 4;
 /// `(ptr, len) -> bytes sent`.
 pub const SYS_REPLY: u64 = 5;
 
+/// Describe a device this process was granted.
+/// `(grant, index, out_ptr, out_cap) -> bytes written`.
+pub const SYS_DEVICE_INFO: u64 = 6;
+
+/// Map a granted device into this process's address space.
+/// `(grant, index) -> virtual address`.
+///
+/// The process names an index, never an address. It cannot express a request
+/// for anything the kernel did not list for it, which is a stronger property
+/// than requests for other things being refused.
+pub const SYS_MAP_DEVICE: u64 = 7;
+
 /// Longest message body, in either direction.
 ///
 /// The kernel holds one buffer of this size per endpoint, so it bounds kernel
@@ -308,6 +320,7 @@ mod tests {
         // repoints every existing binary at a different handler.
         assert_eq!((SYS_LOG, SYS_EXIT, SYS_PING), (0, 1, 2));
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
+        assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
     }
 
     #[test]

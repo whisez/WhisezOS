@@ -17,12 +17,13 @@
 //! holding a pointer to a process of its own.
 
 use crate::abi::{
-    SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_EXIT, SYS_LOG, SYS_PING, SYS_RECEIVE,
-    SYS_REPLY,
+    SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_LOG,
+    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
 use crate::channel::{self, Outcome};
+use crate::device;
 use crate::kprintln;
 use crate::task;
 use crate::usercopy::validate_user_range;
@@ -63,6 +64,8 @@ pub fn handle(
             frame,
         ),
         SYS_REPLY => blocking(channel::reply(task::current_pid(), a0, a1, a2), frame),
+        SYS_DEVICE_INFO => sys_device_info(a0, a1, a2, a3),
+        SYS_MAP_DEVICE => sys_map_device(a0, a1),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -122,6 +125,56 @@ fn sys_log(ptr: u64, len: u64) -> Result<u64, SyscallError> {
         }
     }
     Ok(len as u64)
+}
+
+/// `SYS_DEVICE_INFO(grant, index, out_ptr, out_cap) -> bytes written`.
+fn sys_device_info(grant: u64, index: u64, ptr: u64, capacity: u64) -> Result<u64, SyscallError> {
+    // The grant is checked before the pointer, so a process without one learns
+    // nothing about whether its buffer would have been acceptable.
+    let info = device::describe(grant, index)?;
+
+    let bytes = core::mem::size_of::<device::DeviceInfo>() as u64;
+    if capacity < bytes {
+        return Err(SyscallError::TooLong);
+    }
+    task::with_current_regions(|regions| validate_user_range(regions, ptr, bytes, bytes))?;
+
+    // SAFETY: the range was just validated against the running process's own
+    // regions, and its address space is the one in CR3.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const info).cast::<u8>(),
+            ptr as *mut u8,
+            bytes as usize,
+        );
+    }
+    Ok(bytes)
+}
+
+/// `SYS_MAP_DEVICE(grant, index) -> virtual address`.
+fn sys_map_device(grant: u64, index: u64) -> Result<u64, SyscallError> {
+    let (phys, length) = device::extent(grant, index)?;
+    let slot = task::devices_mapped();
+
+    // SAFETY: the extent came from the kernel's own device table, reached only
+    // through a grant this process holds, and `current_root` is the address
+    // space it is running in.
+    let (base, mapped) =
+        unsafe { arch::user::map_device(task::current_root(), phys, length, slot) }
+            .map_err(|_| SyscallError::BadArgument)?;
+
+    // The mapping has to become one of the process's permitted ranges before it
+    // returns: a driver reading its own framebuffer through any other system
+    // call would otherwise be refused by the pointer validator.
+    let window_base = base & !(4096 - 1);
+    if task::record_device_mapping(window_base, mapped).is_none() {
+        return Err(SyscallError::TooLong);
+    }
+    kprintln!(
+        "[kernel] device {index} mapped for pid {} at {base:#x}",
+        task::current_pid()
+    );
+    Ok(base)
 }
 
 /// `SYS_EXIT(code)`.

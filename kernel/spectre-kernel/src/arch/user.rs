@@ -249,6 +249,87 @@ pub unsafe fn load(image: &[u8], kernel_root: PhysAddr) -> Result<UserProcess, U
     })
 }
 
+/// Where device mappings go in a user address space.
+///
+/// Its own top-level slot, clear of the image at 16 TiB and of the stack below
+/// it, so a device mapping can never land on something the process already has.
+pub const DEVICE_WINDOW_BASE: u64 = 0x0000_2000_0000_0000;
+
+/// Maps a physical device range into a process, uncacheable.
+///
+/// # Why the cache bits are not optional
+///
+/// Device registers have side effects on access. Through a write-back mapping
+/// the processor may satisfy a read from cache — returning a value the device
+/// changed minutes ago — and may merge, reorder, or defer writes. For a
+/// framebuffer that shows up as pixels appearing late or not at all; for a
+/// controller's command register it shows up as a device that never receives
+/// the command. `NO_CACHE` and `WRITE_THROUGH` together select the strongest
+/// uncacheable type the page-table bits can express.
+///
+/// # Safety
+/// `phys` must be a device range the kernel decided this process may have, and
+/// `root` a live top-level table for a process that is not running. The caller
+/// is what enforces the first of those; nothing here can tell a device from
+/// somebody else's memory.
+pub unsafe fn map_device(
+    root: PhysAddr,
+    phys: u64,
+    length: u64,
+    slot: u64,
+) -> Result<(u64, u64), UserError> {
+    if length == 0 {
+        return Err(UserError::DestinationNotWritable { vaddr: phys });
+    }
+    // The window is carved into fixed slots rather than packed, so a second
+    // mapping cannot be placed by arithmetic that depends on the first — and a
+    // process cannot infer one device's size from another's address.
+    const SLOT_SIZE: u64 = 256 * 1024 * 1024;
+    let base = DEVICE_WINDOW_BASE + slot * SLOT_SIZE;
+    if length > SLOT_SIZE {
+        return Err(UserError::DestinationNotWritable { vaddr: phys });
+    }
+
+    let flags = PageFlags::PRESENT
+        | PageFlags::USER
+        | PageFlags::WRITABLE
+        | PageFlags::NO_EXECUTE
+        | PageFlags::NO_CACHE
+        | PageFlags::WRITE_THROUGH
+        // Not this process's memory. Teardown walks every leaf and returns it
+        // to the allocator; without this the framebuffer's thousand frames are
+        // marked free while the display is still reading from them.
+        | PageFlags::DEVICE;
+
+    let first = phys & !(PAGE_SIZE - 1);
+    let last = (phys + length).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let mut offset = 0u64;
+    while first + offset < last {
+        let frame =
+            PhysAddr::new(first + offset).map_err(|_| UserError::DestinationNotWritable {
+                vaddr: first + offset,
+            })?;
+        memory::with_table_access(|access| {
+            paging::map_page(
+                access,
+                root,
+                VirtAddr::from_indices_sign_extended(base + offset, PagingMode::Level4),
+                frame,
+                flags,
+                PageSize::Small,
+                PagingMode::Level4,
+            )
+            .map_err(MemoryError::Page)
+        })?;
+        offset += PAGE_SIZE;
+    }
+
+    // The address the process sees points at the same byte the physical address
+    // did, offset included — a device whose registers start mid-page would
+    // otherwise be off by that offset.
+    Ok((base + (phys - first), last - first))
+}
+
 /// Copies bytes into another process's address space.
 ///
 /// The kernel is running on some *other* address space when a message is

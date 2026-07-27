@@ -233,8 +233,31 @@ enumerate. That is deliberately weaker than the 128-bit capabilities `cap.rs`
 specifies, and deliberately not ambient: a process reaches the services it was
 introduced to and no others.
 
-What is *not* there: storage, network, a real desktop session, and signature
-verification. The system halts once every process has exited.
+**Stage 3 has started.** `device.rs` is the authority a user-space driver stands
+on. The microkernel claim — every driver except the GPU is an ordinary process —
+is a claim about privilege, not code layout, so it needs a kernel that can hand
+out one device without handing out memory.
+
+A process names an *index*, never an address. `map(physical, length)` would put
+the process in charge of choosing an address and the kernel in charge of
+checking its arithmetic, every time, against an argument chosen to make the
+check wrong. Asking for entry *n* of a list the kernel keeps means a request for
+anything else cannot be expressed — which is stronger than being refused.
+
+The framebuffer is the first entry, and a ring-3 process maps it and draws on
+it. Device pages carry a software bit so teardown counts them and leaves them
+alone: the boot test caught the first version returning a thousand framebuffer
+frames to the allocator, which would have handed the display's memory to the
+next process.
+
+The kernel console now reserves a band at the bottom of the screen. It is the
+first boundary between kernel and user space drawn in pixels, and a placeholder
+for the compositor owning the display outright.
+
+What is *not* there: no DMA buffers, no interrupt delivery to user space, and so
+no block driver — which is the next thing, and what SpectreFS needs before any
+of its on-disk structures matter. Also no network, no desktop session, and no
+signature verification. The system halts once every process has exited.
 
 The subsystems below — `cap`, `ipc`, `sched`, `vault`, `gamemode` — are complete
 and carry the bulk of the test suite, but they are written against platform
