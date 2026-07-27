@@ -59,10 +59,15 @@ pub const DMA_SLOT_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Buffers one process may hold at once.
 ///
-/// Each one costs a permitted region in the process's table, which is the same
-/// eight-entry table its loadable segments and device mappings come out of, so
-/// this cannot be raised without raising that too.
-pub const MAX_DMA_REGIONS: u64 = 2;
+/// Four, because a real driver needs three and the number was chosen before
+/// there was one. The virtio block driver holds a scratch buffer, a virtqueue,
+/// and a request area; with a limit of two it was refused the third and exited,
+/// which — since that process was also the IPC server — took the boot down with
+/// it.
+///
+/// Each buffer costs a permitted region in the process's table, so this cannot
+/// be raised without raising `MAX_USER_REGIONS` to match.
+pub const MAX_DMA_REGIONS: u64 = 4;
 
 /// Largest single buffer.
 ///

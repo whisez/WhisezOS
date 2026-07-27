@@ -43,9 +43,15 @@ pub const USER_STACK_TOP: u64 = 0x0000_1000_0000_0000;
 /// unmapped, so an overflow faults instead of running into whatever is next.
 pub const USER_STACK_BYTES: u64 = 64 * 1024;
 
-/// Most regions a process can be given at load time: one per loadable segment
-/// plus the stack.
-pub const MAX_USER_REGIONS: usize = 8;
+/// Most regions a process can hold: one per loadable segment, the stack, every
+/// device window it maps, and every DMA buffer it takes.
+///
+/// Twelve because a driver reaches that. The virtio block driver has three
+/// loadable segments and a stack, maps two device windows, and takes three DMA
+/// buffers — eleven. At eight it was refused its last allocation partway
+/// through bringing up a queue, which is the worst moment to run out: the
+/// device is half configured and the process has no way to undo it.
+pub const MAX_USER_REGIONS: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserError {

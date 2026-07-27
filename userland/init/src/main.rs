@@ -261,9 +261,51 @@ const BLOCK_DEVICE: u64 = 2;
 mod common {
     pub const DEVICE_FEATURE_SELECT: u32 = 0x00;
     pub const DEVICE_FEATURE: u32 = 0x04;
+    pub const DRIVER_FEATURE_SELECT: u32 = 0x08;
+    pub const DRIVER_FEATURE: u32 = 0x0C;
     pub const NUM_QUEUES: u32 = 0x12;
     pub const DEVICE_STATUS: u32 = 0x14;
+    pub const QUEUE_SELECT: u32 = 0x16;
+    pub const QUEUE_SIZE: u32 = 0x18;
+    pub const QUEUE_MSIX_VECTOR: u32 = 0x1A;
+    pub const QUEUE_ENABLE: u32 = 0x1C;
+    pub const QUEUE_NOTIFY_OFF: u32 = 0x1E;
+    pub const QUEUE_DESC: u32 = 0x20;
+    pub const QUEUE_DRIVER: u32 = 0x28;
+    pub const QUEUE_DEVICE: u32 = 0x30;
 }
+
+/// No MSI-X vector. The device must be told this explicitly: the field powers
+/// up as `NO_VECTOR` on QEMU but is not architecturally guaranteed to, and a
+/// queue pointing at an MSI-X vector this driver never configured is a queue
+/// whose completions go nowhere.
+const NO_MSIX_VECTOR: u16 = 0xFFFF;
+
+/// Descriptor flags (virtio 1.0 §2.6.5).
+mod desc_flag {
+    /// This descriptor chains to another.
+    pub const NEXT: u16 = 1;
+    /// The *device* writes into this buffer. Its absence means the device
+    /// reads. Getting this backwards is the difference between a disk read and
+    /// a disk write, with no complaint from anything.
+    pub const WRITE: u16 = 2;
+}
+
+/// virtio-blk request types (virtio 1.0 §5.2.6).
+mod blk {
+    pub const IN: u32 = 0;
+    pub const OUT: u32 = 1;
+    /// The device writes this into the status byte on success.
+    pub const STATUS_OK: u8 = 0;
+}
+
+/// `VIRTIO_F_VERSION_1` is feature bit 32 — bit 0 of the second feature word.
+///
+/// A virtio 1.0 device refuses to leave `FEATURES_OK` set unless the driver
+/// accepts it, which is the specification's way of making sure a driver written
+/// for the legacy layout cannot accidentally drive a modern device.
+const FEATURE_VERSION_1_WORD: u32 = 1;
+const FEATURE_VERSION_1_BIT: u32 = 1;
 
 /// Device status bits (virtio 1.0 §2.1). Written in order; each one tells the
 /// device how far the driver has got, and the device may refuse to proceed if
@@ -273,6 +315,12 @@ mod status {
     pub const ACKNOWLEDGE: u8 = 1;
     /// The driver knows how to drive it.
     pub const DRIVER: u8 = 2;
+    /// The driver is ready. Queues may be used from here on.
+    pub const DRIVER_OK: u8 = 4;
+    /// The driver has finished negotiating features. The device clears this bit
+    /// if it cannot work with what was accepted, which is the one handshake
+    /// step that can fail without anything else going wrong.
+    pub const FEATURES_OK: u8 = 8;
     /// Set by the *device* when it has given up on the driver.
     pub const FAILED: u8 = 128;
 }
@@ -288,6 +336,65 @@ const SECTOR_BYTES: u64 = 512;
 /// plausible number, and only comparing it against a value chosen elsewhere
 /// turns "we read something" into "we read the right thing".
 const EXPECTED_DISK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A split virtqueue, laid out in one DMA buffer.
+///
+/// # Why the three rings are placed by hand
+///
+/// A virtqueue is three structures the device reads at three physical
+/// addresses it is told separately. They have different alignments — 16 for the
+/// descriptor table, 2 for the available ring, 4 for the used ring — and in
+/// virtio 1.0 they need not be adjacent at all. Packing them into one
+/// contiguous allocation at page-aligned offsets satisfies every alignment at
+/// once and costs one DMA buffer instead of three.
+///
+/// # Sizes
+///
+/// A queue of 256 descriptors, which is what QEMU offers, needs 4 KiB of
+/// descriptor table, 518 bytes of available ring, and 2054 of used ring. Laid
+/// out a page apart that is 12 KiB, which is why the buffer below is 16.
+struct Queue {
+    /// Virtual addresses, for this process.
+    desc: u64,
+    avail: u64,
+    used: u64,
+    /// Bus addresses, for the device.
+    desc_bus: u64,
+    avail_bus: u64,
+    used_bus: u64,
+    size: u16,
+    /// Where in the notification region this queue's doorbell is.
+    notify: u64,
+    /// The next slot this driver will write in the available ring.
+    next_avail: u16,
+    /// The last used-ring index this driver has seen.
+    last_used: u16,
+}
+
+/// Bytes of DMA for the queue. See `Queue` for where the number comes from.
+const QUEUE_BYTES: u64 = 16 * 1024;
+/// Offsets of the three rings within that buffer.
+const DESC_OFFSET: u64 = 0;
+const AVAIL_OFFSET: u64 = 4096;
+const USED_OFFSET: u64 = 8192;
+
+/// Descriptors this driver uses per request: header, data, status.
+const DESCRIPTORS_PER_REQUEST: u16 = 3;
+
+/// Bytes of DMA for one request: a 16-byte header, a sector, a status byte.
+const REQUEST_BYTES: u64 = 4096;
+/// Offsets within that buffer.
+const HEADER_OFFSET: u64 = 0;
+const DATA_OFFSET: u64 = 512;
+const STATUS_OFFSET: u64 = 2048;
+
+/// How long to spin waiting for the device before giving up.
+///
+/// A bound rather than a forever loop: a device that never completes a request
+/// is a bug worth reporting, and a driver that hangs waiting for one takes the
+/// evidence with it. QEMU answers a 512-byte read in microseconds, so anything
+/// near this many iterations means something is wrong rather than slow.
+const COMPLETION_SPINS: u64 = 200_000_000;
 
 /// # Safety
 /// `address` must be inside a device window this process was given.
@@ -320,9 +427,33 @@ unsafe fn mmio_write8(address: u64, value: u8) {
 
 /// # Safety
 /// As `mmio_write8`.
+unsafe fn mmio_write16(address: u64, value: u16) {
+    // SAFETY: as above.
+    unsafe { (address as *mut u16).write_volatile(value) }
+}
+
+/// # Safety
+/// As `mmio_write8`.
 unsafe fn mmio_write32(address: u64, value: u32) {
     // SAFETY: as above.
     unsafe { (address as *mut u32).write_volatile(value) }
+}
+
+/// Writes a 64-bit configuration field as two 32-bit halves.
+///
+/// The specification permits either, and a single 64-bit write is what a driver
+/// would reach for. Two halves is the portable choice: a device is only
+/// required to implement 32-bit accesses to these fields, and the low-then-high
+/// order is the one the specification names.
+///
+/// # Safety
+/// As `mmio_write8`.
+unsafe fn mmio_write64_split(address: u64, value: u64) {
+    // SAFETY: as above.
+    unsafe {
+        mmio_write32(address, value as u32);
+        mmio_write32(address + 4, (value >> 32) as u32);
+    }
 }
 
 /// Brings a real PCI device up to the point where a queue could be created.
@@ -448,6 +579,345 @@ fn probe_disk(pid: u64, grant: u64) {
                 b" sectors",
             ],
         );
+    }
+
+    // --- feature negotiation ----------------------------------------------
+    // A virtio 1.0 device refuses to proceed unless the driver accepts
+    // VERSION_1, which is how the specification stops a driver written for the
+    // legacy layout from accidentally driving a modern device.
+    // SAFETY: as above.
+    unsafe {
+        mmio_write32(common + u64::from(common::DRIVER_FEATURE_SELECT), 0);
+        mmio_write32(common + u64::from(common::DRIVER_FEATURE), 0);
+        mmio_write32(
+            common + u64::from(common::DRIVER_FEATURE_SELECT),
+            FEATURE_VERSION_1_WORD,
+        );
+        mmio_write32(
+            common + u64::from(common::DRIVER_FEATURE),
+            FEATURE_VERSION_1_BIT,
+        );
+
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK,
+        );
+        // The device clears this bit if it cannot work with what was accepted.
+        // Reading it back is the only way to find out, and a driver that skips
+        // the check goes on to set up a queue the device will ignore.
+        if mmio_read8(common + u64::from(common::DEVICE_STATUS)) & status::FEATURES_OK == 0 {
+            say(pid, &[b"disk rejected the negotiated features"]);
+            exit(29);
+        }
+    }
+
+    let Some(mut queue) = setup_queue(pid, common, window + u64::from(info.notify_offset), &info)
+    else {
+        return;
+    };
+
+    // SAFETY: as above. The queue exists, so the device may be told the driver
+    // is ready — which is what permits it to look at the rings at all.
+    unsafe {
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+    }
+
+    exercise_disk(pid, &mut queue);
+}
+
+/// Builds queue zero and hands its three ring addresses to the device.
+///
+/// Returns `None` after reporting, for the failures that are worth continuing
+/// past — there is nothing else in this process that depends on the disk.
+fn setup_queue(pid: u64, common: u64, notify_base: u64, info: &DeviceInfo) -> Option<Queue> {
+    let mut region = DmaRegion::EMPTY;
+    let size = core::mem::size_of::<DmaRegion>() as u64;
+    if let Err(error) = call5(
+        SYS_ALLOC_DMA,
+        QUEUE_BYTES,
+        (&raw mut region) as u64,
+        size,
+        0,
+        0,
+    ) {
+        say(pid, &[b"queue memory refused: ", error.name().as_bytes()]);
+        exit(30);
+    }
+
+    // SAFETY: `common` is inside the device window this process was given.
+    let (queue_size, notify_off) = unsafe {
+        mmio_write16(common + u64::from(common::QUEUE_SELECT), 0);
+        (
+            mmio_read16(common + u64::from(common::QUEUE_SIZE)),
+            mmio_read16(common + u64::from(common::QUEUE_NOTIFY_OFF)),
+        )
+    };
+
+    if queue_size == 0 {
+        say(pid, &[b"disk queue 0 does not exist"]);
+        exit(31);
+    }
+    // Three descriptors per request is the smallest chain virtio-blk allows, so
+    // a queue shorter than that cannot carry even one.
+    if queue_size < DESCRIPTORS_PER_REQUEST {
+        say(pid, &[b"disk queue is too short to hold one request"]);
+        exit(32);
+    }
+    // The rings are sized by the queue, and the buffer is fixed. A device
+    // offering a larger queue than the buffer can describe must be told a
+    // smaller size rather than have its offer quietly overrun the allocation.
+    let usable = if u64::from(queue_size) * 16 > AVAIL_OFFSET {
+        (AVAIL_OFFSET / 16) as u16
+    } else {
+        queue_size
+    };
+
+    let queue = Queue {
+        desc: region.virt + DESC_OFFSET,
+        avail: region.virt + AVAIL_OFFSET,
+        used: region.virt + USED_OFFSET,
+        desc_bus: region.bus + DESC_OFFSET,
+        avail_bus: region.bus + AVAIL_OFFSET,
+        used_bus: region.bus + USED_OFFSET,
+        size: usable,
+        notify: notify_base + u64::from(notify_off) * u64::from(info.notify_multiplier),
+        next_avail: 0,
+        last_used: 0,
+    };
+
+    // SAFETY: every address below is either inside the device window or the DMA
+    // buffer the kernel just gave this process.
+    unsafe {
+        mmio_write16(common + u64::from(common::QUEUE_SIZE), queue.size);
+        mmio_write16(
+            common + u64::from(common::QUEUE_MSIX_VECTOR),
+            NO_MSIX_VECTOR,
+        );
+        mmio_write64_split(common + u64::from(common::QUEUE_DESC), queue.desc_bus);
+        mmio_write64_split(common + u64::from(common::QUEUE_DRIVER), queue.avail_bus);
+        mmio_write64_split(common + u64::from(common::QUEUE_DEVICE), queue.used_bus);
+        mmio_write16(common + u64::from(common::QUEUE_ENABLE), 1);
+    }
+
+    let mut buffer = [0u8; 18];
+    say(
+        pid,
+        &[
+            b"queue 0 armed, ",
+            hex(u64::from(queue.size), &mut buffer),
+            b" descriptors",
+        ],
+    );
+    Some(queue)
+}
+
+/// Writes a pattern to a sector, reads it back, and checks it survived.
+///
+/// # Why write then read rather than just read
+///
+/// The disk the build attaches is a fresh sparse file, so every sector reads as
+/// zeros. A read alone would prove the request completed and the buffer was
+/// filled with — zeros, which is also what the buffer already held. Writing a
+/// pattern first makes the comparison mean something: the bytes came back
+/// because they went out, through the device, and not because nothing happened.
+fn exercise_disk(pid: u64, queue: &mut Queue) {
+    let mut region = DmaRegion::EMPTY;
+    let size = core::mem::size_of::<DmaRegion>() as u64;
+    if let Err(error) = call5(
+        SYS_ALLOC_DMA,
+        REQUEST_BYTES,
+        (&raw mut region) as u64,
+        size,
+        0,
+        0,
+    ) {
+        say(pid, &[b"request memory refused: ", error.name().as_bytes()]);
+        exit(33);
+    }
+
+    let data = region.virt + DATA_OFFSET;
+
+    // A pattern that is not zeros and not constant, so a partial transfer or an
+    // off-by-one in the descriptor lengths shows up as a mismatch rather than
+    // as a coincidence.
+    // SAFETY: the DMA buffer is this process's, mapped writable.
+    unsafe {
+        for index in 0..SECTOR_BYTES {
+            let byte = (index as u8) ^ 0x5A;
+            ((data + index) as *mut u8).write_volatile(byte);
+        }
+    }
+
+    if !submit(pid, queue, &region, blk::OUT, 0) {
+        say(pid, &[b"DISK WRITE FAILED"]);
+        exit(34);
+    }
+
+    // Scribble over the buffer before reading, so bytes that come back are
+    // bytes the device put there rather than the ones still sitting in memory
+    // from the write.
+    // SAFETY: as above.
+    unsafe {
+        for index in 0..SECTOR_BYTES {
+            ((data + index) as *mut u8).write_volatile(0xEE);
+        }
+    }
+
+    if !submit(pid, queue, &region, blk::IN, 0) {
+        say(pid, &[b"DISK READ FAILED"]);
+        exit(35);
+    }
+
+    // SAFETY: as above.
+    let mismatch = unsafe {
+        (0..SECTOR_BYTES)
+            .find(|index| ((data + index) as *const u8).read_volatile() != (*index as u8) ^ 0x5A)
+    };
+    if let Some(index) = mismatch {
+        let mut buffer = [0u8; 18];
+        say(
+            pid,
+            &[b"disk returned wrong bytes at ", hex(index, &mut buffer)],
+        );
+        exit(36);
+    }
+
+    say(pid, &[b"disk wrote and read back 512 bytes, verified"]);
+}
+
+/// Submits one block request and waits for the device to finish it.
+///
+/// Named `submit` rather than `request` because this file already has a
+/// `request` — the IPC client role. Two things called the same thing in one
+/// process is how the wrong one gets called.
+///
+/// Returns whether the device reported success.
+///
+/// # The three descriptors
+///
+/// virtio-blk wants a chain: a header the device reads, a data buffer, and a
+/// status byte the device writes. Whether the data buffer is device-readable or
+/// device-writable is the entire difference between a write and a read, and
+/// getting it backwards produces no complaint from anything — the device simply
+/// does the other operation.
+fn submit(pid: u64, queue: &mut Queue, region: &DmaRegion, kind: u32, sector: u64) -> bool {
+    use core::sync::atomic::{fence, Ordering};
+
+    let header = region.virt + HEADER_OFFSET;
+    let status_byte = region.virt + STATUS_OFFSET;
+
+    // SAFETY: every address is inside this process's own DMA buffer or the
+    // device window it was granted.
+    unsafe {
+        // The request header: type, a reserved word, and the sector.
+        (header as *mut u32).write_volatile(kind);
+        ((header + 4) as *mut u32).write_volatile(0);
+        ((header + 8) as *mut u64).write_volatile(sector);
+        // Not a status the device uses, so a byte left unchanged is
+        // distinguishable from a success it never wrote.
+        (status_byte as *mut u8).write_volatile(0xFF);
+
+        // Descriptor 0: the header. The device reads it.
+        write_descriptor(
+            queue.desc,
+            0,
+            region.bus + HEADER_OFFSET,
+            16,
+            desc_flag::NEXT,
+            1,
+        );
+        // Descriptor 1: the data. Device-writable for a read, device-readable
+        // for a write — this is the line that decides which operation happens.
+        let data_flags = if kind == blk::IN {
+            desc_flag::NEXT | desc_flag::WRITE
+        } else {
+            desc_flag::NEXT
+        };
+        write_descriptor(
+            queue.desc,
+            1,
+            region.bus + DATA_OFFSET,
+            SECTOR_BYTES as u32,
+            data_flags,
+            2,
+        );
+        // Descriptor 2: the status byte, which the device always writes.
+        write_descriptor(
+            queue.desc,
+            2,
+            region.bus + STATUS_OFFSET,
+            1,
+            desc_flag::WRITE,
+            0,
+        );
+
+        // Publish the chain. The ring slot has to be visible before the index
+        // that points at it, or the device can read an index that names a slot
+        // still holding the previous request's head.
+        let slot = queue.next_avail % queue.size;
+        ((queue.avail + 4 + u64::from(slot) * 2) as *mut u16).write_volatile(0);
+        fence(Ordering::Release);
+        ((queue.avail + 2) as *mut u16).write_volatile(queue.next_avail.wrapping_add(1));
+        fence(Ordering::Release);
+
+        // The doorbell. Writing the queue index here is what tells the device
+        // to look.
+        mmio_write16(queue.notify, 0);
+
+        // Wait for the used ring to advance. Polling rather than blocking on
+        // the interrupt: the disk's line is not routed yet, and a driver that
+        // waits on an interrupt nothing delivers waits forever. The bound is
+        // what turns a device that never answers into a report.
+        let mut spins = 0u64;
+        loop {
+            fence(Ordering::Acquire);
+            let used_index = ((queue.used + 2) as *const u16).read_volatile();
+            if used_index != queue.last_used {
+                break;
+            }
+            spins += 1;
+            if spins > COMPLETION_SPINS {
+                say(pid, &[b"disk never completed the request"]);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Both indices advance only after the device has answered. Advancing
+        // the available index earlier would be correct — the device has already
+        // consumed it — but keeping the pair updated in one place is what makes
+        // the next request's slot arithmetic obviously right.
+        queue.next_avail = queue.next_avail.wrapping_add(1);
+        queue.last_used = ((queue.used + 2) as *const u16).read_volatile();
+
+        let reported = (status_byte as *const u8).read_volatile();
+        reported == blk::STATUS_OK
+    }
+}
+
+/// Fills in one descriptor.
+///
+/// # Safety
+/// `table` must be the descriptor table of a live queue, and `index` inside it.
+unsafe fn write_descriptor(
+    table: u64,
+    index: u16,
+    address: u64,
+    length: u32,
+    flags: u16,
+    next: u16,
+) {
+    let entry = table + u64::from(index) * 16;
+    // SAFETY: the caller guarantees the table and index. The layout is virtio
+    // 1.0 §2.6.5: address, length, flags, next.
+    unsafe {
+        (entry as *mut u64).write_volatile(address);
+        ((entry + 8) as *mut u32).write_volatile(length);
+        ((entry + 12) as *mut u16).write_volatile(flags);
+        ((entry + 14) as *mut u16).write_volatile(next);
     }
 }
 

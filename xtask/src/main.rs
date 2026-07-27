@@ -554,6 +554,14 @@ const REQUIRED_LINES: &[&str] = &[
     // file this file attaches — a number neither side hardcodes twice.
     "[kernel] virtio-blk is device 2",
     "[init 1] disk ready from ring 3: 0x0000000000008000 sectors",
+    // A virtqueue, and a real block transfer through it. The write-then-read
+    // is what makes the comparison mean anything: the disk image is a fresh
+    // sparse file, so a read alone would return zeros into a buffer that
+    // already held zeros. `verify_disk_pattern` then checks the host's copy of
+    // the file, which is the one piece of evidence nothing inside the guest
+    // could produce.
+    "[init 1] queue 0 armed",
+    "[init 1] disk wrote and read back 512 bytes, verified",
     "[init 2] no disk grant, as expected",
     "[init 3] no disk grant, as expected",
     // And a process with no grant cannot wait on a line it was not given, which
@@ -604,6 +612,53 @@ fn boot_test() -> Result<()> {
     Ok(())
 }
 
+/// The disk the boot test attaches, and the sector the driver exercises.
+const DISK_IMAGE: &str = "target/virtio-disk.img";
+const SECTOR_BYTES: usize = 512;
+
+/// Blanks the sector the driver writes, so the check afterwards means something.
+///
+/// The image survives between runs. Without this, a pattern left by a previous
+/// boot would satisfy the check even if this boot never touched the disk —
+/// which is the one failure the check exists to catch.
+fn blank_disk_sector() -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    if !Path::new(DISK_IMAGE).exists() {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(DISK_IMAGE)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&[0u8; SECTOR_BYTES])?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Checks the host's copy of the disk for what the driver said it wrote.
+///
+/// This is the one assertion in the boot test that nothing inside the guest
+/// could produce. Every other check reads a line the guest printed; this reads
+/// a file the guest can only have changed by driving the device correctly all
+/// the way through QEMU's own virtio-blk implementation.
+fn verify_disk_pattern() -> Result<()> {
+    let contents = std::fs::read(DISK_IMAGE).context("reading back the virtio disk")?;
+    if contents.len() < SECTOR_BYTES {
+        bail!("the disk image is shorter than one sector");
+    }
+
+    for (index, byte) in contents[..SECTOR_BYTES].iter().enumerate() {
+        let expected = (index as u8) ^ 0x5A;
+        if *byte != expected {
+            bail!(
+                "the disk holds {byte:#04x} at offset {index}, not the {expected:#04x} \
+                 the driver reported writing"
+            );
+        }
+    }
+    println!("disk confirmed on the host: 512 bytes written by the ring 3 driver");
+    Ok(())
+}
+
 fn check_log(captured: &str) -> Result<()> {
     check_ordered(captured, EXPECTED_BOOT_LINES, "boot sequence")?;
     check_ordered(captured, TEARDOWN_CHAIN, "teardown chain")?;
@@ -616,7 +671,8 @@ fn check_log(captured: &str) -> Result<()> {
     }
 
     check_preemption(captured)?;
-    check_frame_balance(captured)
+    check_frame_balance(captured)?;
+    verify_disk_pattern()
 }
 
 /// Checks that `lines` appear, in the order given.
