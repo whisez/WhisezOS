@@ -116,6 +116,9 @@ pub mod dma;
 #[path = "../../kernel/spectre-kernel/src/irq.rs"]
 pub mod irq;
 
+#[path = "../../kernel/spectre-kernel/src/pci.rs"]
+pub mod pci;
+
 #[path = "../../kernel/spectre-kernel/src/portauth.rs"]
 pub mod portauth;
 

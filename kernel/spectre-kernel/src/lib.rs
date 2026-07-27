@@ -68,6 +68,7 @@ pub mod dma;
 pub mod elf;
 pub mod font;
 pub mod irq;
+pub mod pci;
 pub mod portauth;
 pub mod rendezvous;
 pub mod roundrobin;
@@ -135,6 +136,14 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     // The device grant. Drawn from the same generator as endpoint handles, and
     // handed to exactly one process — the display driver — so every other
     // process holds zero and zero never matches.
+    // What is actually in the machine. Everything past the framebuffer is on
+    // the PCI bus and invisible until somebody walks it, and walking it is
+    // kernel work by construction: configuration space lives behind ports that
+    // `portauth.rs` keeps out of the I/O bitmap on purpose.
+    // SAFETY: bring-up, interrupts disabled, before any driver exists.
+    let on_bus = unsafe { arch::scan_pci(|_address, _header, _space| {}) };
+    kprintln!("[kernel] {on_bus} pci device(s) on bus 0");
+
     let grant = channel::issue_token();
     let devices = device::init(boot, grant);
     kprintln!("[kernel] {devices} device(s) listed, grant issued to pid=1");

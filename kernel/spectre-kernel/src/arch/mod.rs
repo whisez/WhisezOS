@@ -34,6 +34,7 @@ pub mod interrupts;
 pub mod ioapic;
 pub mod memory;
 pub mod paging;
+pub mod pci;
 pub mod pic;
 pub mod rtc;
 pub mod segments;
@@ -335,6 +336,57 @@ pub unsafe fn unmask_device_line(line: usize) -> Result<(), ioapic::IoApicError>
     );
     Ok(())
 }
+
+/// Walks the PCI bus and reports what is on it.
+///
+/// Returns how many devices answered.
+///
+/// # Safety
+/// Called once during bring-up, with interrupts disabled — the address and data
+/// ports are one operation and must not be separated. Must run before any
+/// driver exists, because BAR sizing briefly points a device's window
+/// somewhere absurd.
+pub unsafe fn scan_pci(
+    mut found: impl FnMut(crate::pci::Address, &crate::pci::Header, &mut PortConfigSpace),
+) -> usize {
+    let mut space = PortConfigSpace;
+    let mut count = 0usize;
+
+    // The scan and the per-device work are separated because `scan_bus_zero`
+    // holds a shared borrow of the space while a caller wanting to size BARs
+    // needs a mutable one. Addresses first, then the work.
+    let mut addresses = [crate::pci::Address::new(0, 0, 0); crate::pci::MAX_DEVICES_SCANNED];
+    let mut headers = [None; crate::pci::MAX_DEVICES_SCANNED];
+    // SAFETY: bring-up, interrupts disabled, as the caller guarantees.
+    unsafe {
+        crate::pci::scan_bus_zero(&space, |address, header| {
+            if count < crate::pci::MAX_DEVICES_SCANNED {
+                addresses[count] = address;
+                headers[count] = Some(header);
+                count += 1;
+            }
+        });
+    }
+
+    for index in 0..count {
+        let header = headers[index].expect("filled above");
+        kprintln!(
+            "[kernel] pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}.{:02x}",
+            addresses[index].bus,
+            addresses[index].device,
+            addresses[index].function,
+            header.vendor,
+            header.device,
+            header.class,
+            header.subclass
+        );
+        found(addresses[index], &header, &mut space);
+    }
+
+    count
+}
+
+pub use pci::PortConfigSpace;
 
 /// Prints a panic message without taking the console lock.
 pub fn emergency_serial(info: &core::panic::PanicInfo<'_>) {

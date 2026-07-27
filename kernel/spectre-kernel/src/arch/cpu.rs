@@ -28,6 +28,28 @@ pub unsafe fn outb(port: u16, value: u8) {
     }
 }
 
+/// # Safety
+/// As `inb`. The 32-bit width matters: PCI configuration space is dword
+/// granular, and a byte read of 0xCFC returns one byte of the selected dword
+/// rather than the dword the caller wanted.
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: the caller guarantees the port.
+    unsafe {
+        core::arch::asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// # Safety
+/// As `outb`.
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: the caller guarantees the port and the value.
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// One leaf of `cpuid`.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuidResult {
