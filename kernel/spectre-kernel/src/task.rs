@@ -649,7 +649,12 @@ unsafe fn start_session() -> ! {
         kprintln!("[kernel] no slot for the session");
         crate::arch::halt_forever();
     };
-    kprintln!("[kernel] session started as pid {pid}, the machine stays up");
+    // The screen is the session's from here. Sharing it worked while the
+    // kernel was the only thing with anything to say, but a display with two
+    // writers and no compositor is one where the last write wins — and the
+    // kernel would win, by scrolling a log over whatever the session drew.
+    crate::arch::framebuffer::release();
+    kprintln!("[kernel] session started as pid {pid}, screen handed over");
 
     // SAFETY: the session is the only live process and has never run, so its
     // frame is the one that starts it.

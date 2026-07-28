@@ -420,6 +420,12 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
             audio_backend,
             "-device",
             sound_device,
+            // A control socket, so the screen can be captured from outside the
+            // guest. Looking at what is actually drawn is the only way to check
+            // a claim about the display: the serial log says what the kernel
+            // believes it printed, not what a person sees.
+            "-qmp",
+            "tcp:127.0.0.1:4444,server=on,wait=off",
             "-serial",
             &serial_arg,
             "-display",
@@ -473,7 +479,7 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // The session starts after the frame accounting, because it holds frames.
     "[kernel] session started as pid",
     "[init 9] session owns the display and the clock",
-    "[init 9] session is drawing, the machine stays up",
+    "[init 9] session is drawing the desktop",
 ];
 
 /// The IPC chain. Which client is served first is a race; that a client is

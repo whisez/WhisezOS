@@ -23,6 +23,11 @@
 #[path = "../../../kernel/spectre-kernel/src/abi.rs"]
 mod abi;
 
+/// The glyph table, compiled from the same file the kernel and the UEFI preview
+/// compile. A second copy would be a second thing to keep in step for no gain.
+#[path = "../../../kernel/spectre-kernel/src/font.rs"]
+mod font;
+
 use abi::{
     decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
     SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG,
@@ -654,13 +659,133 @@ fn probe_disk(pid: u64, grant: u64) {
 /// The device index of the sound card, which the PCI scan appends fourth.
 const SOUND_DEVICE: u64 = 3;
 
-/// Rows of the framebuffer the session owns.
+/// A screen the session draws into, and the pixel arithmetic to do it.
 ///
-/// The band at the bottom the kernel console leaves alone — the same agreement
-/// `arch/framebuffer.rs` describes from the other side. Until there is a
-/// compositor arbitrating, the only thing keeping the two from scrolling over
-/// each other is that each writes where the other does not.
-const SESSION_BAND_ROWS: u64 = 104;
+/// Not a compositor. There are no windows a process can create, nothing is
+/// clipped against anything, and the whole screen is redrawn each frame. What
+/// it is: proof that a process outside the kernel owns the display and can put
+/// a coherent picture on it, which is the thing that was missing when the
+/// machine finished booting and left a wall of log text on screen.
+struct Screen {
+    base: u64,
+    width: u64,
+    height: u64,
+    stride: u64,
+}
+
+mod colour {
+    /// `0x00RRGGBB`, matching the framebuffer's format.
+    pub const DESKTOP_TOP: u32 = 0x0006_0C1A;
+    pub const DESKTOP_BOTTOM: u32 = 0x0001_0308;
+    pub const PANEL: u32 = 0x000C_1830;
+    pub const ACCENT: u32 = 0x0019_E6FF;
+    pub const TEXT: u32 = 0x00D8_E8F8;
+    pub const DIM: u32 = 0x0064_8098;
+    pub const WINDOW: u32 = 0x0012_1E36;
+    pub const WINDOW_BAR: u32 = 0x001B_2C4C;
+    pub const SHADOW: u32 = 0x0000_0206;
+}
+
+/// Height of the bar across the top.
+const PANEL_HEIGHT: u64 = 32;
+/// How much the glyphs are scaled. A 6x7 glyph is unreadable unscaled at this
+/// resolution.
+const TEXT_SCALE: u64 = 2;
+
+impl Screen {
+    /// # Safety
+    /// `base` must be a framebuffer window this process was granted, matching
+    /// the geometry given.
+    unsafe fn put(&self, x: u64, y: u64, colour: u32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        // SAFETY: bounds checked against the geometry the kernel reported.
+        unsafe { ((self.base + (y * self.stride + x) * 4) as *mut u32).write_volatile(colour) }
+    }
+
+    /// # Safety
+    /// As `put`.
+    unsafe fn fill(&self, x: u64, y: u64, w: u64, h: u64, colour: u32) {
+        for row in y..(y + h).min(self.height) {
+            for column in x..(x + w).min(self.width) {
+                // SAFETY: as `put`.
+                unsafe { self.put(column, row, colour) };
+            }
+        }
+    }
+
+    /// A vertical gradient, which is the cheapest thing that does not look like
+    /// a framebuffer somebody forgot to clear.
+    ///
+    /// # Safety
+    /// As `put`.
+    unsafe fn gradient(&self, y: u64, h: u64, top: u32, bottom: u32) {
+        for row in 0..h {
+            // Signed, because the bottom colour is darker than the top and the
+            // difference is negative. Computed in `u32` it wrapped to a huge
+            // positive number and every channel saturated, which put a flat
+            // grey on screen where the desktop should have been — the kind of
+            // wrong that looks like a missing feature rather than a bug.
+            let mix = |shift: u32| -> u32 {
+                let a = ((top >> shift) & 0xFF) as i32;
+                let b = ((bottom >> shift) & 0xFF) as i32;
+                (a + (b - a) * row as i32 / h.max(1) as i32).clamp(0, 255) as u32
+            };
+            let colour = (mix(16) << 16) | (mix(8) << 8) | mix(0);
+            // SAFETY: as `put`.
+            unsafe { self.fill(0, y + row, self.width, 1, colour) };
+        }
+    }
+
+    /// # Safety
+    /// As `put`.
+    unsafe fn text(&self, x: u64, y: u64, bytes: &[u8], colour: u32) {
+        for (index, byte) in bytes.iter().enumerate() {
+            let rows = font::glyph(font::normalise(*byte));
+            for (row, bits) in rows.iter().enumerate() {
+                for column in 0..5u64 {
+                    if bits & (1 << (4 - column)) == 0 {
+                        continue;
+                    }
+                    for sy in 0..TEXT_SCALE {
+                        for sx in 0..TEXT_SCALE {
+                            // SAFETY: as `put`.
+                            unsafe {
+                                self.put(
+                                    x + index as u64 * font::GLYPH_WIDTH as u64 * TEXT_SCALE
+                                        + column * TEXT_SCALE
+                                        + sx,
+                                    y + row as u64 * TEXT_SCALE + sy,
+                                    colour,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A window: a shadow, a body, a title bar, and a title.
+    ///
+    /// # Safety
+    /// As `put`.
+    unsafe fn window(&self, x: u64, y: u64, w: u64, h: u64, title: &[u8], focused: bool) {
+        // SAFETY: as `put`.
+        unsafe {
+            self.fill(x + 4, y + 4, w, h, colour::SHADOW);
+            self.fill(x, y, w, h, colour::WINDOW);
+            self.fill(x, y, w, 24, colour::WINDOW_BAR);
+            // The focused window is the one with the accent stripe. One bit of
+            // state, drawn rather than described.
+            if focused {
+                self.fill(x, y, 3, h, colour::ACCENT);
+            }
+            self.text(x + 10, y + 6, title, colour::TEXT);
+        }
+    }
+}
 
 /// The resident process: what the machine is once the demonstration is over.
 ///
@@ -694,7 +819,7 @@ fn session(grant: u64) -> ! {
         // rather than a reason to stop — and stopping is the one thing this
         // process must not do.
         say(pid, &[b"session has no framebuffer, running blind"]);
-        idle_forever(pid, grant);
+        idle_forever(pid);
     }
 
     let base = match call(SYS_MAP_DEVICE, grant, 0) {
@@ -704,7 +829,7 @@ fn session(grant: u64) -> ! {
                 pid,
                 &[b"session display map failed: ", error.name().as_bytes()],
             );
-            idle_forever(pid, grant);
+            idle_forever(pid);
         }
     };
 
@@ -716,24 +841,28 @@ fn session(grant: u64) -> ! {
             pid,
             &[b"session port grant failed: ", error.name().as_bytes()],
         );
-        idle_forever(pid, grant);
+        idle_forever(pid);
     }
 
     say(pid, &[b"session owns the display and the clock"]);
 
-    let width = u64::from(info.width);
-    let height = u64::from(info.height);
-    let stride = u64::from(info.stride);
-    let top = height.saturating_sub(SESSION_BAND_ROWS);
+    let screen = Screen {
+        base,
+        width: u64::from(info.width),
+        height: u64::from(info.height),
+        stride: u64::from(info.stride),
+    };
+
     let mut tick = 0u64;
     let mut reported = false;
+    let mut painted = false;
 
     loop {
         match call(SYS_IRQ_WAIT, grant, TICKER_DEVICE) {
             Ok(count) => tick = tick.wrapping_add(count),
             Err(error) => {
                 say(pid, &[b"session clock failed: ", error.name().as_bytes()]);
-                idle_forever(pid, grant);
+                idle_forever(pid);
             }
         }
         // SAFETY: the port grant above covers these, which is what makes the
@@ -742,43 +871,133 @@ fn session(grant: u64) -> ! {
             cmos_read(CMOS_REG_C);
         }
 
-        // A bar that advances once per interrupt and wraps at the screen edge.
-        // Deliberately the simplest thing that cannot be faked by a still
-        // image: if it moves, a process outside the kernel is still being
-        // scheduled and hardware is still interrupting.
-        let filled = tick % width.max(1);
-        // SAFETY: `base` is the framebuffer window this process was granted,
-        // and every offset below is inside the band it owns.
+        // The static parts once, the moving parts every frame.
+        //
+        // Redrawing everything at 64 Hz was the first version and it tore: a
+        // screen capture caught the desktop mid-redraw, with the panel drawn
+        // and the window text not. Four megabytes of writes per frame to change
+        // a clock is also simply wasteful. This is the smallest damage
+        // tracking that works — two regions, both known statically — and it
+        // needs no bookkeeping to be right.
+        // SAFETY: `screen` describes the framebuffer window this process was
+        // granted, and every draw below is clipped to its geometry.
         unsafe {
-            for row in top..height {
-                let shade = ((row - top) * 2) as u32;
-                for column in 0..width {
-                    let colour = if column <= filled {
-                        0x0019_E6FF - (shade << 8)
-                    } else {
-                        0x0004_0810 + shade
-                    };
-                    ((base + (row * stride + column) * 4) as *mut u32).write_volatile(colour);
-                }
+            if !painted {
+                painted = true;
+                draw_desktop(&screen);
             }
+            draw_clock(&screen, tick);
+            draw_sweep(&screen, tick);
         }
 
-        // Said once, so the boot test has evidence the loop ran rather than
-        // merely started, without the log filling up forever afterwards.
         if !reported && tick >= 3 {
             reported = true;
-            say(pid, &[b"session is drawing, the machine stays up"]);
+            say(pid, &[b"session is drawing the desktop"]);
         }
     }
 }
 
+/// Everything on the desktop that does not change.
+///
+/// # Safety
+/// `screen` must describe a framebuffer window this process holds.
+unsafe fn draw_desktop(screen: &Screen) {
+    // SAFETY: the caller guarantees the window; every call clips to geometry.
+    unsafe {
+        screen.gradient(
+            0,
+            screen.height,
+            colour::DESKTOP_TOP,
+            colour::DESKTOP_BOTTOM,
+        );
+
+        // The panel across the top, and what it says.
+        screen.fill(0, 0, screen.width, PANEL_HEIGHT, colour::PANEL);
+        screen.fill(0, PANEL_HEIGHT, screen.width, 2, colour::ACCENT);
+        // Placed by arithmetic rather than by eye. A glyph is `GLYPH_WIDTH`
+        // wide before scaling, so eight characters of title occupy exactly
+        // this much — guessing put the second word twelve pixels inside the
+        // first and produced "WHISEZOSSESSION" on screen.
+        const TITLE: &[u8] = b"WHISEZOS";
+        let title_end = 12 + TITLE.len() as u64 * font::GLYPH_WIDTH as u64 * TEXT_SCALE;
+        screen.text(12, 9, TITLE, colour::ACCENT);
+        screen.text(title_end + 16, 9, b"SESSION", colour::DIM);
+
+        // Two windows. They do not do anything — there is no process behind
+        // either — and they are drawn from the same geometry a real one would
+        // have, so that when there is, this is the code that already worked.
+        screen.window(80, 90, 520, 300, b"DEVICES", true);
+        screen.text(96, 130, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
+        screen.text(96, 154, b"AUDIO   VIRTIO-SND  1 OUT 1 IN", colour::DIM);
+        screen.text(96, 178, b"CLOCK   RTC         64 HZ", colour::DIM);
+        screen.text(96, 202, b"DISPLAY FRAMEBUFFER 1280X800", colour::DIM);
+        screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
+
+        screen.window(660, 200, 520, 300, b"KERNEL", false);
+        screen.text(676, 240, b"MICROKERNEL  STAGE 2 COMPLETE", colour::DIM);
+        screen.text(676, 264, b"PROCESSES    ISOLATED", colour::DIM);
+        screen.text(676, 288, b"MEMORY       NO LEAK ON TEARDOWN", colour::DIM);
+        screen.text(676, 312, b"IPC          RENDEZVOUS", colour::DIM);
+        screen.text(676, 360, b"NO FILESYSTEM YET", colour::DIM);
+        screen.text(676, 384, b"NO SHELL YET", colour::DIM);
+    }
+}
+
+/// The uptime, redrawn each frame.
+///
+/// The ticker is the only source of time this process has: 64 interrupts to the
+/// second, counted. A number that advances is proof the machine is running,
+/// which no still image can be.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_clock(screen: &Screen, tick: u64) {
+    let seconds = tick / 64;
+    let mut stamp = *b"UP 00:00:00";
+    let hours = (seconds / 3600) % 100;
+    let minutes = (seconds / 60) % 60;
+    let secs = seconds % 60;
+    stamp[3] = b'0' + (hours / 10) as u8;
+    stamp[4] = b'0' + (hours % 10) as u8;
+    stamp[6] = b'0' + (minutes / 10) as u8;
+    stamp[7] = b'0' + (minutes % 10) as u8;
+    stamp[9] = b'0' + (secs / 10) as u8;
+    stamp[10] = b'0' + (secs % 10) as u8;
+
+    let x = screen.width.saturating_sub(160);
+    // SAFETY: the caller guarantees the window.
+    unsafe {
+        // The panel behind it first: glyphs are drawn as set pixels only, so
+        // without this the previous digit stays underneath the new one.
+        screen.fill(x, 4, 150, 24, colour::PANEL);
+        screen.text(x, 9, &stamp, colour::TEXT);
+    }
+}
+
+/// A marker sweeping along the accent line under the panel.
+///
+/// The one thing that moves on every single frame rather than once a second,
+/// so a stalled machine is obvious at a glance instead of after waiting to see
+/// whether the clock advances.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_sweep(screen: &Screen, tick: u64) {
+    let width = screen.width.max(1);
+    let position = (tick * 6) % width;
+    // SAFETY: the caller guarantees the window.
+    unsafe {
+        screen.fill(0, PANEL_HEIGHT, screen.width, 2, colour::ACCENT);
+        screen.fill(position, PANEL_HEIGHT, 90, 2, colour::TEXT);
+    }
+}
 /// Stays alive without a screen or a clock.
 ///
 /// The session must not exit, so every failure above lands here rather than in
 /// `exit`. `SYS_PING` is used as the sleep: it enters the kernel, which gives
 /// the scheduler a chance to run something else, and it is the one call that
 /// cannot fail.
-fn idle_forever(pid: u64, _grant: u64) -> ! {
+fn idle_forever(pid: u64) -> ! {
     say(pid, &[b"session idling"]);
     loop {
         let _ = call(SYS_PING, 0, 0);

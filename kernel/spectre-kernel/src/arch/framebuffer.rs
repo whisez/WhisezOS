@@ -342,6 +342,20 @@ pub fn write(args: fmt::Arguments<'_>) {
     }
 }
 
+/// Gives the screen up, so a process can own all of it.
+///
+/// The band at the bottom was an agreement about who writes where, and an
+/// agreement is what you have when neither side can be told to stop. Now one
+/// can: once a session holds the display, the kernel writes to the serial port
+/// only and the whole framebuffer belongs to ring 3.
+///
+/// The console can be brought back — `init` re-creates it — which is what a
+/// panic after this point would want. Nothing does that yet, and a kernel that
+/// dies with no screen still has the wire.
+pub fn release() {
+    *CONSOLE.lock() = None;
+}
+
 /// Whether anything is being drawn.
 #[must_use]
 pub fn is_active() -> bool {
