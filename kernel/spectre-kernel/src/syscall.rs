@@ -19,7 +19,7 @@
 use crate::abi::{
     SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
     SYS_GRANT_PORTS, SYS_IRQ_CLAIM, SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE,
-    SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_PING, SYS_RECEIVE, SYS_REPLY, SYS_SHUTDOWN,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
@@ -74,6 +74,7 @@ pub fn handle(
         SYS_GRANT_PORTS => sys_grant_ports(a0, a1),
         SYS_IRQ_WAIT_ANY => sys_irq_wait_any(a0, frame),
         SYS_IRQ_CLAIM => sys_irq_claim(a0, a1),
+        SYS_SHUTDOWN => sys_shutdown(a0),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -350,6 +351,34 @@ fn sys_grant_ports(grant: u64, index: u64) -> Result<u64, SyscallError> {
         task::current_pid()
     );
     Ok(granted)
+}
+
+/// `SYS_SHUTDOWN(grant)`.
+///
+/// Checked against the device grant, which is the same authority every other
+/// hardware call uses. A process that was given no devices cannot turn the
+/// machine off, which is the right answer: it has nothing to lose by it and
+/// everything else does.
+fn sys_shutdown(grant: u64) -> Result<u64, SyscallError> {
+    device::describe(grant, 0)?;
+
+    kprintln!("[kernel] shutdown requested by pid {}", task::current_pid());
+    // Said before the attempt, because a successful one has no observer.
+    for (port, value, name) in arch::power::attempted() {
+        kprintln!("[kernel] powering off: {name} ({port:#x} <- {value:#x})");
+    }
+
+    arch::disable_interrupts();
+    // SAFETY: interrupts are off and nothing after this needs to run. Every
+    // write is to a power-management register; a wrong address is a port
+    // nothing decodes.
+    unsafe { arch::power::power_off() };
+
+    // Only reached if the machine refused. Saying so beats a silent hang, and
+    // halting beats returning to a process that believes it shut the system
+    // down.
+    kprintln!("[kernel] the machine did not power off; halting instead");
+    arch::halt_forever();
 }
 
 /// `SYS_EXIT(code)`.

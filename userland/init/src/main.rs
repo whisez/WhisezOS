@@ -39,6 +39,7 @@ use abi::{
     decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
     SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_CLAIM,
     SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_SHUTDOWN,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -1238,6 +1239,21 @@ fn session(grant: u64) -> ! {
                                         }
                                         console::Action::Uptime => {
                                             report_uptime(&mut shell, tick);
+                                        }
+                                        console::Action::Shutdown => {
+                                            // Drawn once more first, so the
+                                            // last thing on screen is the
+                                            // acknowledgement rather than
+                                            // whatever was there before.
+                                            // Already inside the enclosing
+                                            // `unsafe`, which is what makes the
+                                            // port reads above legal.
+                                            draw_shell(&screen, &shell);
+                                            let _ = call(SYS_SHUTDOWN, grant, 0);
+                                            // Only reached if the machine
+                                            // refused, which the kernel has
+                                            // already reported.
+                                            shell.print(b"the machine refused to power off");
                                         }
                                         console::Action::None => {}
                                     }

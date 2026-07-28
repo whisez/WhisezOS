@@ -133,6 +133,18 @@ pub const SYS_IRQ_WAIT_ANY: u64 = 11;
 /// having claimed the clock, holding the mouse unclaimed, and waiting forever.
 pub const SYS_IRQ_CLAIM: u64 = 12;
 
+/// Turn the machine off. `(grant) -> never returns, if it works`.
+///
+/// The one device the kernel keeps. The register that powers a machine down is
+/// above the window the I/O permission bitmap covers, so `portauth` cannot
+/// grant it to anybody — which was a deliberate boundary rather than an
+/// oversight, and shutting the machine down is the kind of authority it was
+/// drawn to keep.
+///
+/// Returns only on failure, which is the honest shape: a shutdown that worked
+/// has no observer.
+pub const SYS_SHUTDOWN: u64 = 13;
+
 /// What a device is, so a driver can tell what it was handed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -479,7 +491,10 @@ mod tests {
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
         assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
         assert_eq!((SYS_ALLOC_DMA, SYS_IRQ_WAIT, SYS_GRANT_PORTS), (8, 9, 10));
-        assert_eq!((SYS_IRQ_WAIT_ANY, SYS_IRQ_CLAIM), (11, 12));
+        assert_eq!(
+            (SYS_IRQ_WAIT_ANY, SYS_IRQ_CLAIM, SYS_SHUTDOWN),
+            (11, 12, 13)
+        );
     }
 
     #[test]

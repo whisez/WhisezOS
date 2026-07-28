@@ -42,6 +42,12 @@ pub enum Action {
     Redraw,
     /// Read this sector from the disk and print it.
     ReadSector(u64),
+    /// Turn the machine off.
+    ///
+    /// Asked for rather than done, like everything else here: the console has
+    /// no syscalls, and the one that stops the machine is the last one it
+    /// should be given.
+    Shutdown,
     /// Print how long the session has been up.
     ///
     /// The console has no clock, and giving it one would mean giving it a
@@ -172,6 +178,7 @@ impl Console {
                 self.print(b"uptime            since the session started");
                 self.print(b"read <sector>     read one 512-byte sector");
                 self.print(b"echo <text>       print it back");
+                self.print(b"shutdown          turn the machine off");
                 Action::None
             }
             b"clear" => {
@@ -199,6 +206,13 @@ impl Console {
                 }
             },
             b"uptime" => Action::Uptime,
+            b"shutdown" | b"poweroff" | b"halt" => {
+                // Three names because this is the command somebody reaches for
+                // in a hurry, and refusing a synonym is the wrong moment to be
+                // strict about vocabulary.
+                self.print(b"shutting down");
+                Action::Shutdown
+            }
             _ => {
                 let mut message = [b' '; COLUMNS];
                 let prefix = b"unknown command: ";
@@ -382,6 +396,16 @@ mod tests {
         // The newest line is the last one printed, which is what a ring that
         // rotated its start correctly produces.
         assert_eq!(last_line(&console), [b'0' + ((ROWS * 3 - 1) % 10) as u8]);
+    }
+
+    #[test]
+    fn every_name_for_shutdown_works() {
+        // The command somebody reaches for in a hurry. Refusing a synonym is
+        // the wrong moment to be strict about vocabulary.
+        for name in ["shutdown", "poweroff", "halt"] {
+            let mut console = Console::new();
+            assert_eq!(type_line(&mut console, name), Action::Shutdown, "{name}");
+        }
     }
 
     #[test]

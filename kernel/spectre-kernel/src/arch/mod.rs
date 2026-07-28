@@ -37,6 +37,7 @@ pub mod memory;
 pub mod paging;
 pub mod pci;
 pub mod pic;
+pub mod power;
 pub mod rtc;
 pub mod segments;
 pub mod serial;

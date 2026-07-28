@@ -29,6 +29,16 @@ pub unsafe fn outb(port: u16, value: u8) {
 }
 
 /// # Safety
+/// As `outb`. Sixteen bits because the ACPI power-management registers are
+/// word-wide and a byte write to one sets half of it.
+pub unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: the caller guarantees the port and the value.
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// # Safety
 /// As `inb`. The 32-bit width matters: PCI configuration space is dword
 /// granular, and a byte read of 0xCFC returns one byte of the selected dword
 /// rather than the dword the caller wanted.
