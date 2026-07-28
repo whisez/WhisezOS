@@ -382,11 +382,16 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
         Some(path) => format!("file:{}", qemu_path(&std::path::absolute(path)?)),
         None => "stdio".to_string(),
     };
-    let display = if windowed {
-        "gtk,zoom-to-fit=on"
-    } else {
-        "none"
-    };
+    // `zoom-to-fit` scales the guest into whatever size the window happens to
+    // be, and the window opens at the firmware's initial mode — 656x544 here.
+    // The kernel switches to 1280x800, and the result was the whole desktop
+    // squeezed to about half scale: the boot log's blocky text survived it, the
+    // desktop's layout did not, and it read as a display that was not working.
+    //
+    // Off, so GTK resizes the window to the guest instead. Pixels are then one
+    // to one, which for a display anybody is meant to read is the only setting
+    // that is not a guess about what will still be legible.
+    let display = if windowed { "gtk" } else { "none" };
 
     run_path(
         &qemu,
