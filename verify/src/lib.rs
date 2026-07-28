@@ -125,6 +125,12 @@ pub mod pci;
 #[path = "../../kernel/spectre-kernel/src/portauth.rs"]
 pub mod portauth;
 
+#[path = "../../userland/init/src/console.rs"]
+pub mod console;
+
+#[path = "../../userland/init/src/keymap.rs"]
+pub mod keymap;
+
 #[path = "../../kernel/spectre-kernel/src/font.rs"]
 pub mod font;
 

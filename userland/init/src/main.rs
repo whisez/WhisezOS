@@ -28,6 +28,13 @@ mod abi;
 #[path = "../../../kernel/spectre-kernel/src/font.rs"]
 mod font;
 
+/// Scancodes to characters, and the shell's text buffer. Both are pure logic
+/// and both are compiled by the host test harness as well as here — a shell is
+/// the part most likely to be wrong in ways a person notices, and squinting at
+/// a screenshot is a poor way to find out.
+mod console;
+mod keymap;
+
 use abi::{
     decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
     SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_CLAIM,
@@ -942,6 +949,19 @@ const PANEL_HEIGHT: u64 = 32;
 /// resolution.
 const TEXT_SCALE: u64 = 2;
 
+/// Where the shell window sits, and how much of it is text.
+const SHELL_X: u64 = 80;
+const SHELL_Y: u64 = 430;
+const SHELL_W: u64 = 1120;
+const SHELL_H: u64 = 330;
+/// Inside the frame, below the title bar.
+const SHELL_TEXT_X: u64 = SHELL_X + 12;
+const SHELL_TEXT_Y: u64 = SHELL_Y + 34;
+/// One glyph cell, scaled. The gap makes lines legible at this size; without it
+/// descenders touch the row below.
+const CELL_W: u64 = font::GLYPH_WIDTH as u64 * TEXT_SCALE;
+const CELL_H: u64 = font::GLYPH_HEIGHT as u64 * TEXT_SCALE + 3;
+
 impl Screen {
     /// # Safety
     /// `base` must be a framebuffer window this process was granted, matching
@@ -1139,6 +1159,15 @@ fn session(grant: u64) -> ! {
     let mut keys = 0u64;
     let mut reported = false;
     let mut painted = false;
+    let mut extended = false;
+    let mut modifiers = keymap::Modifiers::default();
+    let mut shell = console::Console::new();
+    shell.print(b"WhisezOS session. Type help.");
+
+    // The disk, so `read` reads rather than reporting that it cannot. Failure
+    // here is not fatal: a session without a disk is a session with one fewer
+    // command, and exiting is the one thing it must not do.
+    let mut disk = attach_disk(&mut shell, grant);
     let mut pointer = Pointer {
         x: (screen.width / 2) as i64,
         y: (screen.height / 2) as i64,
@@ -1185,13 +1214,36 @@ fn session(grant: u64) -> ! {
                         let byte = port_in(I8042_DATA);
                         if from_mouse {
                             pointer.feed(byte, &screen);
-                        } else if byte < 0x80 && byte != 0xE0 {
-                            // Presses only. In scancode set 1 a release is the
-                            // press with the top bit set, so counting every
-                            // byte counts each key twice — the readout said ten
-                            // for five keystrokes. 0xE0 is the prefix for the
-                            // extended keys and is not a key of its own.
-                            keys = keys.wrapping_add(1);
+                        } else if extended {
+                            // The byte after the prefix is a different key from
+                            // the same code without it, and none of them
+                            // produce characters. Skipping it is what stops an
+                            // arrow key from typing a letter.
+                            extended = false;
+                        } else if byte == keymap::EXTENDED {
+                            extended = true;
+                        } else {
+                            match keymap::decode(byte, &mut modifiers) {
+                                keymap::Key::Char(character) => {
+                                    keys = keys.wrapping_add(1);
+                                    shell.type_char(character);
+                                }
+                                keymap::Key::Backspace => shell.backspace(),
+                                keymap::Key::Enter => {
+                                    keys = keys.wrapping_add(1);
+                                    match shell.enter() {
+                                        console::Action::Redraw => painted = false,
+                                        console::Action::ReadSector(sector) => {
+                                            read_sector(&mut shell, disk.as_mut(), sector);
+                                        }
+                                        console::Action::Uptime => {
+                                            report_uptime(&mut shell, tick);
+                                        }
+                                        console::Action::None => {}
+                                    }
+                                }
+                                keymap::Key::None => {}
+                            }
                         }
                     }
                 }
@@ -1207,6 +1259,7 @@ fn session(grant: u64) -> ! {
                 draw_desktop(&screen);
             }
             draw_status(&screen, tick, keys, &pointer);
+            draw_shell(&screen, &shell);
             draw_sweep(&screen, tick);
             draw_pointer(&screen, &mut pointer);
         }
@@ -1340,13 +1393,14 @@ unsafe fn draw_desktop(screen: &Screen) {
         screen.text(96, 202, b"DISPLAY FRAMEBUFFER 1280X800", colour::DIM);
         screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
 
-        screen.window(660, 200, 520, 300, b"KERNEL", false);
-        screen.text(676, 240, b"MICROKERNEL  STAGE 2 COMPLETE", colour::DIM);
-        screen.text(676, 264, b"PROCESSES    ISOLATED", colour::DIM);
-        screen.text(676, 288, b"MEMORY       NO LEAK ON TEARDOWN", colour::DIM);
-        screen.text(676, 312, b"IPC          RENDEZVOUS", colour::DIM);
-        screen.text(676, 360, b"NO FILESYSTEM YET", colour::DIM);
-        screen.text(676, 384, b"NO SHELL YET", colour::DIM);
+        screen.window(
+            SHELL_X,
+            SHELL_Y,
+            SHELL_W,
+            SHELL_H,
+            b"SHELL - TYPE HELP",
+            false,
+        );
     }
 }
 
@@ -1398,6 +1452,234 @@ unsafe fn draw_status(screen: &Screen, tick: u64, keys: u64, pointer: &Pointer) 
         screen.text(x, 9, &stamp, colour::TEXT);
         screen.fill(260, 4, 400, 24, colour::PANEL);
         screen.text(260, 9, &readout, colour::DIM);
+    }
+}
+
+/// Everything needed to read a sector, once the disk has been brought up.
+struct Disk {
+    queue: Queue,
+    region: DmaRegion,
+    sectors: u64,
+}
+
+/// Brings the disk up for the session, or explains why not.
+///
+/// The same sequence the demonstration runs, in a process that keeps going
+/// afterwards. Every failure prints and returns `None` rather than exiting: the
+/// session is what stops the machine looking dead, and a missing disk is one
+/// command short of a full shell, not a reason to stop.
+fn attach_disk(shell: &mut console::Console, grant: u64) -> Option<Disk> {
+    let pid = SESSION_ROLE;
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+    if call5(
+        SYS_DEVICE_INFO,
+        grant,
+        BLOCK_DEVICE,
+        (&raw mut info) as u64,
+        size,
+        0,
+    )
+    .is_err()
+        || info.kind != DeviceKind::Block as u32
+    {
+        shell.print(b"no disk on this machine; read is unavailable");
+        return None;
+    }
+
+    let window = call(SYS_MAP_DEVICE, grant, BLOCK_DEVICE).ok()?;
+    let common = window + u64::from(info.common_offset);
+    let config = window + u64::from(info.config_offset);
+
+    if !virtio_handshake(pid, common, 60) {
+        return None;
+    }
+
+    // SAFETY: `config` is inside the device window this process was granted.
+    let sectors =
+        unsafe { u64::from(mmio_read32(config)) | u64::from(mmio_read32(config + 4)) << 32 };
+
+    let queue = setup_queue(
+        pid,
+        common,
+        window + u64::from(info.notify_offset),
+        &info,
+        0,
+        62,
+    )?;
+
+    // SAFETY: the queue exists, so the device may be told the driver is ready —
+    // which is what permits it to look at the rings.
+    unsafe {
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+    }
+
+    let mut region = DmaRegion::EMPTY;
+    let bytes = core::mem::size_of::<DmaRegion>() as u64;
+    if call5(
+        SYS_ALLOC_DMA,
+        REQUEST_BYTES,
+        (&raw mut region) as u64,
+        bytes,
+        0,
+        0,
+    )
+    .is_err()
+    {
+        shell.print(b"no memory for disk requests; read is unavailable");
+        return None;
+    }
+
+    let mut line = [b' '; console::COLUMNS];
+    let prefix = b"disk ready, ";
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 20];
+    let rendered = console::decimal(sectors, &mut digits);
+    let mut at = prefix.len();
+    line[at..at + rendered.len()].copy_from_slice(rendered);
+    at += rendered.len();
+    let tail = b" sectors";
+    line[at..at + tail.len()].copy_from_slice(tail);
+    at += tail.len();
+    shell.print(&line[..at]);
+
+    Some(Disk {
+        queue,
+        region,
+        sectors,
+    })
+}
+
+/// Reads one sector and prints the first bytes of it.
+fn read_sector(shell: &mut console::Console, disk: Option<&mut Disk>, sector: u64) {
+    let Some(disk) = disk else {
+        shell.print(b"read: no disk attached");
+        return;
+    };
+    if sector >= disk.sectors {
+        shell.print(b"read: past the end of the disk");
+        return;
+    }
+
+    if !submit(SESSION_ROLE, &mut disk.queue, &disk.region, blk::IN, sector) {
+        shell.print(b"read: the device did not answer");
+        return;
+    }
+
+    // Two rows of sixteen bytes. Enough to recognise what is there without
+    // filling the history with one sector.
+    let data = disk.region.virt + DATA_OFFSET;
+    for row in 0..2u64 {
+        let mut line = [b' '; console::COLUMNS];
+        let mut at = 0usize;
+        let mut digits = [0u8; 20];
+        let offset = console::decimal(row * 16, &mut digits);
+        line[at..at + offset.len()].copy_from_slice(offset);
+        at += offset.len();
+        line[at] = b':';
+        at += 2;
+
+        for column in 0..16u64 {
+            // SAFETY: the device just wrote this range, which is inside the
+            // request buffer this process owns.
+            let byte = unsafe { ((data + row * 16 + column) as *const u8).read_volatile() };
+            line[at] = hex_digit(byte >> 4);
+            line[at + 1] = hex_digit(byte & 0xF);
+            at += 3;
+        }
+        shell.print(&line[..at]);
+    }
+}
+
+fn hex_digit(value: u8) -> u8 {
+    if value < 10 {
+        b'0' + value
+    } else {
+        b'a' + value - 10
+    }
+}
+
+/// Answers `uptime` from the tick count, which is the only clock this process
+/// has: 64 interrupts to the second, counted since the session started.
+fn report_uptime(shell: &mut console::Console, tick: u64) {
+    let seconds = tick / 64;
+    let mut line = [b' '; console::COLUMNS];
+    let mut digits = [0u8; 20];
+    let rendered = console::decimal(seconds, &mut digits);
+
+    let prefix = b"up ";
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut at = prefix.len();
+    line[at..at + rendered.len()].copy_from_slice(rendered);
+    at += rendered.len();
+    let suffix = b" seconds, ";
+    line[at..at + suffix.len()].copy_from_slice(suffix);
+    at += suffix.len();
+
+    let mut ticks = [0u8; 20];
+    let rendered = console::decimal(tick, &mut ticks);
+    line[at..at + rendered.len()].copy_from_slice(rendered);
+    at += rendered.len();
+    let tail = b" ticks";
+    line[at..at + tail.len()].copy_from_slice(tail);
+    at += tail.len();
+
+    shell.print(&line[..at]);
+}
+
+/// Draws the shell's history and the line being typed.
+///
+/// The whole text area is repainted each frame rather than tracked for damage.
+/// It is 78 by 17 cells, under a tenth of the screen, and the alternative is
+/// bookkeeping that has to be right before anything appears — the same trade
+/// the desktop makes in the other direction, where the static parts are large
+/// and painted once.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        // The history *and* the prompt row below it. Clearing only the history
+        // left the prompt row untouched, so each frame drew a cursor block
+        // beside the last one and the command line filled with them — the kind
+        // of bug that is obvious on a screen and invisible to every test that
+        // reads text rather than pixels.
+        screen.fill(
+            SHELL_TEXT_X - 4,
+            SHELL_TEXT_Y - 4,
+            SHELL_W - 16,
+            (console::ROWS as u64 + 1) * CELL_H + 8,
+            colour::WINDOW,
+        );
+
+        shell.each_line(|index, line| {
+            screen.text(
+                SHELL_TEXT_X,
+                SHELL_TEXT_Y + index as u64 * CELL_H,
+                line,
+                colour::DIM,
+            );
+        });
+
+        // The prompt on the row below the history, with a block for a cursor.
+        // Drawn after it so a full buffer cannot push the prompt off the
+        // window — the one line that must always be visible is the one being
+        // typed into.
+        let row = SHELL_TEXT_Y + (console::ROWS as u64) * CELL_H;
+        screen.text(SHELL_TEXT_X, row, b">", colour::ACCENT);
+        let typed = shell.input();
+        screen.text(SHELL_TEXT_X + CELL_W * 2, row, typed, colour::TEXT);
+        screen.fill(
+            SHELL_TEXT_X + CELL_W * (2 + typed.len() as u64),
+            row,
+            CELL_W - 2,
+            CELL_H - 3,
+            colour::ACCENT,
+        );
     }
 }
 
