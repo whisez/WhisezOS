@@ -330,15 +330,42 @@ mod tests {
 
     const GRANT: u64 = 0xABCD_1234_5678_9EF0;
 
+    /// Held for the length of any test that touches the device table.
+    ///
+    /// The table is a `static`, and `cargo test` runs tests on several threads.
+    /// One test calling `init` between another's `init` and its `describe`
+    /// gives the second test a table it did not build — which showed up as
+    /// three unrelated tests failing together, and passing on a rerun and in
+    /// isolation. A flaky test is worse than a missing one: it teaches you to
+    /// run the suite again instead of reading it.
+    ///
+    /// The lock is not poisoned on a panic, which matters: `spin::Mutex` has no
+    /// poisoning, so one failing test does not turn into every later test
+    /// deadlocking and hiding what actually went wrong.
+    static TABLE_IN_USE: Mutex<()> = Mutex::new(());
+
+    /// Populates the table and runs a test against it, alone.
+    ///
+    /// Every test that reaches the static goes through here. A test written
+    /// without it does not take the lock and the flake comes back silently, so
+    /// there is deliberately no other way to call `init` from a test.
+    fn with_devices(boot: &BootInfo, grant: u64, body: impl FnOnce(usize)) {
+        let _held = TABLE_IN_USE.lock();
+        let count = init(boot, grant);
+        body(count);
+    }
+
     #[test]
     fn a_framebuffer_in_the_handoff_becomes_the_first_device() {
         // Four: the framebuffer, the ticker, and the two halves of the input
         // controller. Only the first depends on what the firmware left behind.
-        assert_eq!(init(&boot_with_framebuffer(), GRANT), 4);
-        let info = describe(GRANT, 0).unwrap();
-        assert_eq!(info.kind, DeviceKind::Framebuffer as u32);
-        assert_eq!(info.width, 1280);
-        assert_eq!(info.length, 1280 * 800 * 4);
+        with_devices(&boot_with_framebuffer(), GRANT, |count| {
+            assert_eq!(count, 4);
+            let info = describe(GRANT, 0).unwrap();
+            assert_eq!(info.kind, DeviceKind::Framebuffer as u32);
+            assert_eq!(info.width, 1280);
+            assert_eq!(info.length, 1280 * 800 * 4);
+        });
     }
 
     #[test]
@@ -346,10 +373,12 @@ mod tests {
         // Unlike the framebuffer it depends on nothing the firmware did, so it
         // is the one device a driver can always count on being there — and with
         // no framebuffer it moves to index zero rather than leaving a hole.
-        assert_eq!(init(&BootInfo::empty(), GRANT), 3);
-        let info = describe(GRANT, 0).unwrap();
-        assert_eq!(info.kind, DeviceKind::Ticker as u32);
-        assert_eq!(line(GRANT, 0), Ok(TICKER_LINE));
+        with_devices(&BootInfo::empty(), GRANT, |count| {
+            assert_eq!(count, 3);
+            let info = describe(GRANT, 0).unwrap();
+            assert_eq!(info.kind, DeviceKind::Ticker as u32);
+            assert_eq!(line(GRANT, 0), Ok(TICKER_LINE));
+        });
     }
 
     #[test]
@@ -357,9 +386,10 @@ mod tests {
         // The framebuffer is a window, not a register file behind an index
         // port. Asking for its ports must be refused rather than answered with
         // the ticker's, which is what a shared default would do.
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(ports(GRANT, 0), Err(SyscallError::NotPermitted));
-        assert_eq!(ports(GRANT, 1), Ok([Some(TICKER_PORTS), None]));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(ports(GRANT, 0), Err(SyscallError::NotPermitted));
+            assert_eq!(ports(GRANT, 1), Ok([Some(TICKER_PORTS), None]));
+        });
     }
 
     #[test]
@@ -367,15 +397,16 @@ mod tests {
         // One chip, two interrupts. They are two devices because a driver has
         // to know which interrupt announced a byte — the shared data register
         // does not say — and a device with two lines has no syscall shape.
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(
-            describe(GRANT, 2).unwrap().kind,
-            DeviceKind::Keyboard as u32
-        );
-        assert_eq!(describe(GRANT, 3).unwrap().kind, DeviceKind::Mouse as u32);
-        assert_eq!(line(GRANT, 2), Ok(KEYBOARD_LINE));
-        assert_eq!(line(GRANT, 3), Ok(MOUSE_LINE));
-        assert_ne!(line(GRANT, 2), line(GRANT, 3));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(
+                describe(GRANT, 2).unwrap().kind,
+                DeviceKind::Keyboard as u32
+            );
+            assert_eq!(describe(GRANT, 3).unwrap().kind, DeviceKind::Mouse as u32);
+            assert_eq!(line(GRANT, 2), Ok(KEYBOARD_LINE));
+            assert_eq!(line(GRANT, 3), Ok(MOUSE_LINE));
+            assert_ne!(line(GRANT, 2), line(GRANT, 3));
+        });
     }
 
     #[test]
@@ -388,8 +419,9 @@ mod tests {
             assert_eq!(forbidden_reason(range), None, "{range:?} cannot be granted");
         }
 
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(ports(GRANT, 2), Ok(INPUT_PORTS));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(ports(GRANT, 2), Ok(INPUT_PORTS));
+        });
     }
 
     #[test]
@@ -405,16 +437,18 @@ mod tests {
         // The framebuffer raises nothing, and asking to wait for its interrupt
         // must be refused rather than answered with line zero — which belongs
         // to a different device.
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(line(GRANT, 0), Err(SyscallError::NotPermitted));
-        assert_eq!(line(GRANT, 1), Ok(TICKER_LINE));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(line(GRANT, 0), Err(SyscallError::NotPermitted));
+            assert_eq!(line(GRANT, 1), Ok(TICKER_LINE));
+        });
     }
 
     #[test]
     fn a_line_needs_the_grant_like_everything_else() {
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(line(GRANT ^ 1, 1), Err(SyscallError::NotPermitted));
-        assert_eq!(line(0, 1), Err(SyscallError::NotPermitted));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(line(GRANT ^ 1, 1), Err(SyscallError::NotPermitted));
+            assert_eq!(line(0, 1), Err(SyscallError::NotPermitted));
+        });
     }
 
     #[test]
@@ -422,50 +456,56 @@ mod tests {
         // Its length is zero, and `map_device` refuses a zero-length extent —
         // so a driver that treats every device as mappable is told no rather
         // than handed an empty window it will write through.
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(extent(GRANT, 1), Ok((0, 0)));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(extent(GRANT, 1), Ok((0, 0)));
+        });
     }
 
     #[test]
     fn the_wrong_token_is_refused() {
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(describe(GRANT ^ 1, 0), Err(SyscallError::NotPermitted));
-        assert_eq!(extent(GRANT ^ 1, 0), Err(SyscallError::NotPermitted));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(describe(GRANT ^ 1, 0), Err(SyscallError::NotPermitted));
+            assert_eq!(extent(GRANT ^ 1, 0), Err(SyscallError::NotPermitted));
+        });
     }
 
     #[test]
     fn a_zero_token_is_refused_even_before_a_grant_is_issued() {
         // A process that was given nothing holds zero, and zero must never
         // match — including against a table whose grant has not been set.
-        init(&BootInfo::empty(), 0);
-        assert_eq!(describe(0, 0), Err(SyscallError::NotPermitted));
+        with_devices(&BootInfo::empty(), 0, |_| {
+            assert_eq!(describe(0, 0), Err(SyscallError::NotPermitted));
+        });
     }
 
     #[test]
     fn an_index_past_the_end_is_refused_the_same_way_as_a_bad_token() {
         // Distinguishing them would tell a process how many devices exist.
-        init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(describe(GRANT, 4), Err(SyscallError::NotPermitted));
-        assert_eq!(describe(GRANT, u64::MAX), Err(SyscallError::NotPermitted));
-        assert_eq!(describe(GRANT ^ 1, 0), describe(GRANT, 99));
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            assert_eq!(describe(GRANT, 4), Err(SyscallError::NotPermitted));
+            assert_eq!(describe(GRANT, u64::MAX), Err(SyscallError::NotPermitted));
+            assert_eq!(describe(GRANT ^ 1, 0), describe(GRANT, 99));
+        });
     }
 
     #[test]
     fn the_physical_address_is_kernel_only() {
         // `DeviceInfo` is what user space receives, and it has nowhere to put a
         // physical address. This is the test that fails if a field is added.
-        init(&boot_with_framebuffer(), GRANT);
-        let (phys, len) = extent(GRANT, 0).unwrap();
-        assert_eq!(phys, 0x8000_0000);
-        assert_eq!(len, 1280 * 800 * 4);
+        with_devices(&boot_with_framebuffer(), GRANT, |_| {
+            let (phys, len) = extent(GRANT, 0).unwrap();
+            assert_eq!(phys, 0x8000_0000);
+            assert_eq!(len, 1280 * 800 * 4);
 
-        let info = describe(GRANT, 0).unwrap();
-        let bytes: [u8; core::mem::size_of::<DeviceInfo>()] = unsafe { core::mem::transmute(info) };
-        let needle = phys.to_le_bytes();
-        assert!(
-            !bytes.windows(needle.len()).any(|w| w == needle),
-            "the physical address leaked into what user space is given"
-        );
+            let info = describe(GRANT, 0).unwrap();
+            let bytes: [u8; core::mem::size_of::<DeviceInfo>()] =
+                unsafe { core::mem::transmute(info) };
+            let needle = phys.to_le_bytes();
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "the physical address leaked into what user space is given"
+            );
+        });
     }
 
     #[test]
@@ -476,7 +516,9 @@ mod tests {
         boot.framebuffer.stride = 16;
         // The framebuffer is dropped; everything that does not depend on the
         // firmware stays.
-        assert_eq!(init(&boot, GRANT), 3);
-        assert_eq!(describe(GRANT, 0).unwrap().kind, DeviceKind::Ticker as u32);
+        with_devices(&boot, GRANT, |count| {
+            assert_eq!(count, 3);
+            assert_eq!(describe(GRANT, 0).unwrap().kind, DeviceKind::Ticker as u32);
+        });
     }
 }

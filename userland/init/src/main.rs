@@ -1863,16 +1863,6 @@ unsafe fn draw_window(
     }
 }
 
-/// The panel's live half: uptime, keystroke count, and pointer position.
-///
-/// The ticker is the only source of time this process has — 64 interrupts to
-/// the second, counted. The other two numbers are there because they are the
-/// cheapest proof that input works: a count that rises when a key is pressed
-/// and coordinates that follow the mouse cannot be produced by a still image.
-///
-/// # Safety
-/// As `draw_desktop`.
-
 /// Everything needed to read a sector, once the disk has been brought up.
 struct Disk {
     queue: Queue,
