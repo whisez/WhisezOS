@@ -164,11 +164,16 @@ pub const TICKER_LINE: usize = 0;
 /// something this code can divide more finely.
 pub const TICKER_PORTS: PortRange = PortRange::new(0x70, 2);
 
-/// Adds a virtio block device to the table.
+/// Adds a virtio device to the table.
 ///
-/// Called from the PCI scan, which is the only thing that knows a disk exists.
+/// Called from the PCI scan, which is the only thing that knows what is on the
+/// bus. The kind is the caller's: this function does not know a disk from a
+/// sound card and does not need to, because everything below the kind — a
+/// window, four structure offsets, an interrupt — is the same for both.
+///
 /// Returns the index it took, or `None` when the table is full.
-pub fn add_block(
+pub fn add_virtio(
+    kind: DeviceKind,
     window: u64,
     length: u64,
     layout: &crate::virtio::Layout,
@@ -181,7 +186,7 @@ pub fn add_block(
     }
     table.entries[slot] = Entry {
         info: DeviceInfo {
-            kind: DeviceKind::Block as u32,
+            kind: kind as u32,
             length,
             common_offset: layout.common.offset,
             notify_offset: layout.notify.offset,

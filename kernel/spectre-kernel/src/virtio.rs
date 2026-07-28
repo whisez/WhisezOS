@@ -44,6 +44,28 @@ pub const VENDOR: u16 = 0x1AF4;
 pub const DEVICE_ID_BASE: u16 = 0x1040;
 /// Device type 2: a block device.
 pub const TYPE_BLOCK: u16 = 2;
+/// Device type 25: a sound card, with playback and capture.
+pub const TYPE_SOUND: u16 = 25;
+
+/// The device types this kernel knows how to list, and what to call them.
+///
+/// Knowing the name is the whole of what the kernel knows about a type. It
+/// does not know that a block device has sectors or that a sound device has
+/// streams — the transport is identical and everything above it is the
+/// driver's. Adding a type here is one line because that is all it should be.
+pub const KNOWN_TYPES: &[(u16, &str)] = &[(TYPE_BLOCK, "block"), (TYPE_SOUND, "sound")];
+
+/// Which known type this header is, if any.
+#[must_use]
+pub fn device_type(header: &pci::Header) -> Option<(u16, &'static str)> {
+    if header.vendor != VENDOR {
+        return None;
+    }
+    KNOWN_TYPES
+        .iter()
+        .find(|(kind, _)| header.device == DEVICE_ID_BASE + kind)
+        .map(|(kind, name)| (*kind, *name))
+}
 
 /// `cfg_type` values inside a virtio vendor capability.
 pub mod cfg {

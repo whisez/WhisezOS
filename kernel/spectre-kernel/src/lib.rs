@@ -80,11 +80,13 @@ pub mod vmspace;
 
 pub use boot_info::BootInfo;
 
-/// Registers a virtio block device found on the bus, if this is one.
+/// Registers a virtio device found on the bus, if this is one the kernel lists.
 ///
-/// Called once per device the scan reports. Everything it decides is either
-/// PCI or virtio generic — it does not know what a disk is, only that this
-/// device says it is virtio type 2 and where it keeps its registers.
+/// Called once per device the scan reports. Everything it decides is either PCI
+/// or virtio generic — it does not know what a disk or a sound card is, only
+/// that this device says it is a virtio type it has a name for and where it
+/// keeps its registers. The block driver and the sound driver get the same five
+/// numbers and disagree entirely about what to do with them.
 ///
 /// # What it writes
 ///
@@ -93,16 +95,27 @@ pub use boot_info::BootInfo;
 /// `BUS_MASTER` lets it read the memory a driver gives it, without which every
 /// DMA the driver sets up is silently ignored. Neither is something a driver
 /// could set for itself, because both are in configuration space.
-fn register_virtio_block(
+fn register_virtio_device(
     address: pci::Address,
     header: &pci::Header,
     space: &mut arch::PortConfigSpace,
 ) {
     use pci::ConfigSpace;
 
-    if !virtio::is_virtio(header, virtio::TYPE_BLOCK) {
+    let Some((kind, name)) = virtio::device_type(header) else {
         return;
-    }
+    };
+    let listed = match kind {
+        virtio::TYPE_BLOCK => device::DeviceKind::Block,
+        virtio::TYPE_SOUND => device::DeviceKind::Sound,
+        // `device_type` only answers for types in `KNOWN_TYPES`, so this is
+        // unreachable unless one is added there without a kind here — which is
+        // worth reporting rather than silently listing as the wrong thing.
+        _ => {
+            kprintln!("[kernel] virtio type {kind} has no device kind, not listed");
+            return;
+        }
+    };
 
     // Size every BAR once. The layout walk needs to check each region against
     // the BAR holding it, and sizing is destructive enough that doing it twice
@@ -137,7 +150,7 @@ fn register_virtio_block(
     } {
         Ok(layout) => layout,
         Err(error) => {
-            kprintln!("[kernel] virtio-blk layout rejected: {error:?}");
+            kprintln!("[kernel] virtio-{name} layout rejected: {error:?}");
             return;
         }
     };
@@ -166,13 +179,13 @@ fn register_virtio_block(
         );
     }
 
-    match device::add_block(base, size, &layout, device::TICKER_LINE) {
+    match device::add_virtio(listed, base, size, &layout, device::TICKER_LINE) {
         Some(index) => kprintln!(
-            "[kernel] virtio-blk is device {index}: bar {bar} at {base:#x}, {} KiB, irq {}",
+            "[kernel] virtio-{name} is device {index}: bar {bar} at {base:#x}, {} KiB, irq {}",
             size >> 10,
             header.interrupt_line
         ),
-        None => kprintln!("[kernel] device table full, virtio-blk not listed"),
+        None => kprintln!("[kernel] device table full, virtio-{name} not listed"),
     }
 }
 
@@ -244,7 +257,7 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     // The table has to exist first — this adds to it.
     // SAFETY: bring-up, interrupts disabled, before any driver exists, which is
     // what BAR sizing requires.
-    let on_bus = unsafe { arch::scan_pci(register_virtio_block) };
+    let on_bus = unsafe { arch::scan_pci(register_virtio_device) };
     kprintln!("[kernel] {on_bus} pci device(s) on bus 0");
     kprintln!("[kernel] {devices} device(s) listed, grant issued to pid=1");
 

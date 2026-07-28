@@ -234,6 +234,9 @@ pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
     // --- a real PCI device ------------------------------------------------
     probe_disk(pid, grant);
 
+    // --- the same transport, a completely different device ----------------
+    probe_sound(pid, grant);
+
     // --- talking to another process ---------------------------------------
     if endpoint != 0 {
         if pid == SERVER_ROLE {
@@ -611,8 +614,14 @@ fn probe_disk(pid: u64, grant: u64) {
         }
     }
 
-    let Some(mut queue) = setup_queue(pid, common, window + u64::from(info.notify_offset), &info)
-    else {
+    let Some(mut queue) = setup_queue(
+        pid,
+        common,
+        window + u64::from(info.notify_offset),
+        &info,
+        0,
+        30,
+    ) else {
         return;
     };
 
@@ -628,11 +637,399 @@ fn probe_disk(pid: u64, grant: u64) {
     exercise_disk(pid, &mut queue);
 }
 
-/// Builds queue zero and hands its three ring addresses to the device.
+/// The device index of the sound card, which the PCI scan appends fourth.
+const SOUND_DEVICE: u64 = 3;
+
+/// virtio-sound's queues (virtio 1.2 §5.14.2).
+///
+/// Three of the four are named and unused. They are the shape of what comes
+/// next — playback pushes buffers to `TX`, capture takes them from `RX` — and
+/// naming them here is cheaper than rediscovering the numbering later. The
+/// `allow` is the honest marker that they are not driven yet.
+#[allow(dead_code)]
+mod snd_queue {
+    /// Requests and their replies. The only one this driver uses so far.
+    pub const CONTROL: u16 = 0;
+    pub const EVENT: u16 = 1;
+    /// Playback: the driver writes samples here.
+    pub const TX: u16 = 2;
+    /// Capture: the device writes samples here. This is the microphone.
+    pub const RX: u16 = 3;
+}
+
+/// virtio-sound control request codes (virtio 1.2 §5.14.6).
+mod snd_code {
+    /// Enumerate PCM streams. The reply says how many there are, which way each
+    /// one points, and what formats and rates it accepts.
+    pub const PCM_INFO: u32 = 0x0100;
+    /// The device's answer when it accepted the request.
+    pub const STATUS_OK: u32 = 0x8000;
+}
+
+/// Stream directions (virtio 1.2 §5.14.6.6).
+mod snd_direction {
+    /// Playback — a speaker or a line out.
+    pub const OUTPUT: u8 = 0;
+    /// Capture — a microphone or a line in.
+    pub const INPUT: u8 = 1;
+}
+
+/// Offsets in `virtio_snd_config`, the sound card's device-specific structure.
+mod snd_config {
+    pub const JACKS: u64 = 0;
+    pub const STREAMS: u64 = 4;
+    pub const CHMAPS: u64 = 8;
+}
+
+/// Bytes in one `virtio_snd_pcm_info` (virtio 1.2 §5.14.6.6.3).
+const PCM_INFO_BYTES: u32 = 32;
+/// Offset of the `direction` byte within one.
+const PCM_INFO_DIRECTION: u64 = 24;
+/// Streams this driver will enumerate. More than any device here reports, so
+/// the count comes from the device rather than from this number.
+const MAX_STREAMS: u32 = 8;
+
+/// Brings the sound card up and asks it what it can do.
+///
+/// # Why this is short
+///
+/// Everything expensive was already built for the disk. PCI enumeration found
+/// the card, the kernel parsed the same four virtio capabilities, the same
+/// status handshake applies, and `setup_queue` builds the same split virtqueue.
+/// The device class is completely different and the transport is identical —
+/// which is the claim the microkernel arrangement rests on, tested here rather
+/// than asserted.
+///
+/// What this establishes is what hardware is present: how many jacks, how many
+/// PCM streams, and which of those are outputs and which are inputs. The input
+/// count is the microphone.
+fn probe_sound(pid: u64, grant: u64) {
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+
+    match call5(
+        SYS_DEVICE_INFO,
+        grant,
+        SOUND_DEVICE,
+        (&raw mut info) as u64,
+        size,
+        0,
+    ) {
+        Ok(_) => {}
+        Err(SyscallError::NotPermitted) => {
+            say(pid, &[b"no sound grant, as expected"]);
+            return;
+        }
+        Err(error) => {
+            say(pid, &[b"sound info failed: ", error.name().as_bytes()]);
+            exit(40);
+        }
+    }
+
+    if info.kind != DeviceKind::Sound as u32 {
+        say(pid, &[b"device 3 is not a sound card"]);
+        exit(41);
+    }
+
+    let window = match call(SYS_MAP_DEVICE, grant, SOUND_DEVICE) {
+        Ok(base) => base,
+        Err(error) => {
+            say(pid, &[b"sound map failed: ", error.name().as_bytes()]);
+            exit(42);
+        }
+    };
+
+    let common = window + u64::from(info.common_offset);
+    let config = window + u64::from(info.config_offset);
+
+    if !virtio_handshake(pid, common, 43) {
+        return;
+    }
+
+    // SAFETY: `config` is inside the device window this process was given.
+    let (jacks, streams, chmaps) = unsafe {
+        (
+            mmio_read32(config + snd_config::JACKS),
+            mmio_read32(config + snd_config::STREAMS),
+            mmio_read32(config + snd_config::CHMAPS),
+        )
+    };
+
+    if streams == 0 {
+        say(pid, &[b"sound card reports no pcm streams"]);
+        exit(44);
+    }
+
+    let mut buffer = [0u8; 18];
+    say(
+        pid,
+        &[
+            b"sound card: ",
+            hex(u64::from(jacks), &mut buffer),
+            b" jacks",
+        ],
+    );
+    let mut buffer = [0u8; 18];
+    say(
+        pid,
+        &[
+            b"sound card: ",
+            hex(u64::from(streams), &mut buffer),
+            b" pcm streams, ",
+            hex(u64::from(chmaps), &mut [0u8; 18]),
+            b" channel maps",
+        ],
+    );
+
+    let Some(mut queue) = setup_queue(
+        pid,
+        common,
+        window + u64::from(info.notify_offset),
+        &info,
+        snd_queue::CONTROL,
+        45,
+    ) else {
+        return;
+    };
+
+    // SAFETY: the control queue exists, so the device may be told the driver is
+    // ready — which is what permits it to look at the rings.
+    unsafe {
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+    }
+
+    enumerate_streams(pid, &mut queue, streams.min(MAX_STREAMS));
+}
+
+/// Asks the card about each PCM stream and reports which way they point.
+///
+/// The counts are the answer to "is there sound, and is there a microphone":
+/// an output stream is a speaker, an input stream is a capture device. They are
+/// read from the card rather than assumed, which matters because the same
+/// driver has to work against a card configured with only one of them.
+fn enumerate_streams(pid: u64, queue: &mut Queue, streams: u32) {
+    let mut region = DmaRegion::EMPTY;
+    let size = core::mem::size_of::<DmaRegion>() as u64;
+    if let Err(error) = call5(
+        SYS_ALLOC_DMA,
+        REQUEST_BYTES,
+        (&raw mut region) as u64,
+        size,
+        0,
+        0,
+    ) {
+        say(
+            pid,
+            &[b"sound request memory refused: ", error.name().as_bytes()],
+        );
+        exit(46);
+    }
+
+    // `virtio_snd_query_info`: the code, the first stream wanted, how many, and
+    // how large each returned record is. The size is sent by the driver so a
+    // device with a longer record than this build knows about truncates rather
+    // than overruns.
+    let request = region.virt + HEADER_OFFSET;
+    // SAFETY: the DMA buffer is this process's own, mapped writable.
+    unsafe {
+        (request as *mut u32).write_volatile(snd_code::PCM_INFO);
+        ((request + 4) as *mut u32).write_volatile(0);
+        ((request + 8) as *mut u32).write_volatile(streams);
+        ((request + 12) as *mut u32).write_volatile(PCM_INFO_BYTES);
+    }
+
+    // The reply is a status word followed by one record per stream.
+    let reply_bytes = 4 + streams * PCM_INFO_BYTES;
+    if u64::from(reply_bytes) > REQUEST_BYTES - DATA_OFFSET {
+        say(pid, &[b"sound reply would not fit the request buffer"]);
+        exit(47);
+    }
+
+    if !control_request(pid, queue, &region, 16, reply_bytes) {
+        say(pid, &[b"SOUND CONTROL REQUEST FAILED"]);
+        exit(48);
+    }
+
+    let reply = region.virt + DATA_OFFSET;
+    // SAFETY: the device just wrote this range, which is inside the buffer.
+    let status = unsafe { (reply as *const u32).read_volatile() };
+    if status != snd_code::STATUS_OK {
+        let mut buffer = [0u8; 18];
+        say(
+            pid,
+            &[
+                b"sound card refused the query: ",
+                hex(u64::from(status), &mut buffer),
+            ],
+        );
+        exit(49);
+    }
+
+    let mut outputs = 0u64;
+    let mut inputs = 0u64;
+    for index in 0..u64::from(streams) {
+        let record = reply + 4 + index * u64::from(PCM_INFO_BYTES);
+        // SAFETY: `record` is inside the reply the device just wrote, whose
+        // length was checked against the buffer above.
+        let direction = unsafe { ((record + PCM_INFO_DIRECTION) as *const u8).read_volatile() };
+        match direction {
+            snd_direction::OUTPUT => outputs += 1,
+            snd_direction::INPUT => inputs += 1,
+            _ => {}
+        }
+    }
+
+    let mut out_buffer = [0u8; 18];
+    let mut in_buffer = [0u8; 18];
+    say(
+        pid,
+        &[
+            b"audio ready: ",
+            hex(outputs, &mut out_buffer),
+            b" playback, ",
+            hex(inputs, &mut in_buffer),
+            b" capture (microphone)",
+        ],
+    );
+
+    if outputs == 0 {
+        say(pid, &[b"NO PLAYBACK STREAM"]);
+        exit(50);
+    }
+    if inputs == 0 {
+        say(pid, &[b"NO CAPTURE STREAM"]);
+        exit(51);
+    }
+}
+
+/// Sends a control request and waits for the reply.
+///
+/// Two descriptors rather than the block driver's three: a device-readable
+/// request and a device-writable reply. virtio-blk needs a third because its
+/// status byte is separate from its data; a sound control reply carries its own
+/// status as its first word.
+fn control_request(
+    pid: u64,
+    queue: &mut Queue,
+    region: &DmaRegion,
+    request_bytes: u32,
+    reply_bytes: u32,
+) -> bool {
+    use core::sync::atomic::{fence, Ordering};
+
+    // SAFETY: every address is inside this process's own DMA buffer or the
+    // device window it was granted.
+    unsafe {
+        // Poison the reply, so a device that writes nothing is distinguishable
+        // from one that answers OK.
+        ((region.virt + DATA_OFFSET) as *mut u32).write_volatile(0);
+
+        write_descriptor(
+            queue.desc,
+            0,
+            region.bus + HEADER_OFFSET,
+            request_bytes,
+            desc_flag::NEXT,
+            1,
+        );
+        write_descriptor(
+            queue.desc,
+            1,
+            region.bus + DATA_OFFSET,
+            reply_bytes,
+            desc_flag::WRITE,
+            0,
+        );
+
+        let slot = queue.next_avail % queue.size;
+        ((queue.avail + 4 + u64::from(slot) * 2) as *mut u16).write_volatile(0);
+        fence(Ordering::Release);
+        ((queue.avail + 2) as *mut u16).write_volatile(queue.next_avail.wrapping_add(1));
+        fence(Ordering::Release);
+
+        mmio_write16(queue.notify, snd_queue::CONTROL);
+
+        let mut spins = 0u64;
+        loop {
+            fence(Ordering::Acquire);
+            if ((queue.used + 2) as *const u16).read_volatile() != queue.last_used {
+                break;
+            }
+            spins += 1;
+            if spins > COMPLETION_SPINS {
+                say(pid, &[b"sound card never answered"]);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+
+        queue.next_avail = queue.next_avail.wrapping_add(1);
+        queue.last_used = ((queue.used + 2) as *const u16).read_volatile();
+    }
+    true
+}
+
+/// Resets a virtio device and walks it through the status handshake.
+///
+/// Shared by both drivers because it is entirely generic: nothing here knows
+/// whether it is talking to a disk or a sound card. `failure_base` is where this
+/// device's exit codes start, so a failure names which device it was.
+fn virtio_handshake(pid: u64, common: u64, failure_base: u64) -> bool {
+    // SAFETY: `common` is inside a device window this process was given.
+    unsafe {
+        mmio_write8(common + u64::from(common::DEVICE_STATUS), 0);
+        if mmio_read8(common + u64::from(common::DEVICE_STATUS)) != 0 {
+            say(pid, &[b"device did not accept a reset"]);
+            exit(failure_base);
+        }
+
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE,
+        );
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER,
+        );
+
+        mmio_write32(common + u64::from(common::DRIVER_FEATURE_SELECT), 0);
+        mmio_write32(common + u64::from(common::DRIVER_FEATURE), 0);
+        mmio_write32(
+            common + u64::from(common::DRIVER_FEATURE_SELECT),
+            FEATURE_VERSION_1_WORD,
+        );
+        mmio_write32(
+            common + u64::from(common::DRIVER_FEATURE),
+            FEATURE_VERSION_1_BIT,
+        );
+
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK,
+        );
+        if mmio_read8(common + u64::from(common::DEVICE_STATUS)) & status::FEATURES_OK == 0 {
+            say(pid, &[b"device rejected the negotiated features"]);
+            exit(failure_base + 1);
+        }
+    }
+    true
+}
+
+/// Builds one queue and hands its three ring addresses to the device.
 ///
 /// Returns `None` after reporting, for the failures that are worth continuing
 /// past — there is nothing else in this process that depends on the disk.
-fn setup_queue(pid: u64, common: u64, notify_base: u64, info: &DeviceInfo) -> Option<Queue> {
+fn setup_queue(
+    pid: u64,
+    common: u64,
+    notify_base: u64,
+    info: &DeviceInfo,
+    queue_index: u16,
+    failure_base: u64,
+) -> Option<Queue> {
     let mut region = DmaRegion::EMPTY;
     let size = core::mem::size_of::<DmaRegion>() as u64;
     if let Err(error) = call5(
@@ -644,12 +1041,12 @@ fn setup_queue(pid: u64, common: u64, notify_base: u64, info: &DeviceInfo) -> Op
         0,
     ) {
         say(pid, &[b"queue memory refused: ", error.name().as_bytes()]);
-        exit(30);
+        exit(failure_base);
     }
 
     // SAFETY: `common` is inside the device window this process was given.
     let (queue_size, notify_off) = unsafe {
-        mmio_write16(common + u64::from(common::QUEUE_SELECT), 0);
+        mmio_write16(common + u64::from(common::QUEUE_SELECT), queue_index);
         (
             mmio_read16(common + u64::from(common::QUEUE_SIZE)),
             mmio_read16(common + u64::from(common::QUEUE_NOTIFY_OFF)),
@@ -657,14 +1054,14 @@ fn setup_queue(pid: u64, common: u64, notify_base: u64, info: &DeviceInfo) -> Op
     };
 
     if queue_size == 0 {
-        say(pid, &[b"disk queue 0 does not exist"]);
-        exit(31);
+        say(pid, &[b"queue does not exist on this device"]);
+        exit(failure_base + 1);
     }
     // Three descriptors per request is the smallest chain virtio-blk allows, so
     // a queue shorter than that cannot carry even one.
     if queue_size < DESCRIPTORS_PER_REQUEST {
-        say(pid, &[b"disk queue is too short to hold one request"]);
-        exit(32);
+        say(pid, &[b"queue is too short to hold one request"]);
+        exit(failure_base + 2);
     }
     // The rings are sized by the queue, and the buffer is fixed. A device
     // offering a larger queue than the buffer can describe must be told a
@@ -706,7 +1103,7 @@ fn setup_queue(pid: u64, common: u64, notify_base: u64, info: &DeviceInfo) -> Op
     say(
         pid,
         &[
-            b"queue 0 armed, ",
+            b"queue armed, ",
             hex(u64::from(queue.size), &mut buffer),
             b" descriptors",
         ],

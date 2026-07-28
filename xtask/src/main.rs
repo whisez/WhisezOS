@@ -362,6 +362,18 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
     // against at length.
     let disk_device = "virtio-blk-pci,drive=vblk,disable-legacy=on,disable-modern=off";
 
+    // A sound card, on the same transport as the disk. `virtio-sound` rather
+    // than Intel HDA on purpose: HDA needs CORB/RIRB ring buffers and codec
+    // verbs, an entirely separate driver, while virtio-sound reuses the PCI
+    // enumeration, capability parsing, virtqueue, and DMA the block driver
+    // already proved. The device class differs; the transport does not.
+    //
+    // The backend is `none`: it accepts and discards samples at the right rate,
+    // which is what a headless boot test wants. A person running `boot-run`
+    // gets whatever their host offers by changing this one word.
+    let audio_backend = "none,id=snd0";
+    let sound_device = "virtio-sound-pci,audiodev=snd0";
+
     // Headless when capturing, windowed when a person is watching. The kernel
     // draws its console to the framebuffer as well as the serial port, so the
     // window is not decoration — it is the same log, on the display the
@@ -404,6 +416,10 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
             &disk_drive,
             "-device",
             disk_device,
+            "-audiodev",
+            audio_backend,
+            "-device",
+            sound_device,
             "-serial",
             &serial_arg,
             "-display",
@@ -552,7 +568,8 @@ const REQUIRED_LINES: &[&str] = &[
     // configuration structure, at an offset the kernel took out of PCI
     // capability space, and 0x8000 sectors of 512 bytes is exactly the 16 MiB
     // file this file attaches — a number neither side hardcodes twice.
-    "[kernel] virtio-blk is device 2",
+    "[kernel] virtio-block is device 2",
+    "[kernel] virtio-sound is device 3",
     "[init 1] disk ready from ring 3: 0x0000000000008000 sectors",
     // A virtqueue, and a real block transfer through it. The write-then-read
     // is what makes the comparison mean anything: the disk image is a fresh
@@ -560,8 +577,17 @@ const REQUIRED_LINES: &[&str] = &[
     // already held zeros. `verify_disk_pattern` then checks the host's copy of
     // the file, which is the one piece of evidence nothing inside the guest
     // could produce.
-    "[init 1] queue 0 armed",
+    "[init 1] queue armed",
     "[init 1] disk wrote and read back 512 bytes, verified",
+    // The same transport carrying a completely different device class. The
+    // sound card is enumerated over its control queue, and the counts come
+    // from the card rather than from this file — one playback stream and one
+    // capture stream is what QEMU's virtio-sound presents, and the driver has
+    // to ask to find that out.
+    "[init 1] sound card: 0x0000000000000002 pcm streams",
+    "[init 1] audio ready: 0x0000000000000001 playback, 0x0000000000000001 capture (microphone)",
+    "[init 2] no sound grant, as expected",
+    "[init 3] no sound grant, as expected",
     "[init 2] no disk grant, as expected",
     "[init 3] no disk grant, as expected",
     // And a process with no grant cannot wait on a line it was not given, which

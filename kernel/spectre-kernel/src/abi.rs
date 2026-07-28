@@ -119,6 +119,8 @@ pub enum DeviceKind {
     Ticker = 2,
     /// A virtio block device: a disk, reached through a mapped window.
     Block = 3,
+    /// A virtio sound device: playback and capture, same transport as the disk.
+    Sound = 4,
 }
 
 /// What `SYS_DEVICE_INFO` writes.
