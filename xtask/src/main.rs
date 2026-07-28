@@ -398,10 +398,15 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
     // enumeration, capability parsing, virtqueue, and DMA the block driver
     // already proved. The device class differs; the transport does not.
     //
-    // The backend is `none`: it accepts and discards samples at the right rate,
-    // which is what a headless boot test wants. A person running `boot-run`
-    // gets whatever their host offers by changing this one word.
-    let audio_backend = "none,id=snd0";
+    // `dsound` when a person is watching, `none` when nothing is. The `none`
+    // backend accepts and discards samples at the right rate, which is exactly
+    // what a headless test wants and exactly what somebody expecting to hear
+    // the boot sound does not.
+    let audio_backend = if windowed {
+        "dsound,id=snd0"
+    } else {
+        "none,id=snd0"
+    };
     let sound_device = "virtio-sound-pci,audiodev=snd0";
 
     // Headless when capturing, windowed when a person is watching. The kernel

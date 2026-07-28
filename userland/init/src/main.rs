@@ -33,6 +33,7 @@ mod font;
 /// the part most likely to be wrong in ways a person notices, and squinting at
 /// a screenshot is a poor way to find out.
 mod console;
+mod desktop;
 mod keymap;
 
 use abi::{
@@ -903,6 +904,7 @@ struct Pointer {
     packet: [u8; 3],
     have: usize,
     left: bool,
+    right: bool,
     /// The desktop the cursor is currently covering, and where it was taken
     /// from.
     ///
@@ -933,8 +935,19 @@ struct Screen {
 
 mod colour {
     /// `0x00RRGGBB`, matching the framebuffer's format.
-    pub const DESKTOP_TOP: u32 = 0x0006_0C1A;
+    pub const DESKTOP_TOP: u32 = 0x000A_1B33;
     pub const DESKTOP_BOTTOM: u32 = 0x0001_0308;
+    /// The wallpaper's scales, and the light that catches them.
+    // Quiet, deliberately. The first version of the wallpaper was loud enough
+    // to compete with the windows on top of it, which is the opposite of what
+    // a background is for — a pattern you notice is one you read instead of
+    // reading what is in front of it.
+    pub const SCALE_DARK: u32 = 0x000A_1A2C;
+    pub const SCALE_LIGHT: u32 = 0x000C_2036;
+    pub const ICON: u32 = 0x0018_3050;
+    pub const SELECTED: u32 = 0x0025_5A88;
+    pub const MENU: u32 = 0x0016_2440;
+    pub const ICON_EDGE: u32 = 0x0019_E6FF;
     pub const PANEL: u32 = 0x000C_1830;
     pub const ACCENT: u32 = 0x0019_E6FF;
     pub const TEXT: u32 = 0x00D8_E8F8;
@@ -1163,18 +1176,23 @@ fn session(grant: u64) -> ! {
     let mut extended = false;
     let mut modifiers = keymap::Modifiers::default();
     let mut shell = console::Console::new();
+    let mut face = desktop::Desktop::new();
+    let mut buttons = desktop::Buttons::default();
+    let mut pending_click: Option<(u64, u64, bool)> = None;
     shell.print(b"WhisezOS session. Type help.");
 
     // The disk, so `read` reads rather than reporting that it cannot. Failure
     // here is not fatal: a session without a disk is a session with one fewer
     // command, and exiting is the one thing it must not do.
     let mut disk = attach_disk(&mut shell, grant);
+    boot_sound(&mut shell, grant);
     let mut pointer = Pointer {
         x: (screen.width / 2) as i64,
         y: (screen.height / 2) as i64,
         packet: [0; 3],
         have: 0,
         left: false,
+        right: false,
         saved: [0; POINTER_SIZE * POINTER_SIZE],
         saved_at: None,
     };
@@ -1214,7 +1232,21 @@ fn session(grant: u64) -> ! {
                         let from_mouse = port_in(I8042_COMMAND) & i8042_status::FROM_MOUSE != 0;
                         let byte = port_in(I8042_DATA);
                         if from_mouse {
-                            pointer.feed(byte, &screen);
+                            // The edge is checked here, per packet, and not
+                            // after the drain. A press and its release arrive
+                            // in the same wake, so a check afterwards sees the
+                            // button already up and the click never happened —
+                            // which is exactly what it looked like.
+                            if pointer.feed(byte, &screen) {
+                                let (left, right) = buttons.edge(pointer.left, pointer.right);
+                                if left || right {
+                                    pending_click = Some((
+                                        pointer.x.max(0) as u64,
+                                        pointer.y.max(0) as u64,
+                                        right,
+                                    ));
+                                }
+                            }
                         } else if extended {
                             // The byte after the prefix is a different key from
                             // the same code without it, and none of them
@@ -1267,15 +1299,30 @@ fn session(grant: u64) -> ! {
             _ => {}
         }
 
+        // Acted on before anything is drawn, so the frame shows the result
+        // rather than the state before it.
+        //
+        // The click is recorded inside the drain above and consumed here.
+        // Recording it and never reading it is what the previous version did —
+        // the button reached the driver, the edge was detected, and nothing
+        // used the answer.
+        if let Some((x, y, right)) = pending_click.take() {
+            let click = face.press(x, y, right, screen.width, screen.height);
+            if act_on_click(click, &mut shell, &mut face, disk.as_mut(), grant, tick) {
+                painted = false;
+            }
+        }
+
         // SAFETY: `screen` describes the framebuffer window this process was
         // granted, and every draw below is clipped to its geometry.
         unsafe {
             if !painted {
                 painted = true;
-                draw_desktop(&screen);
+                draw_desktop(&screen, &face);
             }
             draw_status(&screen, tick, keys, &pointer);
             draw_shell(&screen, &shell);
+            draw_menu(&screen, &face);
             draw_sweep(&screen, tick);
             draw_pointer(&screen, &mut pointer);
         }
@@ -1336,21 +1383,22 @@ impl Pointer {
     /// — the only recovery is to notice the first byte is wrong and start
     /// again, which is what the check below does. Without it a single dropped
     /// byte turns every later packet into nonsense permanently.
-    fn feed(&mut self, byte: u8, screen: &Screen) {
+    fn feed(&mut self, byte: u8, screen: &Screen) -> bool {
         const ALWAYS_ONE: u8 = 1 << 3;
         const LEFT_BUTTON: u8 = 1 << 0;
+        const RIGHT_BUTTON: u8 = 1 << 1;
         const X_SIGN: u8 = 1 << 4;
         const Y_SIGN: u8 = 1 << 5;
         // Movement larger than this means the packet is not a packet.
         const OVERFLOW: u8 = (1 << 6) | (1 << 7);
 
         if self.have == 0 && (byte & ALWAYS_ONE == 0 || byte & OVERFLOW != 0) {
-            return;
+            return false;
         }
         self.packet[self.have] = byte;
         self.have += 1;
         if self.have < 3 {
-            return;
+            return false;
         }
         self.have = 0;
 
@@ -1368,16 +1416,133 @@ impl Pointer {
         }
 
         self.left = flags & LEFT_BUTTON != 0;
+        self.right = flags & RIGHT_BUTTON != 0;
         // The mouse's y grows upward and the screen's grows downward.
         self.x = (self.x + dx).clamp(0, screen.width as i64 - 1);
         self.y = (self.y - dy).clamp(0, screen.height as i64 - 1);
+        true
     }
 }
+/// A wallpaper, drawn rather than loaded.
+///
+/// The repository has a dragon in `assets/wallpapers`, and it is a PNG — which
+/// needs a decoder and a filesystem to read it from, and there is neither. So
+/// the pattern is generated: overlapping scales in two shades, laid out on a
+/// staggered grid the way they sit on an animal, fading as they go down so the
+/// screen has a light source.
+///
+/// It is a placeholder for the real thing and not a pretence at it. When there
+/// is a filesystem this is the code that gets deleted.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_wallpaper(screen: &Screen) {
+    const SCALE_W: u64 = 96;
+    const SCALE_H: u64 = 56;
+
+    let mut row = 0u64;
+    let mut y = PANEL_HEIGHT;
+    while y < screen.height {
+        // Every other row is offset by half a scale, which is what stops the
+        // pattern reading as a grid.
+        let offset = if row.is_multiple_of(2) {
+            0
+        } else {
+            SCALE_W / 2
+        };
+        let mut x = 0u64;
+        while x < screen.width + SCALE_W {
+            // Darker further down, so the light appears to come from above.
+            let depth = (y - PANEL_HEIGHT) * 100 / screen.height.max(1);
+            let base = if (x / SCALE_W + row).is_multiple_of(3) {
+                colour::SCALE_LIGHT
+            } else {
+                colour::SCALE_DARK
+            };
+            let shaded = fade(base, 100 - depth / 2);
+
+            // A scale: a rounded top and a flat body, drawn taller than the
+            // row spacing so each one overlaps the row above and only its top
+            // shows. Six rows of it read as a horizontal line rather than a
+            // scale, which is what the first version drew.
+            //
+            // The inset is quadratic, which at this size is indistinguishable
+            // from an arc and is two multiplications rather than a square root.
+            const ARC: u64 = 16;
+            for line in 0..SCALE_H + ARC {
+                let inset = if line < ARC {
+                    let from_top = ARC - line;
+                    (from_top * from_top * SCALE_W / 2) / (ARC * ARC)
+                } else {
+                    0
+                };
+                if inset * 2 >= SCALE_W {
+                    continue;
+                }
+                // SAFETY: the caller guarantees the window; `fill` clips.
+                unsafe {
+                    screen.fill(x + offset + inset, y + line, SCALE_W - inset * 2, 1, shaded);
+                }
+            }
+            x += SCALE_W;
+        }
+        y += SCALE_H;
+        row += 1;
+    }
+}
+
+/// Scales every channel of a colour by `percent`.
+fn fade(colour: u32, percent: u64) -> u32 {
+    let channel = |shift: u32| ((colour >> shift) & 0xFF) as u64 * percent / 100;
+    ((channel(16) as u32) << 16) | ((channel(8) as u32) << 8) | channel(0) as u32
+}
+
+/// Desktop icons.
+///
+/// They do nothing. Nothing can be clicked, because there is no process behind
+/// any of them and no protocol for one to register itself — that is what a
+/// window server is, and there is not one. They are here because a desktop with
+/// no icons is not a desktop, and because the layout is the part that has to be
+/// right before anything can be behind them.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
+    // The geometry comes from `desktop`, which is also what the hit test uses.
+    // Two copies of it would be two things that have to agree, and the way
+    // they stop agreeing is that clicks land next to what they look like they
+    // land on.
+    for (index, label) in desktop::ICON_LABELS.iter().enumerate() {
+        let (x, y) = desktop::Desktop::icon_at(index, screen.width);
+        let selected = face.selected == Some(index);
+        let body = if selected {
+            colour::SELECTED
+        } else {
+            colour::ICON
+        };
+
+        // SAFETY: the caller guarantees the window; every draw clips.
+        unsafe {
+            screen.fill(x, y, desktop::ICON_SIZE, desktop::ICON_SIZE, body);
+            // A lit top-left edge, which is the cheapest thing that stops a
+            // square looking painted on.
+            screen.fill(x, y, desktop::ICON_SIZE, 2, colour::ICON_EDGE);
+            screen.fill(x, y, 2, desktop::ICON_SIZE, colour::ICON_EDGE);
+            screen.text(
+                x,
+                y + desktop::ICON_SIZE + 6,
+                label,
+                if selected { colour::TEXT } else { colour::DIM },
+            );
+        }
+    }
+}
+
 /// Everything on the desktop that does not change.
 ///
 /// # Safety
 /// `screen` must describe a framebuffer window this process holds.
-unsafe fn draw_desktop(screen: &Screen) {
+unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop) {
     // SAFETY: the caller guarantees the window; every call clips to geometry.
     unsafe {
         screen.gradient(
@@ -1386,6 +1551,8 @@ unsafe fn draw_desktop(screen: &Screen) {
             colour::DESKTOP_TOP,
             colour::DESKTOP_BOTTOM,
         );
+        draw_wallpaper(screen);
+        draw_icons(screen, face);
 
         // The panel across the top, and what it says.
         screen.fill(0, 0, screen.width, PANEL_HEIGHT, colour::PANEL);
@@ -1646,6 +1813,87 @@ fn report_uptime(shell: &mut console::Console, tick: u64) {
     shell.print(&line[..at]);
 }
 
+/// Carries out what a click asked for. Returns whether the desktop underneath
+/// has to be repainted.
+///
+/// Every menu entry does something real. A menu whose items are greyed out or
+/// silently do nothing is worse than no menu: it tells somebody the system can
+/// do things it cannot.
+fn act_on_click(
+    click: desktop::Click,
+    shell: &mut console::Console,
+    face: &mut desktop::Desktop,
+    disk: Option<&mut Disk>,
+    grant: u64,
+    tick: u64,
+) -> bool {
+    match click {
+        desktop::Click::Select(index) => {
+            let mut line = [b' '; console::COLUMNS];
+            let prefix = b"selected ";
+            line[..prefix.len()].copy_from_slice(prefix);
+            let label = desktop::ICON_LABELS[index];
+            let take = label.len().min(console::COLUMNS - prefix.len());
+            line[prefix.len()..prefix.len() + take].copy_from_slice(&label[..take]);
+            shell.print(&line[..prefix.len() + take]);
+            // The highlight is part of the static layer, so it has to be
+            // repainted for the selection to appear.
+            true
+        }
+        // The menu is drawn over the desktop each frame; closing it leaves what
+        // it covered stale, so the layer underneath is painted again.
+        desktop::Click::CloseMenu => true,
+        desktop::Click::OpenMenu(_, _) => false,
+        desktop::Click::Menu(item) => {
+            match item {
+                0 => {
+                    shell.clear();
+                    shell.print(b"WhisezOS session. Type help.");
+                }
+                1 => {
+                    shell.print(b"0 framebuffer  1 ticker  2 keyboard");
+                    shell.print(b"3 mouse        4 disk    5 sound");
+                }
+                2 => read_sector(shell, disk, 0),
+                _ => {
+                    shell.print(b"shutting down");
+                    // An ordinary system call. It returns only if the machine
+                    // refused, which the kernel has already reported.
+                    let _ = call(SYS_SHUTDOWN, grant, 0);
+                    shell.print(b"the machine refused to power off");
+                }
+            }
+            let _ = tick;
+            face.selected = None;
+            true
+        }
+        desktop::Click::None => true,
+    }
+}
+
+/// The context menu, drawn over everything when it is open.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
+    let Some((x, y)) = face.menu else {
+        return;
+    };
+    let height = desktop::MENU_ITEM_HEIGHT * desktop::MENU_ITEMS.len() as u64;
+
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        screen.fill(x + 3, y + 3, desktop::MENU_WIDTH, height, colour::SHADOW);
+        screen.fill(x, y, desktop::MENU_WIDTH, height, colour::MENU);
+        screen.fill(x, y, desktop::MENU_WIDTH, 1, colour::ACCENT);
+
+        for (index, item) in desktop::MENU_ITEMS.iter().enumerate() {
+            let row = y + index as u64 * desktop::MENU_ITEM_HEIGHT;
+            screen.text(x + 10, row + 6, item, colour::TEXT);
+        }
+    }
+}
+
 /// Draws the shell's history and the line being typed.
 ///
 /// The whole text area is repainted each frame rather than tracked for damage.
@@ -1779,6 +2027,17 @@ mod snd_code {
     /// Enumerate PCM streams. The reply says how many there are, which way each
     /// one points, and what formats and rates it accepts.
     pub const PCM_INFO: u32 = 0x0100;
+    /// Fix a stream's rate, format, and buffer sizes. Must precede `PREPARE`.
+    pub const PCM_SET_PARAMS: u32 = 0x0101;
+    /// Allocate what the stream needs. Must precede `START`.
+    pub const PCM_PREPARE: u32 = 0x0102;
+    /// Begin consuming buffers from the transmit queue.
+    pub const PCM_START: u32 = 0x0104;
+    /// Stop. Named and unused: the boot sound plays once and the stream is
+    /// left running, because nothing else wants the card. It is here so the
+    /// next thing that does play has the number rather than looking it up.
+    #[allow(dead_code)]
+    pub const PCM_STOP: u32 = 0x0105;
     /// The device's answer when it accepted the request.
     pub const STATUS_OK: u32 = 0x8000;
 }
@@ -1797,6 +2056,29 @@ mod snd_config {
     pub const STREAMS: u64 = 4;
     pub const CHMAPS: u64 = 8;
 }
+
+/// PCM formats and rates, as the specification numbers them (virtio 1.2
+/// §5.14.6.6.4). Signed 16-bit at 44.1 kHz: what every sound card has accepted
+/// since 1990, and the narrowest thing that is safe to assume.
+const PCM_FORMAT_S16: u8 = 5;
+const PCM_RATE_44100: u8 = 6;
+
+/// Samples per second, matching `PCM_RATE_44100`.
+const SAMPLE_RATE: u32 = 44_100;
+/// One channel. A boot sound in stereo would be the same samples twice.
+const CHANNELS: u8 = 1;
+/// Bytes per sample, matching `PCM_FORMAT_S16`.
+const SAMPLE_BYTES: u32 = 2;
+
+/// How long the boot sound lasts, and therefore how much memory it needs.
+///
+/// Eight tenths of a second at 44.1 kHz mono is about 70 KB, which fits in one
+/// DMA buffer with room to spare. Longer would need the sound split into
+/// periods and fed as the device consumes them, which is the right design for
+/// music and unnecessary for a noise that plays once.
+const SOUND_MILLIS: u32 = 800;
+const SOUND_SAMPLES: u32 = SAMPLE_RATE * SOUND_MILLIS / 1000;
+const SOUND_BYTES: u32 = SOUND_SAMPLES * SAMPLE_BYTES;
 
 /// Bytes in one `virtio_snd_pcm_info` (virtio 1.2 §5.14.6.6.3).
 const PCM_INFO_BYTES: u32 = 32;
@@ -1919,6 +2201,394 @@ fn probe_sound(pid: u64, grant: u64) {
     }
 
     enumerate_streams(pid, &mut queue, streams.min(MAX_STREAMS));
+}
+
+/// Brings the sound card up and plays the boot sound, once.
+///
+/// Failure is reported and carried on from. A session without sound is a
+/// quieter session; a session that exits is a machine that looks dead.
+fn boot_sound(shell: &mut console::Console, grant: u64) {
+    let pid = SESSION_ROLE;
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+    if call5(
+        SYS_DEVICE_INFO,
+        grant,
+        SOUND_DEVICE,
+        (&raw mut info) as u64,
+        size,
+        0,
+    )
+    .is_err()
+        || info.kind != DeviceKind::Sound as u32
+    {
+        shell.print(b"no sound card; starting quietly");
+        return;
+    }
+
+    let Ok(window) = call(SYS_MAP_DEVICE, grant, SOUND_DEVICE) else {
+        shell.print(b"could not map the sound card");
+        return;
+    };
+    let common = window + u64::from(info.common_offset);
+    let notify = window + u64::from(info.notify_offset);
+    let config = window + u64::from(info.config_offset);
+
+    if !virtio_handshake(pid, common, 70) {
+        return;
+    }
+
+    // How many streams there actually are. Asking for more than exist is
+    // refused outright rather than answered with the ones that do — the first
+    // attempt asked for eight against a card with two and was told the message
+    // was bad, which looked exactly like a card with no playback at all.
+    // SAFETY: `config` is inside the device window this process was granted.
+    let streams = unsafe { mmio_read32(config + snd_config::STREAMS) };
+    if streams == 0 {
+        shell.print(b"the sound card reports no streams");
+        return;
+    }
+
+    // The control queue, then the transmit queue. Both before `DRIVER_OK`,
+    // because a device told the driver is ready may look at any queue that has
+    // been enabled and none that has not.
+    let Some(mut control) = setup_queue(pid, common, notify, &info, snd_queue::CONTROL, 72) else {
+        return;
+    };
+    let Some(mut transmit) = setup_queue(pid, common, notify, &info, snd_queue::TX, 75) else {
+        return;
+    };
+
+    // SAFETY: both queues exist, so the device may be told the driver is ready.
+    unsafe {
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+    }
+
+    let mut request = DmaRegion::EMPTY;
+    let bytes = core::mem::size_of::<DmaRegion>() as u64;
+    if call5(
+        SYS_ALLOC_DMA,
+        REQUEST_BYTES,
+        (&raw mut request) as u64,
+        bytes,
+        0,
+        0,
+    )
+    .is_err()
+    {
+        shell.print(b"no memory for sound control");
+        return;
+    }
+
+    // Which stream plays. Asked rather than assumed: a card with capture on
+    // stream zero and playback on stream one is legal, and guessing would
+    // record instead of play.
+    let Some(stream) = first_output_stream(pid, &mut control, &request, streams) else {
+        shell.print(b"the sound card has no playback stream");
+        return;
+    };
+
+    if !play_boot_sound(pid, &mut control, &request, stream) {
+        return;
+    }
+
+    let mut audio = DmaRegion::EMPTY;
+    if call5(
+        SYS_ALLOC_DMA,
+        u64::from(SOUND_BYTES) + 64,
+        (&raw mut audio) as u64,
+        bytes,
+        0,
+        0,
+    )
+    .is_err()
+    {
+        shell.print(b"no memory for the sound itself");
+        return;
+    }
+
+    // The transfer: a header the device reads, the samples it reads, and a
+    // status it writes. Laid out in one buffer with the samples after the
+    // header, so the whole thing is one allocation.
+    let header = audio.virt;
+    let samples = audio.virt + 8;
+    // SAFETY: the buffer is this process's own, and large enough by the size
+    // asked for above.
+    unsafe {
+        (header as *mut u32).write_volatile(stream);
+        ((header + 4) as *mut u32).write_volatile(0);
+    }
+    write_boot_sound(samples);
+
+    if submit_audio(pid, &mut transmit, &audio, SOUND_BYTES) {
+        shell.print(b"boot sound playing");
+    } else {
+        shell.print(b"the sound card took the buffer but did not answer");
+    }
+}
+
+/// Asks the card which stream plays, rather than assuming stream zero does.
+fn first_output_stream(
+    pid: u64,
+    queue: &mut Queue,
+    region: &DmaRegion,
+    streams: u32,
+) -> Option<u32> {
+    let streams = streams.min(MAX_STREAMS);
+    let request = region.virt + HEADER_OFFSET;
+    // SAFETY: the DMA buffer is this process's own.
+    unsafe {
+        (request as *mut u32).write_volatile(snd_code::PCM_INFO);
+        ((request + 4) as *mut u32).write_volatile(0);
+        ((request + 8) as *mut u32).write_volatile(streams);
+        ((request + 12) as *mut u32).write_volatile(PCM_INFO_BYTES);
+    }
+
+    let reply_bytes = 4 + streams * PCM_INFO_BYTES;
+    if !control_request(pid, queue, region, 16, reply_bytes) {
+        return None;
+    }
+
+    let reply = region.virt + DATA_OFFSET;
+    // SAFETY: the device just wrote the reply.
+    if unsafe { (reply as *const u32).read_volatile() } != snd_code::STATUS_OK {
+        return None;
+    }
+
+    for index in 0..streams {
+        let record = reply + 4 + u64::from(index) * u64::from(PCM_INFO_BYTES);
+        // SAFETY: inside the reply, whose length was fixed above.
+        let direction = unsafe { ((record + PCM_INFO_DIRECTION) as *const u8).read_volatile() };
+        if direction == snd_direction::OUTPUT {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Hands one buffer of samples to the device and waits for it to be consumed.
+fn submit_audio(pid: u64, queue: &mut Queue, region: &DmaRegion, bytes: u32) -> bool {
+    use core::sync::atomic::{fence, Ordering};
+
+    // The status word goes after the samples, so the three descriptors cover
+    // one contiguous allocation.
+    let status_at = 8 + u64::from(bytes);
+
+    // SAFETY: every address is inside this process's own DMA buffer, and the
+    // notification address is in the device window it was granted.
+    unsafe {
+        ((region.virt + status_at) as *mut u32).write_volatile(0xFFFF_FFFF);
+
+        write_descriptor(queue.desc, 0, region.bus, 8, desc_flag::NEXT, 1);
+        write_descriptor(queue.desc, 1, region.bus + 8, bytes, desc_flag::NEXT, 2);
+        write_descriptor(
+            queue.desc,
+            2,
+            region.bus + status_at,
+            8,
+            desc_flag::WRITE,
+            0,
+        );
+
+        let slot = queue.next_avail % queue.size;
+        ((queue.avail + 4 + u64::from(slot) * 2) as *mut u16).write_volatile(0);
+        fence(Ordering::Release);
+        ((queue.avail + 2) as *mut u16).write_volatile(queue.next_avail.wrapping_add(1));
+        fence(Ordering::Release);
+
+        mmio_write16(queue.notify, snd_queue::TX);
+
+        // The device holds the buffer for as long as the sound lasts, so this
+        // waits about a second rather than microseconds — the bound is what
+        // separates a slow device from one that never answers.
+        let mut spins = 0u64;
+        loop {
+            fence(Ordering::Acquire);
+            if ((queue.used + 2) as *const u16).read_volatile() != queue.last_used {
+                break;
+            }
+            spins += 1;
+            if spins > COMPLETION_SPINS * 4 {
+                say(pid, &[b"the sound card never returned the buffer"]);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+
+        queue.next_avail = queue.next_avail.wrapping_add(1);
+        queue.last_used = ((queue.used + 2) as *const u16).read_volatile();
+        ((region.virt + status_at) as *const u32).read_volatile() == snd_code::STATUS_OK
+    }
+}
+
+/// Sends one PCM control request and checks the device accepted it.
+///
+/// Every one of these is the same shape: a code, a stream id, sometimes a few
+/// more fields, and a status word back. Writing them out separately would be
+/// four copies of the same twenty lines.
+fn pcm_control(
+    pid: u64,
+    queue: &mut Queue,
+    region: &DmaRegion,
+    code: u32,
+    stream: u32,
+    extra: &[u32],
+) -> bool {
+    let request = region.virt + HEADER_OFFSET;
+    // SAFETY: the DMA buffer is this process's own, mapped writable.
+    unsafe {
+        (request as *mut u32).write_volatile(code);
+        ((request + 4) as *mut u32).write_volatile(stream);
+        for (index, value) in extra.iter().enumerate() {
+            ((request + 8 + index as u64 * 4) as *mut u32).write_volatile(*value);
+        }
+    }
+
+    let length = 8 + extra.len() as u32 * 4;
+    if !control_request(pid, queue, region, length, 4) {
+        return false;
+    }
+
+    // SAFETY: the device just wrote the reply into the same buffer.
+    let status = unsafe { ((region.virt + DATA_OFFSET) as *const u32).read_volatile() };
+    status == snd_code::STATUS_OK
+}
+
+/// Configures stream zero and plays the boot sound through it.
+///
+/// # Why the sound is one buffer and not a stream of periods
+///
+/// A media player feeds the device a period at a time and refills as it
+/// consumes them, because the sound is longer than memory. This one is eight
+/// tenths of a second — about seventy kilobytes — so it goes in whole, and the
+/// device is told the period is the whole thing. The machinery for the other
+/// case belongs with the first thing that needs it.
+fn play_boot_sound(pid: u64, queue: &mut Queue, region: &DmaRegion, stream: u32) -> bool {
+    // Parameters first: the device rejects `PREPARE` on a stream whose format
+    // it has not been told.
+    let params = [
+        SOUND_BYTES,
+        SOUND_BYTES,
+        0,
+        u32::from(CHANNELS) | u32::from(PCM_FORMAT_S16) << 8 | u32::from(PCM_RATE_44100) << 16,
+    ];
+    if !pcm_control(
+        pid,
+        queue,
+        region,
+        snd_code::PCM_SET_PARAMS,
+        stream,
+        &params,
+    ) {
+        say(pid, &[b"sound card refused the stream parameters"]);
+        return false;
+    }
+    if !pcm_control(pid, queue, region, snd_code::PCM_PREPARE, stream, &[]) {
+        say(pid, &[b"sound card refused to prepare the stream"]);
+        return false;
+    }
+    if !pcm_control(pid, queue, region, snd_code::PCM_START, stream, &[]) {
+        say(pid, &[b"sound card refused to start the stream"]);
+        return false;
+    }
+    true
+}
+
+/// Writes the boot sound into a buffer, as signed 16-bit mono samples.
+///
+/// # A roar, within what integer arithmetic can do
+///
+/// There is no floating point here — the target is built `+soft-float, -sse`,
+/// so every `sin` would be a software routine called forty-four thousand times
+/// a second. So the waveform is built from integers: a sawtooth whose period
+/// falls from about 110 Hz to about 55 Hz, which is a descending growl, with a
+/// second sawtooth an octave above at a third the amplitude to give it some
+/// rasp, and a slow tremolo so it is not a flat drone.
+///
+/// A sawtooth rather than a sine because a sawtooth is one subtraction per
+/// sample and is harmonically rich, which is what makes a growl sound like an
+/// animal rather than a test tone. The envelope fades in over the first tenth
+/// and out over the last third, because a waveform that starts and stops at
+/// full amplitude produces a click at each end — and the click is louder than
+/// the sound.
+fn write_boot_sound(buffer: u64) {
+    // Period in samples, from low-A to an octave below it. Computed per sample
+    // rather than per cycle so the pitch slides continuously.
+    const START_PERIOD: u32 = SAMPLE_RATE / 110;
+    const END_PERIOD: u32 = SAMPLE_RATE / 55;
+
+    let mut phase = 0u32;
+    let mut phase_high = 0u32;
+
+    for index in 0..SOUND_SAMPLES {
+        // The slide, linear in period across the whole sound.
+        let period = START_PERIOD + (END_PERIOD - START_PERIOD) * index / SOUND_SAMPLES;
+        let period_high = period / 2;
+
+        phase = if phase + 1 >= period { 0 } else { phase + 1 };
+        phase_high = if phase_high + 1 >= period_high.max(1) {
+            0
+        } else {
+            phase_high + 1
+        };
+
+        // Sawtooth: the phase mapped to the full signed range, then centred.
+        let low =
+            (phase as i32 * 2 * i32::from(i16::MAX) / period.max(1) as i32) - i32::from(i16::MAX);
+        let high = (phase_high as i32 * 2 * i32::from(i16::MAX) / period_high.max(1) as i32)
+            - i32::from(i16::MAX);
+
+        // Tremolo: amplitude wobbles about eight times a second, between two
+        // thirds and full. A triangle rather than a sine, for the same reason
+        // as the sawtooth.
+        let wobble_period = SAMPLE_RATE / 8;
+        let wobble = index % wobble_period;
+        let wobble = if wobble * 2 < wobble_period {
+            wobble * 2
+        } else {
+            wobble_period * 2 - wobble * 2
+        };
+        let tremolo = 170 + (wobble * 85 / wobble_period.max(1)) as i32;
+
+        // Envelope. In over the first tenth, out over the last third — a
+        // waveform that starts at full amplitude clicks, and the click is
+        // louder than the sound.
+        let fade_in = SOUND_SAMPLES / 10;
+        let fade_out = SOUND_SAMPLES / 3;
+        let envelope = if index < fade_in {
+            index * 255 / fade_in.max(1)
+        } else if index > SOUND_SAMPLES - fade_out {
+            (SOUND_SAMPLES - index) * 255 / fade_out.max(1)
+        } else {
+            255
+        } as i32;
+
+        // Mixed at two thirds and one third, then scaled by envelope and
+        // tremolo.
+        //
+        // Multiply before dividing. The first version was
+        // `mixed / 255 * envelope / 255 * tremolo / 255`, which divides a
+        // ±16000 sample down to ±64 before it scales anything and throws the
+        // remainder away three times over. It produced a waveform at about two
+        // tenths of one percent of full scale — the device accepted it, the
+        // status came back OK, and nothing was audible. Silence is the one
+        // failure that looks identical to a driver that is not working at all.
+        //
+        // `mixed * envelope` reaches about 4.2 million, which is comfortably
+        // inside `i32`, so the order costs nothing.
+        let mixed = (low * 2 / 3 + high / 3) / 2;
+        let sample = mixed * envelope / 255 * tremolo / 255;
+        let sample = sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+
+        // SAFETY: `buffer` is a DMA buffer this process owns, and `index` is
+        // bounded by the sample count the buffer was sized from.
+        unsafe {
+            ((buffer + u64::from(index) * 2) as *mut i16).write_volatile(sample);
+        }
+    }
 }
 
 /// Asks the card about each PCM stream and reports which way they point.

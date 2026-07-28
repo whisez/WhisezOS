@@ -125,6 +125,9 @@ pub mod pci;
 #[path = "../../kernel/spectre-kernel/src/portauth.rs"]
 pub mod portauth;
 
+#[path = "../../userland/init/src/desktop.rs"]
+pub mod desktop;
+
 #[path = "../../userland/init/src/console.rs"]
 pub mod console;
 
