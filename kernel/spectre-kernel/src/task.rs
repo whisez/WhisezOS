@@ -36,6 +36,11 @@ use crate::usercopy::UserRegion;
 /// enough that the table is a plain array in `.bss`.
 pub const MAX_PROCESSES: usize = 4;
 
+// A task manager that can only describe some of the table describes a machine
+// that is not the one running. If the table grows, this fails to compile rather
+// than quietly truncating.
+const _: () = assert!(MAX_PROCESSES <= crate::abi::MAX_TASK_ENTRIES);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Slot unused.
@@ -459,6 +464,41 @@ pub fn wake(pid: u64, result: u64) -> bool {
 
 /// Whether a pid names a live process.
 #[must_use]
+/// The live processes, for a task manager.
+///
+/// Live only: an empty slot is not a process, and an exited one waiting to be
+/// reaped is a bookkeeping detail rather than something running. Nothing here
+/// can be used to reach another process — the point is to be able to see what
+/// the machine is doing without being able to do anything to it.
+pub fn list() -> crate::abi::TaskList {
+    let table = TABLE.lock();
+    let mut out = crate::abi::TaskList {
+        count: 0,
+        ticks: table.ticks,
+        switches: table.switches,
+        entries: [crate::abi::TaskEntry::EMPTY; crate::abi::MAX_TASK_ENTRIES],
+    };
+    for process in table.slots.iter() {
+        if !process.state.is_live() {
+            continue;
+        }
+        out.entries[out.count as usize] = crate::abi::TaskEntry {
+            pid: process.pid,
+            state: match process.state {
+                State::Empty => crate::abi::task_state::EMPTY,
+                State::Ready => crate::abi::task_state::READY,
+                State::Running => crate::abi::task_state::RUNNING,
+                State::Blocked => crate::abi::task_state::BLOCKED,
+                State::Exited => crate::abi::task_state::EXITED,
+            },
+            dma_regions: process.dma_regions,
+            devices_mapped: process.devices_mapped,
+        };
+        out.count += 1;
+    }
+    out
+}
+
 pub fn is_live(pid: u64) -> bool {
     TABLE
         .lock()

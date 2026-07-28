@@ -165,6 +165,84 @@ pub enum DeviceKind {
     Mouse = 6,
 }
 
+/// `SYS_TASK_LIST(buffer, capacity) -> bytes written`.
+///
+/// The only call that describes something other than the caller. It is
+/// deliberately read-only and deliberately says nothing a process could use to
+/// reach another one: no address space, no register state, no capability list —
+/// a task manager needs to show what is running, not to touch it.
+pub const SYS_TASK_LIST: u64 = 14;
+
+/// Entries `SYS_TASK_LIST` can return. Matches the kernel's process table; a
+/// const assertion beside that table keeps the two from drifting apart.
+pub const MAX_TASK_ENTRIES: usize = 4;
+
+/// State codes, in the order the kernel's `State` declares them.
+pub mod task_state {
+    pub const EMPTY: u64 = 0;
+    pub const READY: u64 = 1;
+    pub const RUNNING: u64 = 2;
+    pub const BLOCKED: u64 = 3;
+    pub const EXITED: u64 = 4;
+}
+
+/// What to call a state code. Here rather than in the task manager so that a
+/// state added to the kernel cannot be displayed under an older name.
+#[must_use]
+pub const fn task_state_name(code: u64) -> &'static [u8] {
+    match code {
+        task_state::EMPTY => b"EMPTY",
+        task_state::READY => b"READY",
+        task_state::RUNNING => b"RUNNING",
+        task_state::BLOCKED => b"BLOCKED",
+        task_state::EXITED => b"EXITED",
+        _ => b"UNKNOWN",
+    }
+}
+
+/// One live process, as a task manager sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct TaskEntry {
+    pub pid: u64,
+    pub state: u64,
+    pub dma_regions: u64,
+    pub devices_mapped: u64,
+}
+
+impl TaskEntry {
+    pub const EMPTY: Self = Self {
+        pid: 0,
+        state: task_state::EMPTY,
+        dma_regions: 0,
+        devices_mapped: 0,
+    };
+}
+
+/// What `SYS_TASK_LIST` writes.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct TaskList {
+    /// How many entries are filled. Empty slots are not returned: a table with
+    /// four rows of which two say EMPTY reads as two dead processes.
+    pub count: u64,
+    /// Timer ticks the kernel has seen, and context switches it has made. Two
+    /// numbers that prove the scheduler is still working, which is most of what
+    /// a task manager is for.
+    pub ticks: u64,
+    pub switches: u64,
+    pub entries: [TaskEntry; MAX_TASK_ENTRIES],
+}
+
+impl TaskList {
+    pub const EMPTY: Self = Self {
+        count: 0,
+        ticks: 0,
+        switches: 0,
+        entries: [TaskEntry::EMPTY; MAX_TASK_ENTRIES],
+    };
+}
+
 /// What `SYS_DEVICE_INFO` writes.
 ///
 /// This lives in `abi.rs` rather than beside the device table for the same

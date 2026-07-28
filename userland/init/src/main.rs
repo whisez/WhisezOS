@@ -40,7 +40,7 @@ use abi::{
     decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
     SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_CLAIM,
     SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
-    SYS_SHUTDOWN,
+    SYS_SHUTDOWN, SYS_TASK_LIST,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -964,10 +964,10 @@ const PANEL_HEIGHT: u64 = 32;
 const TEXT_SCALE: u64 = 2;
 
 /// Where the shell window sits, and how much of it is text.
-const SHELL_X: u64 = 80;
-const SHELL_Y: u64 = 430;
-const SHELL_W: u64 = 1120;
-const SHELL_H: u64 = 330;
+const SHELL_X: u64 = desktop::bounds(desktop::Window::Shell).0;
+const SHELL_Y: u64 = desktop::bounds(desktop::Window::Shell).1;
+const SHELL_W: u64 = desktop::bounds(desktop::Window::Shell).2;
+
 /// Inside the frame, below the title bar.
 const SHELL_TEXT_X: u64 = SHELL_X + 12;
 const SHELL_TEXT_Y: u64 = SHELL_Y + 34;
@@ -1067,12 +1067,27 @@ impl Screen {
     ///
     /// # Safety
     /// As `put`.
-    unsafe fn window(&self, x: u64, y: u64, w: u64, h: u64, title: &[u8], focused: bool) {
+    unsafe fn window(&self, which: desktop::Window, title: &[u8], focused: bool) {
+        let (x, y, w, h) = desktop::bounds(which);
+        let (cx, cy) = desktop::close_at(which);
         // SAFETY: as `put`.
         unsafe {
             self.fill(x + 4, y + 4, w, h, colour::SHADOW);
             self.fill(x, y, w, h, colour::WINDOW);
-            self.fill(x, y, w, 24, colour::WINDOW_BAR);
+            self.fill(x, y, w, desktop::TITLE_HEIGHT, colour::WINDOW_BAR);
+            // The close box: a square with a cross in it, drawn from the same
+            // constants the hit test reads.
+            self.fill(
+                cx,
+                cy,
+                desktop::CLOSE_SIZE,
+                desktop::CLOSE_SIZE,
+                colour::SHADOW,
+            );
+            for step in 3..desktop::CLOSE_SIZE - 3 {
+                self.put(cx + step, cy + step, colour::TEXT);
+                self.put(cx + desktop::CLOSE_SIZE - 1 - step, cy + step, colour::TEXT);
+            }
             // The focused window is the one with the accent stripe. One bit of
             // state, drawn rather than described.
             if focused {
@@ -1179,6 +1194,8 @@ fn session(grant: u64) -> ! {
     let mut face = desktop::Desktop::new();
     let mut buttons = desktop::Buttons::default();
     let mut pending_click: Option<(u64, u64, bool)> = None;
+    let mut last_tasks = u64::MAX;
+
     shell.print(b"WhisezOS session. Type help.");
 
     // The disk, so `read` reads rather than reporting that it cannot. Failure
@@ -1237,6 +1254,7 @@ fn session(grant: u64) -> ! {
                             // in the same wake, so a check afterwards sees the
                             // button already up and the click never happened —
                             // which is exactly what it looked like.
+
                             if pointer.feed(byte, &screen) {
                                 let (left, right) = buttons.edge(pointer.left, pointer.right);
                                 if left || right {
@@ -1321,7 +1339,16 @@ fn session(grant: u64) -> ! {
                 draw_desktop(&screen, &face);
             }
             draw_status(&screen, tick, keys, &pointer);
-            draw_shell(&screen, &shell);
+            // Once a second rather than every tick. The states do change that
+            // fast, but a table redrawn sixty-four times a second is unreadable
+            // and costs more than it tells anybody.
+            if face.is_open(desktop::Window::Tasks) && tick / 64 != last_tasks {
+                last_tasks = tick / 64;
+                draw_tasks(&screen);
+            }
+            if face.is_open(desktop::Window::Shell) {
+                draw_shell(&screen, &shell);
+            }
             draw_menu(&screen, &face);
             draw_sweep(&screen, tick);
             draw_pointer(&screen, &mut pointer);
@@ -1329,6 +1356,22 @@ fn session(grant: u64) -> ! {
 
         if !reported && tick >= 3 {
             reported = true;
+            // Asked once here as well as by the task manager. The window is opened by a
+            // click, and the boot test has no hands: without this the only proof the
+            // call works would be a screenshot somebody remembered to take.
+            {
+                let mut list = abi::TaskList::EMPTY;
+                let size = core::mem::size_of::<abi::TaskList>() as u64;
+                match call(SYS_TASK_LIST, (&raw mut list) as u64, size) {
+                    Ok(_) => {
+                        let mut count = *b"0";
+                        count[0] = b'0' + (list.count % 10) as u8;
+                        say(pid, &[b"live processes: ", &count]);
+                    }
+                    Err(error) => say(pid, &[b"task list refused: ", error.name().as_bytes()]),
+                }
+            }
+
             say(pid, &[b"session is drawing the desktop"]);
         }
     }
@@ -1569,21 +1612,22 @@ unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop) {
         // Two windows. They do not do anything — there is no process behind
         // either — and they are drawn from the same geometry a real one would
         // have, so that when there is, this is the code that already worked.
-        screen.window(80, 90, 520, 300, b"DEVICES", true);
-        screen.text(96, 130, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
-        screen.text(96, 154, b"AUDIO   VIRTIO-SND  1 OUT 1 IN", colour::DIM);
-        screen.text(96, 178, b"CLOCK   RTC         64 HZ", colour::DIM);
-        screen.text(96, 202, b"DISPLAY FRAMEBUFFER 1280X800", colour::DIM);
-        screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
+        if face.is_open(desktop::Window::Devices) {
+            screen.window(desktop::Window::Devices, b"DEVICES", true);
+            screen.text(96, 130, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
+            screen.text(96, 154, b"AUDIO   VIRTIO-SND  1 OUT 1 IN", colour::DIM);
+            screen.text(96, 178, b"CLOCK   RTC         64 HZ", colour::DIM);
+            screen.text(96, 202, b"DISPLAY FRAMEBUFFER 1280X800", colour::DIM);
+            screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
+        }
 
-        screen.window(
-            SHELL_X,
-            SHELL_Y,
-            SHELL_W,
-            SHELL_H,
-            b"SHELL - TYPE HELP",
-            false,
-        );
+        if face.is_open(desktop::Window::Tasks) {
+            screen.window(desktop::Window::Tasks, b"TASK MANAGER", false);
+        }
+        if face.is_open(desktop::Window::Shell) {
+            screen.window(desktop::Window::Shell, b"SHELL", false);
+        }
+        draw_taskbar(screen, face);
     }
 }
 
@@ -1847,14 +1891,18 @@ fn act_on_click(
         desktop::Click::Menu(item) => {
             match item {
                 0 => {
-                    shell.clear();
-                    shell.print(b"WhisezOS session. Type help.");
+                    face.open(desktop::Window::Shell);
                 }
                 1 => {
-                    shell.print(b"0 framebuffer  1 ticker  2 keyboard");
-                    shell.print(b"3 mouse        4 disk    5 sound");
+                    face.open(desktop::Window::Devices);
                 }
-                2 => read_sector(shell, disk, 0),
+                2 => {
+                    face.open(desktop::Window::Tasks);
+                }
+                3 => {
+                    face.open(desktop::Window::Shell);
+                    read_sector(shell, disk, 0);
+                }
                 _ => {
                     shell.print(b"shutting down");
                     // An ordinary system call. It returns only if the machine
@@ -1867,7 +1915,94 @@ fn act_on_click(
             face.selected = None;
             true
         }
+        // Opening or closing a window changes what the static layer holds.
+        desktop::Click::Open(_) | desktop::Click::Close(_) => true,
         desktop::Click::None => true,
+    }
+}
+
+/// The task manager's rows: what the kernel says is running.
+///
+/// Read from the kernel on every draw rather than kept and updated, because a
+/// process list assembled from what this process remembers is a list of what it
+/// noticed, and the thing worth knowing about a scheduler is what it is doing
+/// now.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_tasks(screen: &Screen) {
+    let (x, y, w, h) = desktop::bounds(desktop::Window::Tasks);
+    let mut list = abi::TaskList::EMPTY;
+    let size = core::mem::size_of::<abi::TaskList>() as u64;
+    let ok = call(SYS_TASK_LIST, (&raw mut list) as u64, size).is_ok();
+
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        // The body below the title bar, so old rows do not show through new
+        // ones. Glyphs are set pixels only.
+        screen.fill(
+            x + 1,
+            y + desktop::TITLE_HEIGHT,
+            w - 2,
+            h - desktop::TITLE_HEIGHT - 1,
+            colour::WINDOW,
+        );
+        if !ok {
+            screen.text(x + 16, y + 44, b"THE KERNEL REFUSED THE LIST", colour::DIM);
+            return;
+        }
+
+        screen.text(x + 16, y + 44, desktop::TASK_HEADER, colour::ACCENT);
+        for (row, entry) in list.entries[..list.count as usize].iter().enumerate() {
+            let line = desktop::task_row(
+                entry.pid,
+                abi::task_state_name(entry.state),
+                entry.dma_regions,
+                entry.devices_mapped,
+            );
+            screen.text(x + 16, y + 70 + row as u64 * 20, &line, colour::TEXT);
+        }
+
+        let mut totals = *b"TICKS 0000000  SWITCHES 0000000";
+        desktop::write_number(&mut totals[6..13], list.ticks);
+        desktop::write_number(&mut totals[24..31], list.switches);
+        screen.text(x + 16, y + h - 44, &totals, colour::DIM);
+    }
+}
+
+/// The bar across the bottom: what is open, and the clock.
+///
+/// Part of the static layer, because it changes only when a window opens or
+/// closes — and both of those already repaint it.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop) {
+    let top = screen.height.saturating_sub(desktop::TASKBAR_HEIGHT);
+
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        screen.fill(0, top, screen.width, desktop::TASKBAR_HEIGHT, colour::PANEL);
+        screen.fill(0, top, screen.width, 1, colour::ACCENT);
+        screen.text(12, top + 10, b"WHISEZOS", colour::ACCENT);
+
+        // One button per open window. An empty taskbar is the honest picture of
+        // a desktop with nothing running, which is what this is until a process
+        // can create a window of its own.
+        let mut x = 130u64;
+        for (window, label) in [
+            (desktop::Window::Shell, b"SHELL   ".as_slice()),
+            (desktop::Window::Devices, b"DEVICES ".as_slice()),
+            (desktop::Window::Tasks, b"TASKS   ".as_slice()),
+        ] {
+            if !face.is_open(window) {
+                continue;
+            }
+            screen.fill(x, top + 5, 130, desktop::TASKBAR_HEIGHT - 10, colour::ICON);
+            screen.fill(x, top + 5, 2, desktop::TASKBAR_HEIGHT - 10, colour::ACCENT);
+            screen.text(x + 10, top + 10, label, colour::TEXT);
+            x += 142;
+        }
     }
 }
 
@@ -2033,10 +2168,9 @@ mod snd_code {
     pub const PCM_PREPARE: u32 = 0x0102;
     /// Begin consuming buffers from the transmit queue.
     pub const PCM_START: u32 = 0x0104;
-    /// Stop. Named and unused: the boot sound plays once and the stream is
-    /// left running, because nothing else wants the card. It is here so the
-    /// next thing that does play has the number rather than looking it up.
-    #[allow(dead_code)]
+    /// Stop. Sent as soon as the buffer has been consumed — a stream left
+    /// running with nothing queued underruns once per period, which is audible
+    /// and does not end.
     pub const PCM_STOP: u32 = 0x0105;
     /// The device's answer when it accepted the request.
     pub const STATUS_OK: u32 = 0x8000;
@@ -2324,9 +2458,20 @@ fn boot_sound(shell: &mut console::Console, grant: u64) {
     write_boot_sound(samples);
 
     if submit_audio(pid, &mut transmit, &audio, SOUND_BYTES) {
-        shell.print(b"boot sound playing");
+        shell.print(b"boot sound played");
     } else {
         shell.print(b"the sound card took the buffer but did not answer");
+    }
+
+    // Stop the stream. Leaving it running was the whole of the clicking: the
+    // device goes on asking for periods, finds nothing in the queue, and emits
+    // an underrun for each one — a tick, forever, at the period rate. The
+    // sound itself was fine and what followed it was not.
+    //
+    // `submit_audio` has already waited for the buffer to come back, so the
+    // last sample has been consumed before this runs.
+    if !pcm_control(pid, &mut control, &request, snd_code::PCM_STOP, stream, &[]) {
+        shell.print(b"the sound card would not stop the stream");
     }
 }
 

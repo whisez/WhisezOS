@@ -19,7 +19,7 @@
 use crate::abi::{
     SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
     SYS_GRANT_PORTS, SYS_IRQ_CLAIM, SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE,
-    SYS_PING, SYS_RECEIVE, SYS_REPLY, SYS_SHUTDOWN,
+    SYS_PING, SYS_RECEIVE, SYS_REPLY, SYS_SHUTDOWN, SYS_TASK_LIST,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
@@ -75,6 +75,7 @@ pub fn handle(
         SYS_IRQ_WAIT_ANY => sys_irq_wait_any(a0, frame),
         SYS_IRQ_CLAIM => sys_irq_claim(a0, a1),
         SYS_SHUTDOWN => sys_shutdown(a0),
+        SYS_TASK_LIST => sys_task_list(a0, a1),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -153,6 +154,32 @@ fn sys_device_info(grant: u64, index: u64, ptr: u64, capacity: u64) -> Result<u6
     unsafe {
         core::ptr::copy_nonoverlapping(
             (&raw const info).cast::<u8>(),
+            ptr as *mut u8,
+            bytes as usize,
+        );
+    }
+    Ok(bytes)
+}
+
+/// `SYS_TASK_LIST(buffer, capacity) -> bytes written`.
+///
+/// No grant. Every other call that reaches outside the caller needs one, and
+/// this one does not, because what it returns is what the machine is doing
+/// rather than a way to affect it — the same argument that makes a process list
+/// readable by anybody on a system with users, on a system that has none.
+fn sys_task_list(ptr: u64, capacity: u64) -> Result<u64, SyscallError> {
+    let list = task::list();
+    let bytes = core::mem::size_of::<crate::abi::TaskList>() as u64;
+    if capacity < bytes {
+        return Err(SyscallError::TooLong);
+    }
+    task::with_current_regions(|regions| validate_user_range(regions, ptr, bytes, bytes))?;
+
+    // SAFETY: the range was just validated against the running process's own
+    // regions, and its address space is the one in CR3.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const list).cast::<u8>(),
             ptr as *mut u8,
             bytes as usize,
         );

@@ -519,6 +519,15 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // The session starts after the frame accounting, because it holds frames.
     "[kernel] session started as pid",
     "[init 9] session owns the display, the clock, and input",
+    // The task manager reads this on a timer; the number is what proves the
+    // call crossed into the kernel and came back with the table rather than
+    // with zeros.
+    //
+    // One, and not by accident: every other process runs its checks and exits,
+    // and the session is what is left. It is deterministic because the session
+    // is started after the last of them has been reaped — an exited process is
+    // not live, so a slow reap would not change the count either.
+    "[init 9] live processes: 1",
     "[init 9] session is drawing the desktop",
 ];
 

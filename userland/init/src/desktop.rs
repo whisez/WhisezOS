@@ -19,7 +19,7 @@
 pub const ICON_COUNT: usize = 4;
 
 /// What each icon is called and what opening it does.
-pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"DISK", b"SOUND", b"SHELL", b"ABOUT"];
+pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"DISK", b"SOUND", b"SHELL", b"TASKS"];
 
 /// Icon geometry. The session draws with these and so does the hit test, which
 /// is the only way the two can agree.
@@ -33,6 +33,56 @@ pub const ICON_RIGHT_MARGIN: u64 = 140;
 pub const MENU_WIDTH: u64 = 190;
 pub const MENU_ITEM_HEIGHT: u64 = 26;
 
+/// The two windows the session can show. Neither is open at startup: a desktop
+/// that begins covered in windows nobody asked for is not a desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Shell,
+    Devices,
+    Tasks,
+}
+
+/// How tall the bar across the bottom is.
+pub const TASKBAR_HEIGHT: u64 = 34;
+
+/// The title bar, and the box at its right end that closes the window.
+pub const TITLE_HEIGHT: u64 = 24;
+pub const CLOSE_SIZE: u64 = 16;
+pub const CLOSE_INSET: u64 = 8;
+
+/// Where each window sits. Here rather than beside the drawing code for the
+/// same reason the icon geometry is: a close box that is drawn in one place and
+/// hit-tested from another is a close box that stops closing the window, and
+/// the way it stops is that clicking it does nothing at all.
+#[must_use]
+pub const fn bounds(window: Window) -> (u64, u64, u64, u64) {
+    match window {
+        Window::Devices => (80, 90, 520, 300),
+        // Stops short of the icon column. A window that covers the icons is a
+        // window that has to be moved before anything else can be opened, and
+        // nothing here can be moved.
+        Window::Tasks => (620, 90, 480, 300),
+        Window::Shell => (80, 430, 1120, 330),
+    }
+}
+
+/// The top-left corner of a window's close box.
+#[must_use]
+pub const fn close_at(window: Window) -> (u64, u64) {
+    let (x, y, w, _) = bounds(window);
+    (
+        x + w - CLOSE_SIZE - CLOSE_INSET,
+        y + (TITLE_HEIGHT - CLOSE_SIZE) / 2,
+    )
+}
+
+/// Whether a point is on a window's close box.
+#[must_use]
+pub const fn on_close(window: Window, x: u64, y: u64) -> bool {
+    let (cx, cy) = close_at(window);
+    x >= cx && x < cx + CLOSE_SIZE && y >= cy && y < cy + CLOSE_SIZE
+}
+
 /// What the menu offers.
 ///
 /// Every one of these does something. The first version opened with "Open
@@ -40,12 +90,51 @@ pub const MENU_ITEM_HEIGHT: u64 = 26;
 /// exists to be clicked once and then never again. A menu whose items are
 /// greyed out, or say something instead of doing something, is worse than no
 /// menu: it tells somebody the system can do things it cannot.
-pub const MENU_ITEMS: [&[u8]; 4] = [
-    b"Clear shell",
-    b"List devices",
+pub const MENU_ITEMS: [&[u8]; 5] = [
+    b"Open shell",
+    b"Show devices",
+    b"Task manager",
     b"Read sector 0",
     b"Shut down",
 ];
+
+/// The task manager's column header, and the width of a row.
+pub const TASK_HEADER: &[u8] = b"PID  STATE    DMA  DEVICES";
+pub const TASK_ROW: usize = 26;
+
+/// Formats one row of the task manager.
+///
+/// Here, with the header beside it, because the two are one thing: a row whose
+/// columns do not line up under their headings is read as the wrong numbers
+/// against the wrong names, and it looks like a rendering nicety rather than
+/// like the mistake it is. The first version put the DMA count one place left
+/// of its column and it read as ten times itself.
+#[must_use]
+pub fn task_row(pid: u64, state: &[u8], dma: u64, devices: u64) -> [u8; TASK_ROW] {
+    let mut row = [b' '; TASK_ROW];
+    write_number(&mut row[0..3], pid);
+    for (slot, byte) in row[5..12].iter_mut().zip(state.iter()) {
+        *slot = *byte;
+    }
+    write_number(&mut row[14..17], dma);
+    write_number(&mut row[19..22], devices);
+    row
+}
+
+/// Writes a number right-aligned into a field of digits.
+///
+/// Saturating rather than wrapping: a count too big for the field shows all
+/// nines, which reads as "more than fits here" instead of as a small number.
+pub fn write_number(field: &mut [u8], value: u64) {
+    let mut left = value;
+    for slot in field.iter_mut().rev() {
+        *slot = b'0' + (left % 10) as u8;
+        left /= 10;
+    }
+    if left > 0 {
+        field.fill(b'9');
+    }
+}
 
 /// What the session should do about a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +149,10 @@ pub enum Click {
     CloseMenu,
     /// This menu entry was chosen.
     Menu(usize),
+    /// A window was opened or brought forward.
+    Open(Window),
+    /// A window was closed.
+    Close(Window),
 }
 
 /// Which buttons are down, and which were down last time.
@@ -95,6 +188,9 @@ pub struct Desktop {
     pub selected: Option<usize>,
     /// Where the context menu is, if it is open.
     pub menu: Option<(u64, u64)>,
+    pub shell_open: bool,
+    pub devices_open: bool,
+    pub tasks_open: bool,
 }
 
 impl Desktop {
@@ -103,6 +199,50 @@ impl Desktop {
         Self {
             selected: None,
             menu: None,
+            shell_open: false,
+            devices_open: false,
+            tasks_open: false,
+        }
+    }
+
+    /// Whether a window is showing.
+    #[must_use]
+    pub const fn is_open(&self, window: Window) -> bool {
+        match window {
+            Window::Shell => self.shell_open,
+            Window::Devices => self.devices_open,
+            Window::Tasks => self.tasks_open,
+        }
+    }
+
+    /// Opens a window, or brings it forward if it is already open.
+    pub fn open(&mut self, window: Window) -> Click {
+        match window {
+            Window::Shell => self.shell_open = true,
+            Window::Devices => self.devices_open = true,
+            Window::Tasks => self.tasks_open = true,
+        }
+        Click::Open(window)
+    }
+
+    /// Closes a window.
+    pub fn close(&mut self, window: Window) -> Click {
+        match window {
+            Window::Shell => self.shell_open = false,
+            Window::Devices => self.devices_open = false,
+            Window::Tasks => self.tasks_open = false,
+        }
+        Click::Close(window)
+    }
+
+    /// Which window an icon opens, if it opens one.
+    #[must_use]
+    pub const fn icon_window(index: usize) -> Option<Window> {
+        match index {
+            0 => Some(Window::Devices),
+            2 => Some(Window::Shell),
+            3 => Some(Window::Tasks),
+            _ => None,
         }
     }
 
@@ -166,10 +306,24 @@ impl Desktop {
             return Click::OpenMenu(mx, my);
         }
 
+        // A window is above the desktop, so its close box is checked before
+        // anything underneath. Shell first: it is drawn last and so is on top.
+        for window in [Window::Shell, Window::Tasks, Window::Devices] {
+            if self.is_open(window) && on_close(window, x, y) {
+                return self.close(window);
+            }
+        }
+
         match Self::icon_under(x, y, width) {
             Some(index) => {
                 self.selected = Some(index);
-                Click::Select(index)
+                // An icon opens what it names. Selecting and then needing a
+                // second gesture to open would be right if there were a
+                // keyboard focus model to select *for*, and there is not.
+                match Self::icon_window(index) {
+                    Some(window) => self.open(window),
+                    None => Click::Select(index),
+                }
             }
             None => {
                 self.selected = None;
@@ -214,11 +368,149 @@ mod tests {
     }
 
     #[test]
-    fn clicking_an_icon_selects_it() {
+    fn clicking_an_icon_that_names_a_window_opens_it() {
         let mut desktop = Desktop::new();
+        assert!(!desktop.shell_open);
         let (x, y) = icon_centre(2);
-        assert_eq!(desktop.press(x, y, false, WIDTH, HEIGHT), Click::Select(2));
+        assert_eq!(
+            desktop.press(x, y, false, WIDTH, HEIGHT),
+            Click::Open(Window::Shell)
+        );
+        assert!(desktop.shell_open);
         assert_eq!(desktop.selected, Some(2));
+    }
+
+    #[test]
+    fn clicking_an_icon_with_no_window_behind_it_only_selects() {
+        // SOUND names nothing yet: there is no window to show a card that is
+        // played once at boot. It highlights and does not pretend to open
+        // something.
+        let mut desktop = Desktop::new();
+        let (x, y) = icon_centre(1);
+        assert_eq!(desktop.press(x, y, false, WIDTH, HEIGHT), Click::Select(1));
+        assert_eq!(desktop.selected, Some(1));
+    }
+
+    #[test]
+    fn every_task_column_starts_under_its_heading() {
+        // The check the first version needed and did not have: find each
+        // heading in the header, and insist the digits begin at the same place.
+        let row = task_row(7, b"RUNNING", 6, 3);
+        let header = TASK_HEADER;
+        for (heading, first_digit) in [
+            (&b"PID"[..], 0usize),
+            (&b"DMA"[..], 14),
+            (&b"DEVICES"[..], 19),
+        ] {
+            let at = header
+                .windows(heading.len())
+                .position(|w| w == heading)
+                .expect("heading is in the header");
+            assert_eq!(at, first_digit, "column moved out from under its heading");
+        }
+        // The row is as wide as the header; DEVICES is a longer word than the
+        // count under it, so the tail is blank.
+        assert_eq!(&row[..22], b"007  RUNNING  006  003");
+        assert!(row[22..].iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn a_count_too_wide_for_its_column_says_so() {
+        // Wrapping would print 1000 DMA regions as 000, which is the one
+        // reading that is worse than no reading.
+        let row = task_row(0, b"READY", 1000, 0);
+        assert_eq!(&row[14..17], b"999");
+    }
+
+    #[test]
+    fn no_two_windows_share_a_close_box() {
+        // They overlap on screen by design; two close boxes at the same point
+        // would mean the top one is unclosable, because the scan finds the
+        // other first.
+        let all = [Window::Shell, Window::Devices, Window::Tasks];
+        for (index, window) in all.iter().enumerate() {
+            for other in &all[index + 1..] {
+                let (cx, cy) = close_at(*window);
+                assert!(!on_close(*other, cx, cy), "two windows, one close box");
+            }
+        }
+    }
+
+    #[test]
+    fn every_icon_that_names_a_window_names_a_different_one() {
+        // Two icons onto one window is two icons of which one is redundant, and
+        // no way to tell from the desktop which.
+        for a in 0..ICON_COUNT {
+            for b in a + 1..ICON_COUNT {
+                if let (Some(x), Some(y)) = (Desktop::icon_window(a), Desktop::icon_window(b)) {
+                    assert_ne!(x, y, "two icons open the same window");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_close_box_sits_inside_its_own_title_bar() {
+        for window in [Window::Shell, Window::Devices, Window::Tasks] {
+            let (x, y, w, _) = bounds(window);
+            let (cx, cy) = close_at(window);
+            assert!(cx >= x && cx + CLOSE_SIZE <= x + w, "past the window edge");
+            assert!(
+                cy >= y && cy + CLOSE_SIZE <= y + TITLE_HEIGHT,
+                "off the bar"
+            );
+        }
+    }
+
+    #[test]
+    fn the_close_box_closes_the_window_it_belongs_to() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let (cx, cy) = close_at(Window::Shell);
+        assert_eq!(
+            desktop.press(cx + 2, cy + 2, false, 1280, 800),
+            Click::Close(Window::Shell)
+        );
+        assert!(!desktop.is_open(Window::Shell));
+    }
+
+    #[test]
+    fn a_closed_windows_close_box_is_not_clickable() {
+        // Otherwise the box keeps swallowing clicks on whatever the window was
+        // covering, which is a hole in the desktop where a window used to be.
+        let mut desktop = Desktop::new();
+        let (cx, cy) = close_at(Window::Devices);
+        assert_ne!(
+            desktop.press(cx + 2, cy + 2, false, 1280, 800),
+            Click::Close(Window::Devices)
+        );
+    }
+
+    #[test]
+    fn no_window_hides_the_taskbar() {
+        for window in [Window::Shell, Window::Devices, Window::Tasks] {
+            let (_, y, _, h) = bounds(window);
+            assert!(y + h <= 800 - TASKBAR_HEIGHT, "a window covers the taskbar");
+        }
+    }
+
+    #[test]
+    fn nothing_is_open_when_the_session_starts() {
+        // A desktop that begins covered in windows nobody asked for is not a
+        // desktop.
+        let desktop = Desktop::new();
+        assert!(!desktop.is_open(Window::Shell));
+        assert!(!desktop.is_open(Window::Devices));
+    }
+
+    #[test]
+    fn a_window_can_be_closed_and_opened_again() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        assert_eq!(desktop.close(Window::Shell), Click::Close(Window::Shell));
+        assert!(!desktop.shell_open);
+        assert_eq!(desktop.open(Window::Shell), Click::Open(Window::Shell));
+        assert!(desktop.shell_open);
     }
 
     #[test]
@@ -338,16 +630,16 @@ mod tests {
     }
 
     #[test]
-    fn no_menu_entry_merely_describes_the_state_it_is_in() {
-        // "Open shell" was an entry whose only effect was to say the shell was
-        // already open. This is the assertion that keeps one from coming back:
-        // an entry beginning with "Open" would have to open something, and
-        // nothing here can be opened yet.
-        for item in MENU_ITEMS {
-            assert!(
-                !item.starts_with(b"Open"),
-                "an entry promises to open something",
-            );
-        }
+    fn an_entry_that_promises_to_open_something_opens_something() {
+        // This test used to forbid the word entirely, because "Open shell"
+        // answered "the shell is already open below" — the shell was always
+        // open and the entry was decoration. Windows start closed now, so the
+        // word is honest again, and the rule becomes the one it should have
+        // been: an entry may say "Open" as long as it does.
+        assert!(MENU_ITEMS[0].starts_with(b"Open"));
+        let mut desktop = Desktop::new();
+        assert!(!desktop.is_open(Window::Shell));
+        desktop.open(Window::Shell);
+        assert!(desktop.is_open(Window::Shell));
     }
 }
