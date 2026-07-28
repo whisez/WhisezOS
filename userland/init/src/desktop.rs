@@ -19,7 +19,7 @@
 pub const ICON_COUNT: usize = 4;
 
 /// What each icon is called and what opening it does.
-pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"FILES", b"SOUND", b"SHELL", b"TASKS"];
+pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"FILES", b"ASSISTANT", b"SHELL", b"TASKS"];
 
 /// Icon geometry. The session draws with these and so does the hit test, which
 /// is the only way the two can agree.
@@ -41,7 +41,29 @@ pub enum Window {
     Devices,
     Tasks,
     Files,
+    Assistant,
 }
+
+impl Window {
+    /// Whether typing goes into this window.
+    ///
+    /// The two that take text are the two with a prompt in them. A keystroke
+    /// with nowhere to go is better than one that goes somewhere invisible.
+    #[must_use]
+    pub const fn takes_text(self) -> bool {
+        matches!(self, Self::Shell | Self::Assistant)
+    }
+}
+
+/// Every window, front to back. The order is the order a click finds them, so
+/// it is the order they are drawn in reverse.
+pub const ALL_WINDOWS: [Window; 5] = [
+    Window::Assistant,
+    Window::Shell,
+    Window::Tasks,
+    Window::Files,
+    Window::Devices,
+];
 
 /// How tall the bar across the bottom is.
 pub const TASKBAR_HEIGHT: u64 = 34;
@@ -66,6 +88,10 @@ pub const fn bounds(window: Window) -> (u64, u64, u64, u64) {
         // Where DEVICES sits, one step down and across. They overlap, which is
         // what windows do; what they must not do is share a close box.
         Window::Files => (110, 130, 520, 300),
+        // Wide enough for the longest line the assistant can say. Narrower and
+        // the answers ran off the right edge, past the rectangle the redraw
+        // clears — so the tails of old answers stayed on the desktop.
+        Window::Assistant => (400, 420, 800, 340),
         Window::Shell => (80, 430, 1120, 330),
     }
 }
@@ -94,10 +120,11 @@ pub const fn on_close(window: Window, x: u64, y: u64) -> bool {
 /// exists to be clicked once and then never again. A menu whose items are
 /// greyed out, or say something instead of doing something, is worse than no
 /// menu: it tells somebody the system can do things it cannot.
-pub const MENU_ITEMS: [&[u8]; 6] = [
+pub const MENU_ITEMS: [&[u8]; 7] = [
     b"New folder",
     b"Open files",
     b"Open shell",
+    b"Open assistant",
     b"Show devices",
     b"Task manager",
     b"Shut down",
@@ -197,6 +224,11 @@ pub struct Desktop {
     pub devices_open: bool,
     pub tasks_open: bool,
     pub files_open: bool,
+    pub assistant_open: bool,
+    /// Which window keystrokes go to. Set when a window is opened or clicked
+    /// into, cleared when it closes — a window that keeps the keyboard after it
+    /// is gone is where typing disappears to.
+    pub focus: Option<Window>,
 }
 
 impl Desktop {
@@ -209,6 +241,8 @@ impl Desktop {
             devices_open: false,
             tasks_open: false,
             files_open: false,
+            assistant_open: false,
+            focus: None,
         }
     }
 
@@ -220,6 +254,7 @@ impl Desktop {
             Window::Devices => self.devices_open,
             Window::Tasks => self.tasks_open,
             Window::Files => self.files_open,
+            Window::Assistant => self.assistant_open,
         }
     }
 
@@ -230,6 +265,10 @@ impl Desktop {
             Window::Devices => self.devices_open = true,
             Window::Tasks => self.tasks_open = true,
             Window::Files => self.files_open = true,
+            Window::Assistant => self.assistant_open = true,
+        }
+        if window.takes_text() {
+            self.focus = Some(window);
         }
         Click::Open(window)
     }
@@ -241,6 +280,15 @@ impl Desktop {
             Window::Devices => self.devices_open = false,
             Window::Tasks => self.tasks_open = false,
             Window::Files => self.files_open = false,
+            Window::Assistant => self.assistant_open = false,
+        }
+        if self.focus == Some(window) {
+            // Handed to whatever else is open and takes text, so that closing
+            // one of two prompts does not leave the keyboard pointing at
+            // nothing while a prompt is still on screen.
+            self.focus = [Window::Shell, Window::Assistant]
+                .into_iter()
+                .find(|other| *other != window && self.is_open(*other));
         }
         Click::Close(window)
     }
@@ -255,8 +303,9 @@ impl Desktop {
         match index {
             1 => Some(Window::Files),
             2 => Some(Window::Shell),
-            3 => Some(Window::Devices),
-            4 => Some(Window::Tasks),
+            3 => Some(Window::Assistant),
+            4 => Some(Window::Devices),
+            5 => Some(Window::Tasks),
             _ => None,
         }
     }
@@ -266,6 +315,7 @@ impl Desktop {
     pub const fn icon_window(index: usize) -> Option<Window> {
         match index {
             0 => Some(Window::Files),
+            1 => Some(Window::Assistant),
             2 => Some(Window::Shell),
             3 => Some(Window::Tasks),
             _ => None,
@@ -334,7 +384,7 @@ impl Desktop {
 
         // A window is above the desktop, so its close box is checked before
         // anything underneath. Shell first: it is drawn last and so is on top.
-        for window in [Window::Shell, Window::Tasks, Window::Files, Window::Devices] {
+        for window in ALL_WINDOWS {
             if self.is_open(window) && on_close(window, x, y) {
                 return self.close(window);
             }
@@ -407,14 +457,66 @@ mod tests {
     }
 
     #[test]
-    fn clicking_an_icon_with_no_window_behind_it_only_selects() {
-        // SOUND names nothing yet: there is no window to show a card that is
-        // played once at boot. It highlights and does not pretend to open
-        // something.
+    fn every_icon_opens_a_window() {
+        // This replaces a test that checked the opposite: that an icon naming
+        // no window merely highlights. That was right while two icons named
+        // nothing, and the rule it protected — an icon must not pretend to open
+        // something — is better served now by there being nothing left to
+        // pretend about. An icon on this desktop opens something or it should
+        // not be on this desktop.
+        for index in 0..ICON_COUNT {
+            let window = Desktop::icon_window(index)
+                .unwrap_or_else(|| panic!("icon {index} is a picture of nothing"));
+            let mut desktop = Desktop::new();
+            let (x, y) = icon_centre(index);
+            assert_eq!(
+                desktop.press(x, y, false, WIDTH, HEIGHT),
+                Click::Open(window)
+            );
+            assert!(desktop.is_open(window));
+            assert_eq!(desktop.selected, Some(index));
+        }
+    }
+
+    #[test]
+    fn typing_goes_to_the_window_that_was_opened_last() {
         let mut desktop = Desktop::new();
-        let (x, y) = icon_centre(1);
-        assert_eq!(desktop.press(x, y, false, WIDTH, HEIGHT), Click::Select(1));
-        assert_eq!(desktop.selected, Some(1));
+        assert_eq!(desktop.focus, None, "the keyboard points somewhere at rest");
+        desktop.open(Window::Shell);
+        assert_eq!(desktop.focus, Some(Window::Shell));
+        desktop.open(Window::Assistant);
+        assert_eq!(desktop.focus, Some(Window::Assistant));
+    }
+
+    #[test]
+    fn a_window_that_takes_no_text_does_not_take_the_keyboard() {
+        // Opening the task manager while typing must not swallow the next key.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.open(Window::Tasks);
+        assert_eq!(desktop.focus, Some(Window::Shell));
+    }
+
+    #[test]
+    fn closing_the_focused_window_hands_the_keyboard_on() {
+        // And not to nothing, while a prompt is still on screen: keystrokes
+        // that land nowhere while something asks for them is the worst of the
+        // three outcomes.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.open(Window::Assistant);
+        desktop.close(Window::Assistant);
+        assert_eq!(desktop.focus, Some(Window::Shell));
+        desktop.close(Window::Shell);
+        assert_eq!(desktop.focus, None);
+    }
+
+    #[test]
+    fn only_windows_with_a_prompt_take_text() {
+        for window in ALL_WINDOWS {
+            let expected = matches!(window, Window::Shell | Window::Assistant);
+            assert_eq!(window.takes_text(), expected, "{window:?}");
+        }
     }
 
     #[test]
@@ -453,7 +555,7 @@ mod tests {
         // They overlap on screen by design; two close boxes at the same point
         // would mean the top one is unclosable, because the scan finds the
         // other first.
-        let all = [Window::Shell, Window::Devices, Window::Tasks, Window::Files];
+        let all = ALL_WINDOWS;
         for (index, window) in all.iter().enumerate() {
             for other in &all[index + 1..] {
                 let (cx, cy) = close_at(*window);
@@ -477,7 +579,7 @@ mod tests {
 
     #[test]
     fn a_close_box_sits_inside_its_own_title_bar() {
-        for window in [Window::Shell, Window::Devices, Window::Tasks, Window::Files] {
+        for window in ALL_WINDOWS {
             let (x, y, w, _) = bounds(window);
             let (cx, cy) = close_at(window);
             assert!(cx >= x && cx + CLOSE_SIZE <= x + w, "past the window edge");
@@ -514,7 +616,7 @@ mod tests {
 
     #[test]
     fn no_window_hides_the_taskbar() {
-        for window in [Window::Shell, Window::Devices, Window::Tasks, Window::Files] {
+        for window in ALL_WINDOWS {
             let (_, y, _, h) = bounds(window);
             assert!(y + h <= 800 - TASKBAR_HEIGHT, "a window covers the taskbar");
         }

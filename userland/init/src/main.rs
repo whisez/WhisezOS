@@ -31,6 +31,8 @@ mod blake3;
 #[path = "../../../fs/spectrefs/src/dir.rs"]
 mod dir;
 
+mod assistant;
+
 #[path = "../../../kernel/spectre-kernel/src/font.rs"]
 mod font;
 
@@ -978,14 +980,6 @@ const PANEL_HEIGHT: u64 = 32;
 /// resolution.
 const TEXT_SCALE: u64 = 2;
 
-/// Where the shell window sits, and how much of it is text.
-const SHELL_X: u64 = desktop::bounds(desktop::Window::Shell).0;
-const SHELL_Y: u64 = desktop::bounds(desktop::Window::Shell).1;
-const SHELL_W: u64 = desktop::bounds(desktop::Window::Shell).2;
-
-/// Inside the frame, below the title bar.
-const SHELL_TEXT_X: u64 = SHELL_X + 12;
-const SHELL_TEXT_Y: u64 = SHELL_Y + 34;
 /// One glyph cell, scaled. The gap makes lines legible at this size; without it
 /// descenders touch the row below.
 const CELL_W: u64 = font::GLYPH_WIDTH as u64 * TEXT_SCALE;
@@ -1206,6 +1200,7 @@ fn session(grant: u64) -> ! {
     let mut extended = false;
     let mut modifiers = keymap::Modifiers::default();
     let mut shell = console::Console::new();
+    let mut helper = console::Console::for_questions();
     let mut face = desktop::Desktop::new();
     let mut buttons = desktop::Buttons::default();
     let mut pending_click: Option<(u64, u64, bool)> = None;
@@ -1213,6 +1208,12 @@ fn session(grant: u64) -> ! {
     let mut coined = 0u32;
 
     shell.print(b"WhisezOS session. Type help.");
+    // Said here rather than only in the module comment, because the person who
+    // needs to read it is the one looking at the window.
+    helper.print(b"WhisezOS assistant. Not a language model:");
+    helper.print(b"there is none on this machine. I answer questions");
+    helper.print(b"about it from what the kernel and disk report.");
+    helper.print(b"Ask: uptime, processes, files, devices, or who I am.");
 
     // The disk, so `read` reads rather than reporting that it cannot. Failure
     // here is not fatal: a session without a disk is a session with one fewer
@@ -1291,56 +1292,68 @@ fn session(grant: u64) -> ! {
                         } else if byte == keymap::EXTENDED {
                             extended = true;
                         } else {
-                            match keymap::decode(byte, &mut modifiers) {
-                                keymap::Key::Char(character) => {
-                                    keys = keys.wrapping_add(1);
-                                    shell.type_char(character);
-                                }
-                                keymap::Key::Backspace => shell.backspace(),
-                                keymap::Key::Enter => {
-                                    keys = keys.wrapping_add(1);
-                                    match shell.enter() {
-                                        console::Action::Redraw => painted = false,
-                                        console::Action::ReadSector(sector) => {
-                                            read_sector(&mut shell, disk.as_mut(), sector);
-                                        }
-                                        console::Action::MakeFolder(name, length) => {
-                                            make_folder(
-                                                &mut shell,
-                                                disk.as_mut(),
-                                                &mut files,
-                                                &name[..length],
-                                            );
-                                            // The FILES window, if it is showing,
-                                            // is now a picture of the disk as it
-                                            // was before the folder existed.
-                                            painted = false;
-                                        }
-                                        console::Action::List => {
-                                            list_folders(&mut shell, files.as_ref());
-                                        }
-                                        console::Action::Uptime => {
-                                            report_uptime(&mut shell, tick);
-                                        }
-                                        console::Action::Shutdown => {
-                                            // Drawn once more first, so the
-                                            // last thing on screen is the
-                                            // acknowledgement rather than
-                                            // whatever was there before.
-                                            // Already inside the enclosing
-                                            // `unsafe`, which is what makes the
-                                            // port reads above legal.
-                                            draw_shell(&screen, &shell);
-                                            let _ = call(SYS_SHUTDOWN, grant, 0);
-                                            // Only reached if the machine
-                                            // refused, which the kernel has
-                                            // already reported.
-                                            shell.print(b"the machine refused to power off");
-                                        }
-                                        console::Action::None => {}
+                            // The key is applied to whichever window holds the
+                            // keyboard, and what it asked for is dealt with
+                            // afterwards — the console has to be released
+                            // before the answer can touch anything else.
+                            //
+                            // A keystroke with nowhere to go is dropped rather
+                            // than typed into a window that is not on screen,
+                            // which is where a shell that always listens puts
+                            // it.
+                            let key = keymap::decode(byte, &mut modifiers);
+                            if !matches!(key, keymap::Key::None) {
+                                keys = keys.wrapping_add(1);
+                            }
+                            let action = match face.focus {
+                                Some(desktop::Window::Assistant) => apply_key(&mut helper, key),
+                                Some(desktop::Window::Shell) => apply_key(&mut shell, key),
+                                _ => console::Action::None,
+                            };
+                            {
+                                match action {
+                                    console::Action::Ask(line, length) => {
+                                        answer(&mut helper, &line[..length], tick, files.as_ref());
                                     }
+                                    console::Action::Redraw => painted = false,
+                                    console::Action::ReadSector(sector) => {
+                                        read_sector(&mut shell, disk.as_mut(), sector);
+                                    }
+                                    console::Action::MakeFolder(name, length) => {
+                                        make_folder(
+                                            &mut shell,
+                                            disk.as_mut(),
+                                            &mut files,
+                                            &name[..length],
+                                        );
+                                        // The FILES window, if it is showing,
+                                        // is now a picture of the disk as it
+                                        // was before the folder existed.
+                                        painted = false;
+                                    }
+                                    console::Action::List => {
+                                        list_folders(&mut shell, files.as_ref());
+                                    }
+                                    console::Action::Uptime => {
+                                        report_uptime(&mut shell, tick);
+                                    }
+                                    console::Action::Shutdown => {
+                                        // Drawn once more first, so the
+                                        // last thing on screen is the
+                                        // acknowledgement rather than
+                                        // whatever was there before.
+                                        // Already inside the enclosing
+                                        // `unsafe`, which is what makes the
+                                        // port reads above legal.
+                                        draw_shell(&screen, &shell);
+                                        let _ = call(SYS_SHUTDOWN, grant, 0);
+                                        // Only reached if the machine
+                                        // refused, which the kernel has
+                                        // already reported.
+                                        shell.print(b"the machine refused to power off");
+                                    }
+                                    console::Action::None => {}
                                 }
-                                keymap::Key::None => {}
                             }
                         }
                     }
@@ -1391,6 +1404,9 @@ fn session(grant: u64) -> ! {
             }
             if face.is_open(desktop::Window::Shell) {
                 draw_shell(&screen, &shell);
+            }
+            if face.is_open(desktop::Window::Assistant) {
+                draw_console(&screen, &helper, desktop::Window::Assistant);
             }
             draw_menu(&screen, &face);
             draw_sweep(&screen, tick);
@@ -1704,8 +1720,19 @@ unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop, files: Option<&
         if face.is_open(desktop::Window::Tasks) {
             screen.window(desktop::Window::Tasks, b"TASK MANAGER", false);
         }
+        if face.is_open(desktop::Window::Assistant) {
+            screen.window(
+                desktop::Window::Assistant,
+                b"ASSISTANT",
+                face.focus == Some(desktop::Window::Assistant),
+            );
+        }
         if face.is_open(desktop::Window::Shell) {
-            screen.window(desktop::Window::Shell, b"SHELL", false);
+            screen.window(
+                desktop::Window::Shell,
+                b"SHELL",
+                face.focus == Some(desktop::Window::Shell),
+            );
         }
         draw_taskbar(screen, face);
     }
@@ -1962,6 +1989,82 @@ fn store(shell: &mut console::Console, disk: Option<&mut Disk>, table: &dir::Tab
         return false;
     }
     true
+}
+
+// The assistant's longest answer has to fit the window it is drawn in. Getting
+// this wrong is not a visual nicety: text past the frame is also past the
+// rectangle the redraw clears, so it stays on the desktop after the window
+// closes.
+const _: () = assert!(
+    (desktop::bounds(desktop::Window::Assistant).2 - 20) / CELL_W >= assistant::LINE_MAX as u64
+);
+
+/// Puts one key into a console and says what it asked for.
+///
+/// Split out so the console can be released before the answer is dealt with:
+/// answering may touch the disk, the other console, or the screen, and none of
+/// those can be reached while one of them is borrowed.
+fn apply_key(console: &mut console::Console, key: keymap::Key) -> console::Action {
+    match key {
+        keymap::Key::Char(character) => {
+            console.type_char(character);
+            console::Action::None
+        }
+        keymap::Key::Backspace => {
+            console.backspace();
+            console::Action::None
+        }
+        keymap::Key::Enter => console.enter(),
+        keymap::Key::None => console::Action::None,
+    }
+}
+
+/// Answers a question in the assistant window.
+///
+/// What a question means is decided in `assistant.rs`, which has no syscalls and
+/// is tested without a machine. What the answer *is* has to be read from the
+/// machine, which is here. Neither half can drift into the other: a matcher that
+/// could read a clock would be untestable, and a window that decided what words
+/// meant would be a second place where that is decided.
+fn answer(helper: &mut console::Console, question: &[u8], tick: u64, files: Option<&dir::Table>) {
+    match assistant::ask(question) {
+        assistant::Answer::Say(lines) => {
+            for line in lines {
+                helper.print(line);
+            }
+        }
+        assistant::Answer::Uptime => report_uptime(helper, tick),
+        assistant::Answer::Files => list_folders(helper, files),
+        assistant::Answer::Processes => {
+            let mut list = abi::TaskList::EMPTY;
+            let size = core::mem::size_of::<abi::TaskList>() as u64;
+            if call(SYS_TASK_LIST, (&raw mut list) as u64, size).is_err() {
+                helper.print(b"the kernel would not say what is running");
+                return;
+            }
+            helper.print(desktop::TASK_HEADER);
+            for entry in &list.entries[..list.count as usize] {
+                let row = desktop::task_row(
+                    entry.pid,
+                    abi::task_state_name(entry.state),
+                    entry.dma_regions,
+                    entry.devices_mapped,
+                );
+                helper.print(&row);
+            }
+        }
+        assistant::Answer::Devices => {
+            helper.print(b"framebuffer 1280x800   rtc clock, 64 hz");
+            helper.print(b"i8042 keyboard and mouse");
+            helper.print(b"virtio-blk disk, 16 mib");
+            helper.print(b"virtio-snd, 1 output stream 1 input");
+        }
+        assistant::Answer::Unknown => {
+            helper.print(b"I cannot answer that. I am not a language model");
+            helper.print(b"and I will not guess. Ask about uptime, processes,");
+            helper.print(b"files, devices, memory, or the network.");
+        }
+    }
 }
 
 /// Prints what is in the root, for the shell.
@@ -2281,6 +2384,7 @@ unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop) {
             (desktop::Window::Devices, b"DEVICES ".as_slice()),
             (desktop::Window::Tasks, b"TASKS   ".as_slice()),
             (desktop::Window::Files, b"FILES   ".as_slice()),
+            (desktop::Window::Assistant, b"ASSIST  ".as_slice()),
         ] {
             if !face.is_open(window) {
                 continue;
@@ -2327,6 +2431,30 @@ unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
 /// # Safety
 /// As `draw_desktop`.
 unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
+    // SAFETY: as `draw_console`.
+    unsafe { draw_console(screen, shell, desktop::Window::Shell) }
+}
+
+/// A console inside its window: the history, then the line being typed.
+///
+/// One function for both consoles. Two copies of this would be two places for
+/// the prompt row to fall outside the cleared rectangle, which is a bug this
+/// already had once — every frame drew a cursor beside the last one until the
+/// command line was a row of blocks.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_console(screen: &Screen, shell: &console::Console, which: desktop::Window) {
+    let (wx, wy, ww, wh) = desktop::bounds(which);
+    let text_x = wx + 10;
+    let text_y = wy + desktop::TITLE_HEIGHT + 8;
+    // As many rows as the window has room for, so a short window shows fewer
+    // lines rather than drawing them past its own bottom edge.
+    let rows = ((wh - desktop::TITLE_HEIGHT - 24) / CELL_H).min(console::ROWS as u64 + 1);
+    // Columns the window can show. Text is cut to this rather than drawn past
+    // the edge: what falls outside the frame also falls outside the rectangle
+    // the redraw clears, so it stays on the desktop after the window is gone.
+    let columns = ((ww - 20) / CELL_W) as usize;
     // SAFETY: the caller guarantees the window; every draw clips.
     unsafe {
         // The history *and* the prompt row below it. Clearing only the history
@@ -2335,18 +2463,22 @@ unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
         // of bug that is obvious on a screen and invisible to every test that
         // reads text rather than pixels.
         screen.fill(
-            SHELL_TEXT_X - 4,
-            SHELL_TEXT_Y - 4,
-            SHELL_W - 16,
-            (console::ROWS as u64 + 1) * CELL_H + 8,
+            text_x - 4,
+            text_y - 4,
+            ww - 16,
+            rows * CELL_H + 8,
             colour::WINDOW,
         );
 
         shell.each_line(|index, line| {
+            if index as u64 + 1 >= rows {
+                return;
+            }
+            let take = line.len().min(columns);
             screen.text(
-                SHELL_TEXT_X,
-                SHELL_TEXT_Y + index as u64 * CELL_H,
-                line,
+                text_x,
+                text_y + index as u64 * CELL_H,
+                &line[..take],
                 colour::DIM,
             );
         });
@@ -2355,12 +2487,15 @@ unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
         // Drawn after it so a full buffer cannot push the prompt off the
         // window — the one line that must always be visible is the one being
         // typed into.
-        let row = SHELL_TEXT_Y + (console::ROWS as u64) * CELL_H;
-        screen.text(SHELL_TEXT_X, row, b">", colour::ACCENT);
+        let row = text_y + (rows - 1) * CELL_H;
+        screen.text(text_x, row, b">", colour::ACCENT);
+        // The end of what was typed rather than the start: somebody typing past
+        // the width should see the characters they are typing.
         let typed = shell.input();
-        screen.text(SHELL_TEXT_X + CELL_W * 2, row, typed, colour::TEXT);
+        let shown = &typed[typed.len().saturating_sub(columns.saturating_sub(3))..];
+        screen.text(text_x + CELL_W * 2, row, shown, colour::TEXT);
         screen.fill(
-            SHELL_TEXT_X + CELL_W * (2 + typed.len() as u64),
+            text_x + CELL_W * (2 + shown.len() as u64),
             row,
             CELL_W - 2,
             CELL_H - 3,

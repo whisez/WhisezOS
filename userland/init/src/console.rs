@@ -38,6 +38,19 @@ pub const INPUT_LIMIT: usize = COLUMNS - 2;
 /// a restriction with no reason behind it and nothing to point at.
 pub const NAME_LIMIT: usize = 64;
 
+/// What a console does with a line when it is entered.
+///
+/// One buffer type for two windows. The shell and the assistant need the same
+/// ring of lines, the same editing and the same cursor; the only difference is
+/// what happens on Enter, so that is the only thing that varies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Interpret the line as a command.
+    Shell,
+    /// Hand the line back unread.
+    Question,
+}
+
 /// What the session should do after a command ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -53,6 +66,10 @@ pub enum Action {
     /// no syscalls, and the one that stops the machine is the last one it
     /// should be given.
     Shutdown,
+    /// Somebody typed a question. The console does not read it: what a question
+    /// means belongs to the assistant, which is tested without a machine for
+    /// the same reason this file is.
+    Ask([u8; INPUT_LIMIT], usize),
     /// Make a folder with this name.
     ///
     /// The name is carried rather than a borrow because the buffer it was typed
@@ -85,6 +102,7 @@ pub struct Console {
     used: usize,
     input: [u8; INPUT_LIMIT],
     input_len: usize,
+    mode: Mode,
 }
 
 impl Default for Console {
@@ -103,7 +121,16 @@ impl Console {
             used: 0,
             input: [0; INPUT_LIMIT],
             input_len: 0,
+            mode: Mode::Shell,
         }
+    }
+
+    /// A console whose lines are questions rather than commands.
+    #[must_use]
+    pub const fn for_questions() -> Self {
+        let mut console = Self::new();
+        console.mode = Mode::Question;
+        console
     }
 
     /// The lines currently on screen, oldest first.
@@ -176,7 +203,13 @@ impl Console {
         echoed[2..2 + take].copy_from_slice(&line[..take]);
         self.print(&echoed[..2 + take]);
 
-        self.run(&line[..length])
+        match self.mode {
+            Mode::Shell => self.run(&line[..length]),
+            // Handed back unread. A console that decided what a question meant
+            // would be a second place where that is decided.
+            Mode::Question if trim(&line[..length]).is_empty() => Action::None,
+            Mode::Question => Action::Ask(line, length),
+        }
     }
 
     /// Interprets one command.
@@ -540,6 +573,40 @@ mod tests {
             panic!("the shell decided a name question that is not its own");
         };
         assert_eq!(&name[..length], b"A/B");
+    }
+
+    #[test]
+    fn a_question_console_does_not_run_commands() {
+        // The failure this guards: an assistant window that quietly executes
+        // whatever is typed into it. "shutdown" is a question about the
+        // machine as easily as it is an order to stop it.
+        let mut console = Console::for_questions();
+        let Action::Ask(line, length) = type_line(&mut console, "shutdown") else {
+            panic!("the assistant ran a command instead of reading a question");
+        };
+        assert_eq!(&line[..length], b"shutdown");
+    }
+
+    #[test]
+    fn an_empty_question_is_not_a_question() {
+        let mut console = Console::for_questions();
+        assert_eq!(type_line(&mut console, ""), Action::None);
+        assert_eq!(type_line(&mut console, "   "), Action::None);
+    }
+
+    #[test]
+    fn a_question_is_still_echoed() {
+        // Otherwise the window reads as a list of answers to questions nobody
+        // can see.
+        let mut console = Console::for_questions();
+        type_line(&mut console, "uptime");
+        let mut found = false;
+        console.each_line(|_, row| {
+            if row.starts_with(b"> uptime") {
+                found = true;
+            }
+        });
+        assert!(found, "the question was not echoed");
     }
 
     #[test]

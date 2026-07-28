@@ -91,6 +91,9 @@ pub mod layout;
 #[path = "../../fs/spectrefs/src/dir.rs"]
 pub mod dir;
 
+#[path = "../../userland/init/src/assistant.rs"]
+pub mod assistant;
+
 #[path = "../../boot/spectre-boot/src/glitch.rs"]
 pub mod glitch;
 

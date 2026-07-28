@@ -1,0 +1,306 @@
+//! The assistant: questions about the machine, answered from the machine.
+//!
+//! # What this is not
+//!
+//! It is not a language model and it must never be presented as one. There is
+//! no model here and there cannot be: the weights of the smallest useful one are
+//! larger than this disk, there is no floating point (the target is built
+//! `+soft-float, -sse`), and there is nothing to load a model file with. A
+//! window that answered in a model's voice would be a lie told by the operating
+//! system about itself, which is the worst place to put one.
+//!
+//! What it is: a fixed set of questions the machine can actually answer, matched
+//! by the words in them, answered from what the kernel and the disk say right
+//! now. The window says so on its first line. Somebody who reads that line knows
+//! exactly what they have, which is more than most assistants offer.
+//!
+//! # Why matching on words rather than on exact commands
+//!
+//! Because the questions are the point. `uptime` is already a shell command; if
+//! the assistant only accepted `uptime` it would be a second, worse shell. It
+//! takes "how long has this been running" and "uptime" and "how long up" as the
+//! same question, which is the only thing here that behaves like an assistant.
+
+#![allow(dead_code)]
+
+/// The longest question it will look at. Longer ones are answered as unknown
+/// rather than truncated, because a truncated question can match a topic the
+/// person did not ask about.
+pub const QUESTION_LIMIT: usize = 76;
+
+/// The longest line an answer may hold.
+///
+/// Checked by a test here and by a const assertion beside the window geometry,
+/// which is what ties the two together: a longer line would be drawn outside
+/// the window, and outside the rectangle the redraw clears.
+pub const LINE_MAX: usize = 60;
+
+/// What the assistant was asked to do about the machine.
+///
+/// The answers it can give from its own knowledge are `Say`; anything needing a
+/// number from the kernel or the disk is a request to the session, for the same
+/// reason `console::Action` is — this file has no syscalls, so every rule in it
+/// can be tested without a machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Print these lines.
+    Say(&'static [&'static [u8]]),
+    /// How long the machine has been up.
+    Uptime,
+    /// What is running.
+    Processes,
+    /// What is on the disk.
+    Files,
+    /// What hardware there is.
+    Devices,
+    /// Nothing matched.
+    Unknown,
+}
+
+/// A topic: the words that reach it, and what it answers.
+struct Topic {
+    /// Any one of these in the question selects the topic. Whole words, so that
+    /// "software" does not match a topic keyed on "soft".
+    words: &'static [&'static [u8]],
+    answer: Answer,
+}
+
+/// What it knows.
+///
+/// Ordered by how specific the topic is, and matched in that order, so that a
+/// question mentioning two topics gets the narrower one. "how much disk space is
+/// free" names both storage and the machine; the storage answer is the one that
+/// was asked for.
+const TOPICS: &[Topic] = &[
+    Topic {
+        words: &[b"uptime", b"long", b"running"],
+        answer: Answer::Uptime,
+    },
+    Topic {
+        words: &[b"process", b"processes", b"tasks"],
+        answer: Answer::Processes,
+    },
+    Topic {
+        words: &[b"file", b"files", b"folder", b"folders", b"disk", b"ls"],
+        answer: Answer::Files,
+    },
+    Topic {
+        words: &[b"device", b"devices", b"hardware", b"sound", b"mouse"],
+        answer: Answer::Devices,
+    },
+    Topic {
+        words: &[b"who", b"you", b"yourself"],
+        answer: Answer::Say(&[
+            b"I am not a language model and there is none here.",
+            b"I answer a fixed set of questions about this machine",
+            b"from what the kernel and the disk report.",
+            b"Ask: uptime, processes, files, devices, memory, help.",
+        ]),
+    },
+    Topic {
+        words: &[b"memory", b"ram", b"free"],
+        answer: Answer::Say(&[
+            b"The kernel does not report free memory to ring 3 yet.",
+            b"The task manager shows DMA regions and device",
+            b"mappings per process, which is what it does report.",
+        ]),
+    },
+    Topic {
+        words: &[b"internet", b"network", b"wifi", b"ip", b"browser"],
+        answer: Answer::Say(&[
+            b"There is no network. No driver, no stack, no card",
+            b"attached. Nothing here can reach anything outside",
+            b"this machine, and nothing here pretends to.",
+        ]),
+    },
+    Topic {
+        words: &[b"help", b"can", b"do"],
+        answer: Answer::Say(&[
+            b"Ask about: uptime, processes, files, devices,",
+            b"memory, network. Or ask who I am.",
+            b"For commands, open the shell and type help.",
+        ]),
+    },
+];
+
+/// Reads a question.
+///
+/// Case is ignored and punctuation is not a word boundary problem, because the
+/// question is split on anything that is not a letter — somebody typing "what's
+/// running?" should not be told to try again without the question mark.
+#[must_use]
+pub fn ask(question: &[u8]) -> Answer {
+    if question.len() > QUESTION_LIMIT {
+        return Answer::Unknown;
+    }
+    for topic in TOPICS {
+        for word in topic.words {
+            if contains_word(question, word) {
+                return topic.answer;
+            }
+        }
+    }
+    Answer::Unknown
+}
+
+/// Whether a question contains a word, as a whole word and ignoring case.
+///
+/// Whole-word rather than substring: keyed on "can", a substring match would
+/// fire on "cancel" and on "scan", and the answer would arrive for a question
+/// nobody asked.
+#[must_use]
+pub fn contains_word(question: &[u8], word: &[u8]) -> bool {
+    let mut at = 0;
+    while at < question.len() {
+        if !is_letter(question[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < question.len() && is_letter(question[at]) {
+            at += 1;
+        }
+        let found = &question[start..at];
+        if found.len() == word.len()
+            && found
+                .iter()
+                .zip(word.iter())
+                .all(|(a, b)| lower(*a) == lower(*b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+const fn is_letter(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+const fn lower(byte: u8) -> u8 {
+    byte.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_answers_the_question_it_was_asked() {
+        assert_eq!(ask(b"uptime"), Answer::Uptime);
+        assert_eq!(ask(b"what processes are there"), Answer::Processes);
+        assert_eq!(ask(b"show me the files"), Answer::Files);
+        assert_eq!(ask(b"what devices does this have"), Answer::Devices);
+    }
+
+    #[test]
+    fn the_same_question_asked_differently_is_the_same_question() {
+        // The one thing here that behaves like an assistant rather than like a
+        // second shell.
+        for phrasing in [
+            &b"uptime"[..],
+            b"how long has this been running",
+            b"HOW LONG UP",
+            b"uptime?",
+        ] {
+            assert_eq!(ask(phrasing), Answer::Uptime, "{phrasing:?}");
+        }
+    }
+
+    #[test]
+    fn punctuation_does_not_hide_a_word() {
+        assert_eq!(ask(b"what's running?"), Answer::Uptime);
+        assert_eq!(ask(b"files!"), Answer::Files);
+    }
+
+    #[test]
+    fn a_word_inside_another_word_does_not_match() {
+        // Keyed on "can", a substring match fires on "cancel" and on "scan",
+        // and an answer arrives for a question nobody asked.
+        assert_eq!(ask(b"cancel"), Answer::Unknown);
+        assert_eq!(ask(b"scandinavia"), Answer::Unknown);
+        // And "disk" must not be found inside "diskette-shaped".
+        assert!(!contains_word(b"diskette", b"disk"));
+    }
+
+    #[test]
+    fn it_says_it_is_not_a_language_model_when_asked_what_it_is() {
+        // The one answer that must never drift. Somebody asking what this is
+        // deserves the true answer in the first line of it.
+        let Answer::Say(lines) = ask(b"who are you") else {
+            panic!("the assistant would not say what it is");
+        };
+        assert!(
+            lines[0].windows(14).any(|w| w == b"language model"),
+            "the first line does not say what it is not"
+        );
+    }
+
+    #[test]
+    fn it_does_not_claim_a_network_it_does_not_have() {
+        let Answer::Say(lines) = ask(b"can I get on the internet") else {
+            panic!("the assistant dodged the question");
+        };
+        assert!(lines
+            .iter()
+            .any(|line| line.windows(2).any(|w| w == b"no" || w == b"No")));
+    }
+
+    #[test]
+    fn a_question_it_cannot_answer_is_not_answered() {
+        // The failure worth guarding: a matcher loose enough to find a topic in
+        // anything would answer every question, and confidently.
+        for question in [
+            &b"write me a poem about the sea"[..],
+            b"what is the capital of France",
+            b"solve x squared plus two x",
+            b"",
+        ] {
+            assert_eq!(ask(question), Answer::Unknown, "{question:?}");
+        }
+    }
+
+    #[test]
+    fn an_overlong_question_is_refused_rather_than_cut_short() {
+        // A truncated question can match a topic the person did not ask about.
+        let long = [b'a'; QUESTION_LIMIT + 1];
+        assert_eq!(ask(&long), Answer::Unknown);
+    }
+
+    #[test]
+    fn every_word_reaches_the_topic_it_is_listed_under() {
+        // Per word, not per topic. A word claimed by an earlier topic still
+        // sits in the list looking like it does something — the first version
+        // had "running?" under processes, which the splitter can never produce
+        // because it stops at the question mark, and "running" under uptime,
+        // which would have shadowed it anyway. Both read as coverage of a
+        // question the assistant could not actually answer.
+        for topic in TOPICS {
+            for word in topic.words {
+                assert_eq!(
+                    ask(word),
+                    topic.answer,
+                    "a word does not reach its own topic: {:?}",
+                    core::str::from_utf8(word).unwrap_or("?")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_topic_has_words_and_every_answer_has_lines() {
+        for topic in TOPICS {
+            assert!(!topic.words.is_empty());
+            for word in topic.words {
+                assert!(!word.is_empty());
+            }
+            if let Answer::Say(lines) = topic.answer {
+                assert!(!lines.is_empty(), "a topic answers with nothing");
+                for line in lines {
+                    assert!(!line.is_empty());
+                    assert!(line.len() <= LINE_MAX, "a line will not fit the window");
+                }
+            }
+        }
+    }
+}
