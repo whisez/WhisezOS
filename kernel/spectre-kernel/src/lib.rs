@@ -267,6 +267,16 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     // issues, so it outlives every process built from it.
     unsafe { task::arm_respawn(image, platform.kernel_root, 1, 3, endpoint) };
 
+    // And the process that outlives all of it. Armed here, started by the
+    // shutdown path once every demonstration process has exited and the frame
+    // accounting has been reported — a session holds frames, so starting one
+    // before the leak check would make the check meaningless.
+    //
+    // Without this the kernel halts when the last process exits, and a machine
+    // that finishes and stops looks exactly like one that hung.
+    // SAFETY: as above — the image outlives every process built from it.
+    unsafe { task::arm_session(image, platform.kernel_root, 9, grant) };
+
     // Two processes from one image. They share no memory — each gets its own
     // address space built from the same bytes — and tell themselves apart only
     // by the argument the kernel puts in `rdi`. Two is the smallest number that

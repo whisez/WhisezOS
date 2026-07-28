@@ -559,8 +559,83 @@ fn report_shutdown() -> ! {
     );
     report_frame_balance();
     kprintln!("[kernel] stage 2 complete");
-    kprintln!("[kernel] nothing left to schedule, halting");
-    crate::arch::halt_forever();
+
+    // Everything above is the demonstration finishing and accounting for
+    // itself. What follows is the machine going on running, which is a
+    // different thing and deliberately happens after the accounting: a session
+    // process holds frames, so starting one before the balance is reported
+    // would make the leak check meaningless.
+    // SAFETY: no process is live — every one has exited and been reaped — so
+    // nothing has state that starting another could disturb.
+    unsafe { start_session() }
+}
+
+/// What the system runs once the demonstration has finished and been counted.
+///
+/// Separate from `SPAWNER` because it is a different question. That one
+/// replaces a process to prove reclaimed frames are usable again, on a budget,
+/// during the run. This one is what the machine *is* afterwards.
+#[derive(Debug, Clone, Copy)]
+struct Session {
+    image_phys: u64,
+    image_len: usize,
+    kernel_root: PhysAddr,
+    argument: u64,
+    grant: u64,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+/// Arms the process that outlives the demonstration.
+///
+/// # Safety
+/// `image` must remain valid and mapped for the life of the system, which holds
+/// because it is in loader memory the allocator does not issue.
+pub unsafe fn arm_session(image: &'static [u8], kernel_root: PhysAddr, argument: u64, grant: u64) {
+    *SESSION.lock() = Some(Session {
+        image_phys: image.as_ptr() as u64,
+        image_len: image.len(),
+        kernel_root,
+        argument,
+        grant,
+    });
+}
+
+/// Starts the session, or halts if there is none.
+///
+/// # Safety
+/// Called with no live process, from the shutdown path.
+unsafe fn start_session() -> ! {
+    let Some(session) = *SESSION.lock() else {
+        kprintln!("[kernel] nothing left to schedule, halting");
+        crate::arch::halt_forever();
+    };
+
+    // SAFETY: the image lives in loader memory, which the frame allocator never
+    // issues, so the slice is valid for the life of the system.
+    let image =
+        unsafe { core::slice::from_raw_parts(session.image_phys as *const u8, session.image_len) };
+    // SAFETY: the early allocator is up, physical memory is identity mapped,
+    // and `kernel_root` is the table in CR3.
+    let process = match unsafe { crate::arch::user::load(image, session.kernel_root) } {
+        Ok(process) => process,
+        Err(error) => {
+            kprintln!("[kernel] SESSION REJECTED: {error:?}");
+            crate::arch::halt_forever();
+        }
+    };
+
+    // No endpoint: the session is not a client of anything yet. It gets the
+    // device grant, because it is what drives the screen from here on.
+    let Some(pid) = admit(&process, session.argument, 0, session.grant) else {
+        kprintln!("[kernel] no slot for the session");
+        crate::arch::halt_forever();
+    };
+    kprintln!("[kernel] session started as pid {pid}, the machine stays up");
+
+    // SAFETY: the session is the only live process and has never run, so its
+    // frame is the one that starts it.
+    unsafe { resume_next() }
 }
 
 /// Marks the running process as finished, returning its pid.

@@ -307,6 +307,16 @@ fn sys_exit(code: u64) -> ! {
     // And any interrupt line it held, or the line stays claimed by a pid that
     // will be reused — delivering somebody else's interrupts to a process that
     // never asked for them.
+    // And the devices behind them. Releasing a line says nobody owns it; it
+    // does not reach the hardware, which goes on interrupting until something
+    // tells it to stop.
+    for line in 0..irq::MAX_LINES {
+        if irq::owner(line) == Some(pid) {
+            // SAFETY: a system call arrives with interrupts disabled, which the
+            // register accesses require.
+            unsafe { arch::quiesce_device_line(line) };
+        }
+    }
     irq::on_process_gone(pid);
     if code == 0 {
         kprintln!("[kernel] pid {pid} exited with code 0");

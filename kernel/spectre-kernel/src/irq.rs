@@ -240,6 +240,20 @@ fn on_process_gone_in(lines: &mut Table, pid: u64) -> usize {
     released
 }
 
+/// Who owns a line, if anybody.
+///
+/// The exit path needs it: silencing a device is only correct for the process
+/// that was driving it, and asking before releasing is the only order in which
+/// the answer is still there.
+#[must_use]
+pub fn owner(line: usize) -> Option<u64> {
+    if line >= MAX_LINES {
+        return None;
+    }
+    let lines = LINES.lock();
+    lines[line].is_claimed().then_some(lines[line].owner)
+}
+
 /// How many processes are blocked waiting for an interrupt.
 ///
 /// The scheduler needs this to tell a deadlock from an idle system. Every live

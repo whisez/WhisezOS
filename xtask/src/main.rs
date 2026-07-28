@@ -467,6 +467,13 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     "[kernel] lapic id=",
     "[kernel] entering ring 3",
     "[kernel] stage 2 complete",
+    // And then the machine goes on running. Without this the kernel halted
+    // when the last process exited, which from the outside is indistinguishable
+    // from a hang — the screen simply stopped on "nothing left to schedule".
+    // The session starts after the frame accounting, because it holds frames.
+    "[kernel] session started as pid",
+    "[init 9] session owns the display and the clock",
+    "[init 9] session is drawing, the machine stays up",
 ];
 
 /// The IPC chain. Which client is served first is a race; that a client is

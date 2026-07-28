@@ -277,6 +277,41 @@ pub unsafe fn start_device_interrupt(line: usize) -> Result<u32, ioapic::IoApicE
     Ok(rtc::HZ)
 }
 
+/// Stops a device and masks its line, after the process driving it has gone.
+///
+/// Releasing the line in `irq.rs` is bookkeeping: it says nobody owns this any
+/// more. The device does not read that table. Left armed, the RTC goes on
+/// raising its interrupt at 64 Hz into a kernel whose only response is to
+/// notice nobody wanted it — which is exactly what the boot log showed after
+/// the driver exited, one line of `interrupt on unclaimed line 0, masking`.
+///
+/// Harmless, because the storm defence caught it. Still wrong: a device outlives
+/// its driver only because nothing told it not to.
+///
+/// # Safety
+/// Called with interrupts disabled, from the exit path.
+pub unsafe fn quiesce_device_line(line: usize) {
+    let Some((routed, pin)) = *ROUTED_PINS.lock() else {
+        return;
+    };
+    if routed != line {
+        return;
+    }
+
+    // Device first, then the line. The other order leaves a window in which an
+    // already-raised interrupt arrives at a line that is still unmasked and a
+    // process that is already gone.
+    // SAFETY: interrupts are off, as the caller guarantees.
+    unsafe { rtc::stop_periodic() };
+
+    // SAFETY: as above. `attach` rather than `init`: masking one pin should not
+    // mask every other.
+    if let Ok(chip) = unsafe { ioapic::attach(ioapic::DEFAULT_BASE) } {
+        // SAFETY: the pin was routed by `start_device_interrupt`.
+        let _ = unsafe { chip.mask(pin) };
+    }
+}
+
 /// Which I/O APIC pin each claimable line was routed to.
 ///
 /// One entry today. It exists because unmasking happens somewhere else and much

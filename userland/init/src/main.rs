@@ -164,8 +164,22 @@ fn spin(iterations: u64) {
     core::hint::black_box(sink);
 }
 
+/// The argument the kernel starts the session with.
+///
+/// Not 1, 2, or 3: those are the demonstration's processes, and a session that
+/// shared a number with one of them would run its test battery — which ends in
+/// `SYS_EXIT`, and a session that exits is the thing this exists to stop.
+const SESSION_ROLE: u64 = 9;
+
 #[no_mangle]
 pub extern "sysv64" fn _start(pid: u64, endpoint: u64, grant: u64) -> ! {
+    // The session is a different program that happens to share an image. It
+    // runs after the demonstration has finished and been accounted for, and it
+    // does not return.
+    if pid == SESSION_ROLE {
+        session(grant);
+    }
+
     say(pid, &[b"hello from ring 3"]);
 
     // The round trip. Printing could be faked by a kernel that never left ring
@@ -639,6 +653,138 @@ fn probe_disk(pid: u64, grant: u64) {
 
 /// The device index of the sound card, which the PCI scan appends fourth.
 const SOUND_DEVICE: u64 = 3;
+
+/// Rows of the framebuffer the session owns.
+///
+/// The band at the bottom the kernel console leaves alone — the same agreement
+/// `arch/framebuffer.rs` describes from the other side. Until there is a
+/// compositor arbitrating, the only thing keeping the two from scrolling over
+/// each other is that each writes where the other does not.
+const SESSION_BAND_ROWS: u64 = 104;
+
+/// The resident process: what the machine is once the demonstration is over.
+///
+/// # Why this exists
+///
+/// Without it the system halts. Every process ran its checks, exited, and was
+/// reaped, the kernel reported that nothing was left to schedule, and the screen
+/// froze on that line. Nothing was wrong — there was simply nothing after — but
+/// a machine that finishes and stops is indistinguishable, from the outside,
+/// from one that hung.
+///
+/// So this does not exit. It owns the display band and the ticker, and it
+/// redraws on every interrupt, which makes the screen visibly alive: an
+/// advancing bar is proof that interrupts are still arriving, that the
+/// scheduler is still running, and that a ring 3 process is still being given
+/// the processor.
+///
+/// It is not a service manager yet. It starts nothing and answers nothing —
+/// that is the next piece, and it needs a way to spawn a process on request
+/// rather than on a budget.
+fn session(grant: u64) -> ! {
+    let pid = SESSION_ROLE;
+    say(pid, &[b"session started, the machine is up"]);
+
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+    if call5(SYS_DEVICE_INFO, grant, 0, (&raw mut info) as u64, size, 0).is_err()
+        || info.kind != DeviceKind::Framebuffer as u32
+    {
+        // No screen. The serial console still works, so this is a degradation
+        // rather than a reason to stop — and stopping is the one thing this
+        // process must not do.
+        say(pid, &[b"session has no framebuffer, running blind"]);
+        idle_forever(pid, grant);
+    }
+
+    let base = match call(SYS_MAP_DEVICE, grant, 0) {
+        Ok(base) => base,
+        Err(error) => {
+            say(
+                pid,
+                &[b"session display map failed: ", error.name().as_bytes()],
+            );
+            idle_forever(pid, grant);
+        }
+    };
+
+    // The ports, then the line. Same order as the demonstration used, and for
+    // the same reason: a driver that waits before it can service the device
+    // gets one interrupt and then waits forever.
+    if let Err(error) = call(SYS_GRANT_PORTS, grant, TICKER_DEVICE) {
+        say(
+            pid,
+            &[b"session port grant failed: ", error.name().as_bytes()],
+        );
+        idle_forever(pid, grant);
+    }
+
+    say(pid, &[b"session owns the display and the clock"]);
+
+    let width = u64::from(info.width);
+    let height = u64::from(info.height);
+    let stride = u64::from(info.stride);
+    let top = height.saturating_sub(SESSION_BAND_ROWS);
+    let mut tick = 0u64;
+    let mut reported = false;
+
+    loop {
+        match call(SYS_IRQ_WAIT, grant, TICKER_DEVICE) {
+            Ok(count) => tick = tick.wrapping_add(count),
+            Err(error) => {
+                say(pid, &[b"session clock failed: ", error.name().as_bytes()]);
+                idle_forever(pid, grant);
+            }
+        }
+        // SAFETY: the port grant above covers these, which is what makes the
+        // instructions legal from ring 3 at all.
+        unsafe {
+            cmos_read(CMOS_REG_C);
+        }
+
+        // A bar that advances once per interrupt and wraps at the screen edge.
+        // Deliberately the simplest thing that cannot be faked by a still
+        // image: if it moves, a process outside the kernel is still being
+        // scheduled and hardware is still interrupting.
+        let filled = tick % width.max(1);
+        // SAFETY: `base` is the framebuffer window this process was granted,
+        // and every offset below is inside the band it owns.
+        unsafe {
+            for row in top..height {
+                let shade = ((row - top) * 2) as u32;
+                for column in 0..width {
+                    let colour = if column <= filled {
+                        0x0019_E6FF - (shade << 8)
+                    } else {
+                        0x0004_0810 + shade
+                    };
+                    ((base + (row * stride + column) * 4) as *mut u32).write_volatile(colour);
+                }
+            }
+        }
+
+        // Said once, so the boot test has evidence the loop ran rather than
+        // merely started, without the log filling up forever afterwards.
+        if !reported && tick >= 3 {
+            reported = true;
+            say(pid, &[b"session is drawing, the machine stays up"]);
+        }
+    }
+}
+
+/// Stays alive without a screen or a clock.
+///
+/// The session must not exit, so every failure above lands here rather than in
+/// `exit`. `SYS_PING` is used as the sleep: it enters the kernel, which gives
+/// the scheduler a chance to run something else, and it is the one call that
+/// cannot fail.
+fn idle_forever(pid: u64, _grant: u64) -> ! {
+    say(pid, &[b"session idling"]);
+    loop {
+        let _ = call(SYS_PING, 0, 0);
+        spin(SPIN);
+    }
+}
 
 /// virtio-sound's queues (virtio 1.2 §5.14.2).
 ///
