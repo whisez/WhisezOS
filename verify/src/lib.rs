@@ -140,6 +140,9 @@ pub mod console;
 #[path = "../../userland/init/src/keymap.rs"]
 pub mod keymap;
 
+#[path = "../../userland/init/src/editor.rs"]
+pub mod editor;
+
 #[path = "../../kernel/spectre-kernel/src/font.rs"]
 pub mod font;
 

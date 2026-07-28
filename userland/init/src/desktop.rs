@@ -27,10 +27,11 @@
 #![allow(dead_code)]
 
 /// Icons on the desktop.
-pub const ICON_COUNT: usize = 4;
+pub const ICON_COUNT: usize = 5;
 
 /// What each icon is called.
-pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"FILES", b"ASSISTANT", b"SHELL", b"TASKS"];
+pub const ICON_LABELS: [&[u8]; ICON_COUNT] =
+    [b"THIS PC", b"ASSISTANT", b"NOTEPAD", b"NETWORK", b"TASKS"];
 
 /// Icon geometry. The session draws with these and so does the hit test, which
 /// is the only way the two can agree.
@@ -44,9 +45,9 @@ pub const ICON_LEFT: u64 = 24;
 
 /// The bar across the bottom, and the button at its left end.
 pub const TASKBAR_HEIGHT: u64 = 48;
-pub const START_WIDTH: u64 = 72;
+pub const START_WIDTH: u64 = 64;
 /// One taskbar button per open window.
-pub const TASK_BUTTON_WIDTH: u64 = 168;
+pub const TASK_BUTTON_WIDTH: u64 = 132;
 pub const TASK_BUTTON_GAP: u64 = 4;
 
 /// The start menu: where it sits relative to the button, and how big.
@@ -74,11 +75,14 @@ pub enum Window {
     Tasks,
     Files,
     Assistant,
+    Editor,
+    Network,
+    Drivers,
 }
 
 /// How many there are. Used to size every per-window array, so adding one to
 /// the enum fails to compile rather than silently going unhandled.
-pub const WINDOW_COUNT: usize = 5;
+pub const WINDOW_COUNT: usize = 8;
 
 /// Every window, in a fixed order. Not a stacking order any more — that is in
 /// `Desktop::order` and it changes.
@@ -88,6 +92,9 @@ pub const ALL_WINDOWS: [Window; WINDOW_COUNT] = [
     Window::Tasks,
     Window::Files,
     Window::Assistant,
+    Window::Editor,
+    Window::Network,
+    Window::Drivers,
 ];
 
 impl Window {
@@ -100,6 +107,9 @@ impl Window {
             Self::Tasks => 2,
             Self::Files => 3,
             Self::Assistant => 4,
+            Self::Editor => 5,
+            Self::Network => 6,
+            Self::Drivers => 7,
         }
     }
 
@@ -112,6 +122,9 @@ impl Window {
             Self::Tasks => b"TASK MANAGER",
             Self::Files => b"FILES",
             Self::Assistant => b"ASSISTANT",
+            Self::Editor => b"NOTEPAD",
+            Self::Network => b"NETWORK & INTERNET",
+            Self::Drivers => b"DRIVER MANAGER",
         }
     }
 
@@ -124,6 +137,9 @@ impl Window {
             Self::Tasks => b"TASKS",
             Self::Files => b"FILES",
             Self::Assistant => b"ASSISTANT",
+            Self::Editor => b"NOTEPAD",
+            Self::Network => b"NETWORK",
+            Self::Drivers => b"DRIVERS",
         }
     }
 
@@ -133,7 +149,7 @@ impl Window {
     /// with nowhere to go is better than one that goes somewhere invisible.
     #[must_use]
     pub const fn takes_text(self) -> bool {
-        matches!(self, Self::Shell | Self::Assistant)
+        matches!(self, Self::Shell | Self::Assistant | Self::Editor)
     }
 }
 
@@ -171,10 +187,10 @@ pub const fn default_rect(window: Window) -> Rect {
             h: 300,
         },
         Window::Files => Rect {
-            x: 150,
-            y: 60,
-            w: 520,
-            h: 320,
+            x: 120,
+            y: 54,
+            w: 760,
+            h: 480,
         },
         // Wide enough for the longest line the assistant can say. Narrower and
         // the answers ran off the right edge, past the rectangle the redraw
@@ -190,6 +206,24 @@ pub const fn default_rect(window: Window) -> Rect {
             y: 380,
             w: 940,
             h: 340,
+        },
+        Window::Editor => Rect {
+            x: 220,
+            y: 80,
+            w: 820,
+            h: 560,
+        },
+        Window::Network => Rect {
+            x: 330,
+            y: 130,
+            w: 620,
+            h: 390,
+        },
+        Window::Drivers => Rect {
+            x: 280,
+            y: 96,
+            w: 700,
+            h: 470,
         },
     }
 }
@@ -222,9 +256,12 @@ pub const fn title_button_rect(rect: Rect, button: TitleButton) -> Rect {
 }
 
 /// What the start menu offers, and what each entry opens.
-pub const START_ITEMS: [&[u8]; 6] = [
+pub const START_ITEMS: [&[u8]; 9] = [
     b"Files",
+    b"Notepad",
     b"Assistant",
+    b"Network & Internet",
+    b"Driver Manager",
     b"Shell",
     b"Task manager",
     b"Devices",
@@ -236,10 +273,13 @@ pub const START_ITEMS: [&[u8]; 6] = [
 pub const fn start_window(index: usize) -> Option<Window> {
     match index {
         0 => Some(Window::Files),
-        1 => Some(Window::Assistant),
-        2 => Some(Window::Shell),
-        3 => Some(Window::Tasks),
-        4 => Some(Window::Devices),
+        1 => Some(Window::Editor),
+        2 => Some(Window::Assistant),
+        3 => Some(Window::Network),
+        4 => Some(Window::Drivers),
+        5 => Some(Window::Shell),
+        6 => Some(Window::Tasks),
+        7 => Some(Window::Devices),
         _ => None,
     }
 }
@@ -249,15 +289,32 @@ pub const fn start_window(index: usize) -> Option<Window> {
 /// Short, because everything else moved to the start menu where somebody would
 /// look for it. A right-click menu that repeats the start menu is a second
 /// place to keep the same list correct.
-pub const MENU_ITEMS: [&[u8]; 3] = [b"New folder", b"Refresh", b"Task manager"];
+pub const MENU_ITEMS: [&[u8]; 4] = [
+    b"New folder",
+    b"New text document",
+    b"Refresh",
+    b"Task manager",
+];
 
 /// Rows the FILES window shows, and where the first one starts.
 ///
 /// The first row is the way out — `..` when somewhere other than the root. A
 /// folder that can be entered and not left is a trap, and the way out belongs
 /// in the list rather than in a gesture somebody has to already know.
-pub const FILE_ROW_HEIGHT: u64 = 22;
-pub const FILE_ROW_TOP: u64 = 40;
+pub const FILE_ROW_HEIGHT: u64 = 28;
+pub const FILE_TOOLBAR_TOP: u64 = TITLE_HEIGHT + 8;
+pub const FILE_TOOLBAR_HEIGHT: u64 = 34;
+pub const FILE_ADDRESS_TOP: u64 = FILE_TOOLBAR_TOP + FILE_TOOLBAR_HEIGHT + 4;
+pub const FILE_ADDRESS_HEIGHT: u64 = 28;
+pub const FILE_HEADER_TOP: u64 = FILE_ADDRESS_TOP + FILE_ADDRESS_HEIGHT + 6;
+pub const FILE_ROW_TOP: u64 = FILE_HEADER_TOP + 28;
+
+pub const EDITOR_TOOLBAR_TOP: u64 = TITLE_HEIGHT;
+pub const EDITOR_TOOLBAR_HEIGHT: u64 = 38;
+pub const EDITOR_TEXT_TOP: u64 = EDITOR_TOOLBAR_TOP + EDITOR_TOOLBAR_HEIGHT + 8;
+pub const EDITOR_TEXT_LEFT: u64 = 14;
+pub const EDITOR_CELL_WIDTH: u64 = 8;
+pub const EDITOR_CELL_HEIGHT: u64 = 16;
 
 /// The task manager's column header, and the width of a row.
 pub const TASK_HEADER: &[u8] = b"PID  STATE    DMA  DEVICES";
@@ -322,6 +379,15 @@ pub enum Click {
     Minimise(Window),
     /// This row of the FILES window was clicked.
     File(usize),
+    /// A visible Explorer toolbar action.
+    FileNewFolder,
+    FileNewText,
+    /// The Notepad save button or a position in its text area.
+    EditorSave,
+    EditorCursor {
+        row: usize,
+        column: usize,
+    },
     /// A window is being dragged. The session repaints and nothing else.
     Drag,
 }
@@ -413,6 +479,9 @@ impl Desktop {
                 default_rect(Window::Tasks),
                 default_rect(Window::Files),
                 default_rect(Window::Assistant),
+                default_rect(Window::Editor),
+                default_rect(Window::Network),
+                default_rect(Window::Drivers),
             ],
             restore: [
                 default_rect(Window::Shell),
@@ -420,6 +489,9 @@ impl Desktop {
                 default_rect(Window::Tasks),
                 default_rect(Window::Files),
                 default_rect(Window::Assistant),
+                default_rect(Window::Editor),
+                default_rect(Window::Network),
+                default_rect(Window::Drivers),
             ],
             maximised: [false; WINDOW_COUNT],
             order: ALL_WINDOWS,
@@ -582,8 +654,9 @@ impl Desktop {
         match index {
             0 => Some(Window::Files),
             1 => Some(Window::Assistant),
-            2 => Some(Window::Shell),
-            3 => Some(Window::Tasks),
+            2 => Some(Window::Editor),
+            3 => Some(Window::Network),
+            4 => Some(Window::Tasks),
             _ => None,
         }
     }
@@ -679,6 +752,36 @@ impl Desktop {
         }
         let row = ((y - top) / FILE_ROW_HEIGHT) as usize;
         (row < rows).then_some(row)
+    }
+
+    #[must_use]
+    pub const fn file_new_folder_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 12,
+            y: rect.y + FILE_TOOLBAR_TOP,
+            w: 126,
+            h: FILE_TOOLBAR_HEIGHT,
+        }
+    }
+
+    #[must_use]
+    pub const fn file_new_text_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 146,
+            y: rect.y + FILE_TOOLBAR_TOP,
+            w: 142,
+            h: FILE_TOOLBAR_HEIGHT,
+        }
+    }
+
+    #[must_use]
+    pub const fn editor_save_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 12,
+            y: rect.y + EDITOR_TOOLBAR_TOP + 5,
+            w: 76,
+            h: EDITOR_TOOLBAR_HEIGHT - 10,
+        }
     }
 
     /// Handles a press at a point.
@@ -801,8 +904,27 @@ impl Desktop {
                 return self.open(window);
             }
             if window == Window::Files {
+                if Self::file_new_folder_rect(rect).holds(x, y) {
+                    return Click::FileNewFolder;
+                }
+                if Self::file_new_text_rect(rect).holds(x, y) {
+                    return Click::FileNewText;
+                }
                 if let Some(row) = self.file_row_under(y, rows) {
                     return Click::File(row);
+                }
+            }
+            if window == Window::Editor {
+                if Self::editor_save_rect(rect).holds(x, y) {
+                    return Click::EditorSave;
+                }
+                let text_top = rect.y + EDITOR_TEXT_TOP;
+                if y >= text_top {
+                    return Click::EditorCursor {
+                        row: ((y - text_top) / EDITOR_CELL_HEIGHT) as usize,
+                        column: (x.saturating_sub(rect.x + EDITOR_TEXT_LEFT) / EDITOR_CELL_WIDTH)
+                            as usize,
+                    };
                 }
             }
             return self.open(window);
@@ -1261,8 +1383,9 @@ mod tests {
         desktop.open(Window::Shell);
         desktop.start_open = true;
         let rect = desktop.rect(Window::Shell);
+        let menu = Desktop::start_menu_rect(HEIGHT);
         assert_eq!(
-            desktop.press(rect.x + 40, rect.y + 40, false, WIDTH, HEIGHT, 0),
+            desktop.press(menu.x + menu.w + 10, rect.y + 40, false, WIDTH, HEIGHT, 0),
             Click::CloseMenu
         );
         assert!(!desktop.start_open);
@@ -1435,7 +1558,7 @@ mod tests {
     #[test]
     fn only_windows_with_a_prompt_take_text() {
         for window in ALL_WINDOWS {
-            let expected = matches!(window, Window::Shell | Window::Assistant);
+            let expected = matches!(window, Window::Shell | Window::Assistant | Window::Editor);
             assert_eq!(window.takes_text(), expected, "{window:?}");
         }
     }

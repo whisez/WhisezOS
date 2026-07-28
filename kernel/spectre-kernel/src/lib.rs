@@ -106,6 +106,7 @@ fn register_virtio_device(
         return;
     };
     let listed = match kind {
+        virtio::TYPE_NETWORK => device::DeviceKind::Network,
         virtio::TYPE_BLOCK => device::DeviceKind::Block,
         virtio::TYPE_SOUND => device::DeviceKind::Sound,
         // `device_type` only answers for types in `KNOWN_TYPES`, so this is

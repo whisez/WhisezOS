@@ -42,6 +42,7 @@ mod font;
 /// a screenshot is a poor way to find out.
 mod console;
 mod desktop;
+mod editor;
 mod keymap;
 
 use abi::{
@@ -684,6 +685,8 @@ fn probe_disk(pid: u64, grant: u64) {
 
 /// The device index of the sound card, the second the PCI scan appends.
 const SOUND_DEVICE: u64 = 5;
+/// The modern virtio Ethernet adapter appended after disk and sound.
+const NETWORK_DEVICE: u64 = 6;
 
 /// The kernel's line numbers. Not device indices — a device index is what a
 /// process names when asking for hardware, and a line is what the kernel calls
@@ -1246,6 +1249,7 @@ fn session(grant: u64) -> ! {
     let mut modifiers = keymap::Modifiers::default();
     let mut shell = console::Console::new();
     let mut helper = console::Console::for_questions();
+    let mut notepad = editor::Editor::new();
     let mut face = desktop::Desktop::new();
     let mut buttons = desktop::Buttons::default();
     let mut pending_click: Option<(u64, u64, bool)> = None;
@@ -1255,10 +1259,10 @@ fn session(grant: u64) -> ! {
     shell.print(b"WhisezOS session. Type help.");
     // Said here rather than only in the module comment, because the person who
     // needs to read it is the one looking at the window.
-    helper.print(b"WhisezOS assistant. Not a language model:");
-    helper.print(b"there is none on this machine. I answer questions");
-    helper.print(b"about it from what the kernel and disk report.");
-    helper.print(b"Ask: uptime, processes, files, devices, or who I am.");
+    helper.print(b"WhisezOS Assistant / Sistem Asistani");
+    helper.print(b"Turkce ve English sistem komutlarini anlarim.");
+    helper.print(b"Sor: dosyalar, not defteri, ag, suruculer, gorevler.");
+    helper.print(b"Or ask: files, network, drivers, tasks, uptime.");
 
     // The disk, so `read` reads rather than reporting that it cannot. Failure
     // here is not fatal: a session without a disk is a session with one fewer
@@ -1266,6 +1270,7 @@ fn session(grant: u64) -> ! {
     let mut disk = attach_disk(&mut shell, grant);
     let mut files = mount(&mut shell, disk.as_mut());
     boot_sound(&mut shell, grant);
+    let network = attach_network(&mut shell, grant);
     let mut pointer = Pointer {
         x: (screen.width / 2) as i64,
         y: (screen.height / 2) as i64,
@@ -1343,14 +1348,6 @@ fn session(grant: u64) -> ! {
                                     painted = false;
                                 }
                             }
-                        } else if extended {
-                            // The byte after the prefix is a different key from
-                            // the same code without it, and none of them
-                            // produce characters. Skipping it is what stops an
-                            // arrow key from typing a letter.
-                            extended = false;
-                        } else if byte == keymap::EXTENDED {
-                            extended = true;
                         } else {
                             // The key is applied to whichever window holds the
                             // keyboard, and what it asked for is dealt with
@@ -1361,9 +1358,33 @@ fn session(grant: u64) -> ! {
                             // than typed into a window that is not on screen,
                             // which is where a shell that always listens puts
                             // it.
-                            let key = keymap::decode(byte, &mut modifiers);
+                            let key = if extended {
+                                extended = false;
+                                keymap::decode_extended(byte)
+                            } else if byte == keymap::EXTENDED {
+                                extended = true;
+                                keymap::Key::None
+                            } else {
+                                keymap::decode(byte, &mut modifiers)
+                            };
                             if !matches!(key, keymap::Key::None) {
                                 keys = keys.wrapping_add(1);
+                            }
+                            if face.focus == Some(desktop::Window::Editor) {
+                                match notepad.apply(key) {
+                                    editor::Action::Save => {
+                                        save_editor(
+                                            &mut notepad,
+                                            &mut shell,
+                                            disk.as_mut(),
+                                            &mut files,
+                                        );
+                                        painted = false;
+                                    }
+                                    editor::Action::Redraw => painted = false,
+                                    editor::Action::None => {}
+                                }
+                                continue;
                             }
                             let action = match face.focus {
                                 Some(desktop::Window::Assistant) => apply_key(&mut helper, key),
@@ -1376,9 +1397,16 @@ fn session(grant: u64) -> ! {
                                         answer(
                                             &mut helper,
                                             &line[..length],
-                                            tick,
-                                            &mut files,
-                                            disk.as_mut(),
+                                            AnswerContext {
+                                                tick,
+                                                files: &mut files,
+                                                disk: disk.as_mut(),
+                                                face: &mut face,
+                                                notepad: &mut notepad,
+                                                shell: &mut shell,
+                                                coined: &mut coined,
+                                                network: network.as_ref(),
+                                            },
                                         );
                                         // The notes may have grown, and the
                                         // FILES window shows what is on the
@@ -1457,6 +1485,7 @@ fn session(grant: u64) -> ! {
                     face: &mut face,
                     disk: disk.as_mut(),
                     files: &mut files,
+                    notepad: &mut notepad,
                     coined: &mut coined,
                     grant,
                     tick,
@@ -1477,7 +1506,14 @@ fn session(grant: u64) -> ! {
                 // closed underneath it.
                 pointer.forget();
                 painted = true;
-                draw_desktop(&screen, &face, files.as_ref(), tick);
+                draw_desktop(
+                    &screen,
+                    &face,
+                    files.as_ref(),
+                    &notepad,
+                    network.as_ref(),
+                    tick,
+                );
             }
             // Once a second rather than every tick. The states do change that
             // fast, but a table redrawn sixty-four times a second is unreadable
@@ -1714,11 +1750,20 @@ unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
                     }
                     screen.fill(cx - 3, cy - 3, 7, 7, colour::BAR_TEXT_ON);
                 }
-                // Shell: a dark terminal tile with a prompt.
+                // Notepad: a white page with blue text lines.
                 2 => {
-                    screen.fill(x + 5, y + 8, 47, 40, colour::ICON_EDGE);
-                    screen.fill(x + 7, y + 10, 43, 36, colour::ICON_TERMINAL);
-                    screen.text(x + 12, y + 19, b">_", colour::BAR_TEXT_ON);
+                    screen.fill(x + 10, y + 6, 36, 45, 0x00E9_F1F7);
+                    screen.fill(x + 38, y + 6, 8, 8, colour::ICON_EDGE);
+                    for row in 0..4u64 {
+                        screen.fill(x + 16, y + 20 + row * 7, 23, 2, colour::START);
+                    }
+                }
+                // Network: three ascending radio bars.
+                3 => {
+                    screen.fill(x + 10, y + 35, 7, 12, colour::ACCENT);
+                    screen.fill(x + 24, y + 25, 7, 22, colour::ACCENT);
+                    screen.fill(x + 38, y + 14, 7, 33, colour::ICON_ASSISTANT);
+                    screen.fill(x + 8, y + 49, 40, 2, colour::DIM);
                 }
                 // Tasks: a small performance graph.
                 _ => {
@@ -1754,6 +1799,8 @@ unsafe fn draw_desktop(
     screen: &Screen,
     face: &desktop::Desktop,
     files: Option<&dir::Table>,
+    notepad: &editor::Editor,
+    network: Option<&Network>,
     tick: u64,
 ) {
     // SAFETY: the caller guarantees the window; every call clips to geometry.
@@ -1772,7 +1819,7 @@ unsafe fn draw_desktop(
         // newly opened window underneath the one it was opened over.
         for window in face.order() {
             if face.is_visible(window) {
-                draw_window(screen, window, face, files);
+                draw_window(screen, window, face, files, notepad, network);
             }
         }
         draw_taskbar(screen, face, tick);
@@ -1789,6 +1836,8 @@ unsafe fn draw_window(
     window: desktop::Window,
     face: &desktop::Desktop,
     files: Option<&dir::Table>,
+    notepad: &editor::Editor,
+    network: Option<&Network>,
 ) {
     // The window in front is the active one, whether or not it takes text. A
     // task manager on top with the shell's bar coloured says the shell is where
@@ -1819,13 +1868,71 @@ unsafe fn draw_window(
             }
             desktop::Window::Files => {
                 let (fx, fy) = (dx, dy);
+                let folder_button = desktop::Desktop::file_new_folder_rect(rect);
+                let text_button = desktop::Desktop::file_new_text_rect(rect);
+                screen.fill(
+                    fx + 1,
+                    fy + desktop::FILE_TOOLBAR_TOP - 4,
+                    rect.w - 2,
+                    desktop::FILE_TOOLBAR_HEIGHT + 8,
+                    colour::PANEL,
+                );
+                for (button, label) in [
+                    (folder_button, &b"+ NEW FOLDER"[..]),
+                    (text_button, &b"+ NEW TEXT"[..]),
+                ] {
+                    screen.fill(button.x, button.y, button.w, button.h, colour::PANEL_BUTTON);
+                    screen.fill(
+                        button.x,
+                        button.y + button.h - 2,
+                        button.w,
+                        2,
+                        colour::ACCENT,
+                    );
+                    screen.text(button.x + 10, button.y + 9, label, colour::TEXT);
+                }
+
+                let address_y = fy + desktop::FILE_ADDRESS_TOP;
+                screen.fill(
+                    fx + 12,
+                    address_y,
+                    rect.w - 24,
+                    desktop::FILE_ADDRESS_HEIGHT,
+                    0x0010_1721,
+                );
+                screen.fill(fx + 12, address_y, rect.w - 24, 1, colour::PANEL_EDGE);
+                screen.text(
+                    fx + 24,
+                    address_y + 7,
+                    b"THIS PC  >  WHISEZ DISK",
+                    colour::TEXT,
+                );
+
                 let Some(table) = files else {
                     // A missing filesystem and an empty one look identical
                     // otherwise, and they call for different things from
                     // whoever is reading.
-                    screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
+                    screen.text(
+                        fx + 20,
+                        fy + desktop::FILE_ROW_TOP,
+                        b"NO DIRECTORY ON THIS DISK",
+                        colour::DIM,
+                    );
                     return;
                 };
+
+                if face.cwd != dir::ROOT {
+                    if let Some(entry) = table.entry(face.cwd) {
+                        screen.text(fx + 238, address_y + 7, b"  >  ", colour::DIM);
+                        screen.text(fx + 278, address_y + 7, entry.label(), colour::ACCENT);
+                    }
+                }
+
+                let header_y = fy + desktop::FILE_HEADER_TOP;
+                screen.fill(fx + 12, header_y, rect.w - 24, 24, 0x001A_2533);
+                screen.text(fx + 54, header_y + 5, b"NAME", colour::DIM);
+                screen.text(fx + rect.w - 230, header_y + 5, b"TYPE", colour::DIM);
+                screen.text(fx + rect.w - 104, header_y + 5, b"SIZE", colour::DIM);
 
                 // The listing and the hit test walk the same rows in the same
                 // order, through the same two functions. Two walks would be two
@@ -1837,32 +1944,67 @@ unsafe fn draw_window(
                 // thing the folder holds. Counting rows left a folder holding
                 // nothing looking like a folder holding one thing.
                 if table.children(face.cwd).next().is_none() {
-                    screen.text(fx + 16, fy + 44, b"THIS FOLDER IS EMPTY", colour::DIM);
                     screen.text(
-                        fx + 16,
-                        fy + 68,
-                        b"RIGHT CLICK FOR A NEW FOLDER",
+                        fx + 54,
+                        fy + desktop::FILE_ROW_TOP + 12,
+                        b"THIS FOLDER IS EMPTY",
+                        colour::DIM,
+                    );
+                    screen.text(
+                        fx + 54,
+                        fy + desktop::FILE_ROW_TOP + 36,
+                        b"USE THE TOOLBAR TO CREATE A FOLDER OR TEXT FILE",
                         colour::DIM,
                     );
                 }
                 for row in 0..rows {
                     let at = fy + desktop::FILE_ROW_TOP + row as u64 * desktop::FILE_ROW_HEIGHT;
-                    let (mark, label) = match file_row(table, face.cwd, row) {
-                        Some(Row::Up) => (&b"[UP] "[..], &b".."[..]),
+                    if row.is_multiple_of(2) {
+                        screen.fill(
+                            fx + 12,
+                            at,
+                            rect.w - 24,
+                            desktop::FILE_ROW_HEIGHT,
+                            0x0014_1C27,
+                        );
+                    }
+                    let (mark, label, kind, length) = match file_row(table, face.cwd, row) {
+                        Some(Row::Up) => (&b"^"[..], &b".."[..], &b"PARENT"[..], 0),
                         Some(Row::Entry(entry)) => (
                             if entry.kind == dir::Kind::Directory.code() {
-                                &b"[DIR]"[..]
+                                &b"[]"[..]
                             } else {
-                                &b"     "[..]
+                                &b"T"[..]
                             },
                             entry.label(),
+                            if entry.kind == dir::Kind::Directory.code() {
+                                &b"FOLDER"[..]
+                            } else {
+                                &b"TEXT FILE"[..]
+                            },
+                            entry.length,
                         ),
                         None => break,
                     };
-                    screen.text(fx + 16, at, mark, colour::ACCENT);
-                    screen.text(fx + 92, at, label, colour::TEXT);
+                    screen.text(fx + 24, at + 6, mark, colour::ACCENT);
+                    screen.text(fx + 54, at + 6, label, colour::TEXT);
+                    screen.text(fx + rect.w - 230, at + 6, kind, colour::DIM);
+                    if length != 0 {
+                        let mut digits = [0u8; 20];
+                        let value = console::decimal(length, &mut digits);
+                        screen.text(fx + rect.w - 104, at + 6, value, colour::DIM);
+                        screen.text(
+                            fx + rect.w - 104 + value.len() as u64 * CELL_W,
+                            at + 6,
+                            b" B",
+                            colour::DIM,
+                        );
+                    }
                 }
             }
+            desktop::Window::Editor => draw_editor(screen, rect, notepad),
+            desktop::Window::Network => draw_network(screen, rect, network),
+            desktop::Window::Drivers => draw_drivers(screen, rect, network),
             // Their contents are drawn by the live layer, which runs on a
             // different schedule: the frames here, the text there.
             desktop::Window::Tasks | desktop::Window::Assistant | desktop::Window::Shell => {}
@@ -1875,6 +2017,377 @@ struct Disk {
     queue: Queue,
     region: DmaRegion,
     sectors: u64,
+}
+
+/// A live virtio-net data path. The queues and buffers stay owned for the
+/// session lifetime; the visible fields are results observed from the adapter
+/// and QEMU's user-mode gateway, not optimistic configuration flags.
+struct Network {
+    rx_queue: Queue,
+    tx_queue: Queue,
+    rx: DmaRegion,
+    tx: DmaRegion,
+    mac: [u8; 6],
+    ip: [u8; 4],
+    gateway: [u8; 4],
+    dns: [u8; 4],
+    link_up: bool,
+    gateway_reachable: bool,
+    dns_ready: bool,
+}
+
+impl Network {
+    #[must_use]
+    const fn online(&self) -> bool {
+        self.link_up && self.gateway_reachable && self.dns_ready
+    }
+}
+
+const NET_PACKET_BYTES: u64 = 2048;
+// Modern virtio-net uses the v1 header, including the two-byte `num_buffers`
+// field. QEMU strips all twelve bytes before putting the Ethernet frame on the
+// backend; using the ten-byte legacy size would consume the first two bytes of
+// the destination MAC and turn a broadcast ARP request into a malformed frame.
+const VIRTIO_NET_HEADER: usize = 12;
+const NET_FEATURE_MAC: u32 = 1 << 5;
+const NET_FEATURE_STATUS: u32 = 1 << 16;
+const NET_STATUS_LINK_UP: u16 = 1;
+const NET_RX_QUEUE: u16 = 0;
+const NET_TX_QUEUE: u16 = 1;
+const NET_IP: [u8; 4] = [10, 0, 2, 15];
+const NET_GATEWAY: [u8; 4] = [10, 0, 2, 2];
+const NET_DNS: [u8; 4] = [10, 0, 2, 3];
+
+/// Starts the modern virtio Ethernet device, proves transmit/receive with ARP,
+/// then resolves `example.com` through the usernet DNS proxy. This is enough to
+/// distinguish a configured adapter from a working route to the outside.
+fn attach_network(shell: &mut console::Console, grant: u64) -> Option<Network> {
+    let pid = SESSION_ROLE;
+    let mut info = DeviceInfo::EMPTY;
+    let size = core::mem::size_of::<DeviceInfo>() as u64;
+    if call5(
+        SYS_DEVICE_INFO,
+        grant,
+        NETWORK_DEVICE,
+        (&raw mut info) as u64,
+        size,
+        0,
+    )
+    .is_err()
+        || info.kind != DeviceKind::Network as u32
+    {
+        shell.print(b"network: no virtio Ethernet adapter");
+        return None;
+    }
+
+    let window = call(SYS_MAP_DEVICE, grant, NETWORK_DEVICE).ok()?;
+    let common = window + u64::from(info.common_offset);
+    let notify = window + u64::from(info.notify_offset);
+    let config = window + u64::from(info.config_offset);
+    let accepted = virtio_handshake_features(pid, common, NET_FEATURE_MAC | NET_FEATURE_STATUS, 90);
+    if accepted & NET_FEATURE_MAC == 0 {
+        shell.print(b"network: adapter did not expose a MAC address");
+        return None;
+    }
+
+    let mut mac = [0u8; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        // SAFETY: the six-byte MAC is the first field in virtio-net config.
+        *byte = unsafe { mmio_read8(config + index as u64) };
+    }
+    let link_up = if accepted & NET_FEATURE_STATUS != 0 {
+        // SAFETY: status follows the six-byte MAC when the feature is accepted.
+        unsafe { mmio_read16(config + 6) & NET_STATUS_LINK_UP != 0 }
+    } else {
+        true
+    };
+
+    let rx_queue = setup_queue(pid, common, notify, &info, NET_RX_QUEUE, 92)?;
+    let tx_queue = setup_queue(pid, common, notify, &info, NET_TX_QUEUE, 95)?;
+    let mut rx = DmaRegion::EMPTY;
+    let mut tx = DmaRegion::EMPTY;
+    let out_bytes = core::mem::size_of::<DmaRegion>() as u64;
+    if call5(
+        SYS_ALLOC_DMA,
+        NET_PACKET_BYTES,
+        (&raw mut rx) as u64,
+        out_bytes,
+        0,
+        0,
+    )
+    .is_err()
+        || call5(
+            SYS_ALLOC_DMA,
+            NET_PACKET_BYTES,
+            (&raw mut tx) as u64,
+            out_bytes,
+            0,
+            0,
+        )
+        .is_err()
+    {
+        shell.print(b"network: no DMA memory for packets");
+        return None;
+    }
+
+    // SAFETY: both queues and packet buffers are complete.
+    unsafe {
+        mmio_write8(
+            common + u64::from(common::DEVICE_STATUS),
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+    }
+
+    let mut network = Network {
+        rx_queue,
+        tx_queue,
+        rx,
+        tx,
+        mac,
+        ip: NET_IP,
+        gateway: NET_GATEWAY,
+        dns: NET_DNS,
+        link_up,
+        gateway_reachable: false,
+        dns_ready: false,
+    };
+
+    if link_up {
+        if let Some(_gateway_mac) = arp_lookup(&mut network, NET_GATEWAY) {
+            network.gateway_reachable = true;
+        }
+        if let Some(dns_mac) = arp_lookup(&mut network, NET_DNS) {
+            network.dns_ready = dns_probe(&mut network, dns_mac);
+        }
+    }
+
+    if network.online() {
+        shell.print(b"network online: 10.0.2.15, DNS verified");
+        say(pid, &[b"network online, gateway and DNS verified"]);
+    } else if network.gateway_reachable {
+        shell.print(b"network: gateway reachable, DNS unavailable");
+    } else if network.link_up {
+        shell.print(b"network: adapter up, gateway unavailable");
+    } else {
+        shell.print(b"network: adapter reports link down");
+    }
+    Some(network)
+}
+
+fn post_receive(network: &mut Network) {
+    use core::sync::atomic::{fence, Ordering};
+    let queue = &mut network.rx_queue;
+    // SAFETY: descriptor zero and the available slot are inside this queue's
+    // DMA allocation, and `rx` is a separate DMA region owned by the session.
+    unsafe {
+        write_descriptor(
+            queue.desc,
+            0,
+            network.rx.bus,
+            NET_PACKET_BYTES as u32,
+            desc_flag::WRITE,
+            0,
+        );
+        let slot = queue.next_avail % queue.size;
+        ((queue.avail + 4 + u64::from(slot) * 2) as *mut u16).write_volatile(0);
+        queue.next_avail = queue.next_avail.wrapping_add(1);
+        fence(Ordering::Release);
+        ((queue.avail + 2) as *mut u16).write_volatile(queue.next_avail);
+        fence(Ordering::Release);
+        mmio_write16(queue.notify, NET_RX_QUEUE);
+    }
+}
+
+fn send_packet(network: &mut Network, length: usize) -> bool {
+    use core::sync::atomic::{fence, Ordering};
+    let queue = &mut network.tx_queue;
+    // SAFETY: descriptor zero and both rings are inside the queue DMA region.
+    unsafe {
+        write_descriptor(queue.desc, 0, network.tx.bus, length as u32, 0, 0);
+        let slot = queue.next_avail % queue.size;
+        ((queue.avail + 4 + u64::from(slot) * 2) as *mut u16).write_volatile(0);
+        queue.next_avail = queue.next_avail.wrapping_add(1);
+        fence(Ordering::Release);
+        ((queue.avail + 2) as *mut u16).write_volatile(queue.next_avail);
+        fence(Ordering::Release);
+        mmio_write16(queue.notify, NET_TX_QUEUE);
+
+        for _ in 0..20_000_000u64 {
+            fence(Ordering::Acquire);
+            let used = ((queue.used + 2) as *const u16).read_volatile();
+            if used != queue.last_used {
+                queue.last_used = used;
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    false
+}
+
+fn receive_packet(network: &mut Network) -> Option<usize> {
+    use core::sync::atomic::{fence, Ordering};
+    let queue = &mut network.rx_queue;
+    // SAFETY: the used ring belongs to this queue and is written by the device.
+    unsafe {
+        for _ in 0..40_000_000u64 {
+            fence(Ordering::Acquire);
+            let used = ((queue.used + 2) as *const u16).read_volatile();
+            if used != queue.last_used {
+                let slot = queue.last_used % queue.size;
+                let element = queue.used + 4 + u64::from(slot) * 8;
+                let length = ((element + 4) as *const u32).read_volatile() as usize;
+                queue.last_used = used;
+                return Some(length.min(NET_PACKET_BYTES as usize));
+            }
+            core::hint::spin_loop();
+        }
+    }
+    None
+}
+
+fn arp_lookup(network: &mut Network, target: [u8; 4]) -> Option<[u8; 6]> {
+    // SAFETY: `tx` and `rx` are live packet buffers owned by this process.
+    let packet = unsafe {
+        core::slice::from_raw_parts_mut(network.tx.virt as *mut u8, NET_PACKET_BYTES as usize)
+    };
+    packet.fill(0);
+    let frame = &mut packet[VIRTIO_NET_HEADER..];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&network.mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x06]);
+    frame[14..16].copy_from_slice(&[0x00, 0x01]);
+    frame[16..18].copy_from_slice(&[0x08, 0x00]);
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&[0x00, 0x01]);
+    frame[22..28].copy_from_slice(&network.mac);
+    frame[28..32].copy_from_slice(&network.ip);
+    frame[32..38].fill(0);
+    frame[38..42].copy_from_slice(&target);
+
+    // User-mode networking can deliver an IPv6 advertisement or another
+    // broadcast before the ARP reply. With one receive buffer that packet
+    // consumes the request, so repost the buffer and retransmit instead of
+    // mistaking ordinary background traffic for an unreachable gateway.
+    for _ in 0..4 {
+        post_receive(network);
+        if !send_packet(network, VIRTIO_NET_HEADER + 42) {
+            return None;
+        }
+        let Some(length) = receive_packet(network) else {
+            continue;
+        };
+        if length < VIRTIO_NET_HEADER + 42 {
+            continue;
+        }
+        // SAFETY: the device completed a write no longer than the allocation.
+        let received = unsafe { core::slice::from_raw_parts(network.rx.virt as *const u8, length) };
+        let frame = &received[VIRTIO_NET_HEADER..];
+        if frame[12..14] != [0x08, 0x06] || frame[20..22] != [0x00, 0x02] || frame[28..32] != target
+        {
+            continue;
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&frame[22..28]);
+        return Some(mac);
+    }
+    None
+}
+
+fn dns_probe(network: &mut Network, dns_mac: [u8; 6]) -> bool {
+    // SAFETY: `tx` is a packet buffer owned by this process.
+    let packet = unsafe {
+        core::slice::from_raw_parts_mut(network.tx.virt as *mut u8, NET_PACKET_BYTES as usize)
+    };
+    packet.fill(0);
+    let frame = &mut packet[VIRTIO_NET_HEADER..];
+    frame[..6].copy_from_slice(&dns_mac);
+    frame[6..12].copy_from_slice(&network.mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x00]);
+
+    const DNS_BYTES: usize = 29;
+    const UDP_BYTES: usize = 8 + DNS_BYTES;
+    const IP_BYTES: usize = 20 + UDP_BYTES;
+    let ip = &mut frame[14..14 + 20];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(IP_BYTES as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&0x575Au16.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[12..16].copy_from_slice(&network.ip);
+    ip[16..20].copy_from_slice(&network.dns);
+    let checksum = internet_checksum(ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    let udp = &mut frame[34..42];
+    udp[0..2].copy_from_slice(&49152u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&(UDP_BYTES as u16).to_be_bytes());
+    // A zero UDP checksum is valid for IPv4.
+
+    let dns = &mut frame[42..42 + DNS_BYTES];
+    dns[0..2].copy_from_slice(&0x575Au16.to_be_bytes());
+    dns[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+    dns[4..6].copy_from_slice(&1u16.to_be_bytes());
+    let qname = [
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ];
+    dns[12..25].copy_from_slice(&qname);
+    dns[25..27].copy_from_slice(&1u16.to_be_bytes());
+    dns[27..29].copy_from_slice(&1u16.to_be_bytes());
+
+    for _ in 0..4 {
+        post_receive(network);
+        if !send_packet(network, VIRTIO_NET_HEADER + 14 + IP_BYTES) {
+            return false;
+        }
+        let Some(length) = receive_packet(network) else {
+            continue;
+        };
+        if length < VIRTIO_NET_HEADER + 14 + 20 + 8 + 12 {
+            continue;
+        }
+        // SAFETY: the completed packet length is bounded by the DMA buffer.
+        let received = unsafe { core::slice::from_raw_parts(network.rx.virt as *const u8, length) };
+        let frame = &received[VIRTIO_NET_HEADER..];
+        if frame[12..14] != [0x08, 0x00] || frame[23] != 17 {
+            continue;
+        }
+        let ihl = usize::from(frame[14] & 0x0F) * 4;
+        let udp_at = 14 + ihl;
+        if frame.len() < udp_at + 8 + 12
+            || u16::from_be_bytes([frame[udp_at + 2], frame[udp_at + 3]]) != 49152
+        {
+            continue;
+        }
+        let dns = &frame[udp_at + 8..];
+        if u16::from_be_bytes([dns[0], dns[1]]) == 0x575A
+            && dns[2] & 0x80 != 0
+            && dns[3] & 0x0F == 0
+            && u16::from_be_bytes([dns[6], dns[7]]) > 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in bytes.chunks(2) {
+        let word = if pair.len() == 2 {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from(pair[0]) << 8
+        };
+        sum += u32::from(word);
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+    }
+    !(sum as u16)
 }
 
 /// Brings the disk up for the session, or explains why not.
@@ -2097,7 +2610,15 @@ fn apply_key(console: &mut console::Console, key: keymap::Key) -> console::Actio
             console::Action::None
         }
         keymap::Key::Enter => console.enter(),
-        keymap::Key::None => console::Action::None,
+        keymap::Key::Left
+        | keymap::Key::Right
+        | keymap::Key::Up
+        | keymap::Key::Down
+        | keymap::Key::Home
+        | keymap::Key::End
+        | keymap::Key::Delete
+        | keymap::Key::Save
+        | keymap::Key::None => console::Action::None,
     }
 }
 
@@ -2108,13 +2629,28 @@ fn apply_key(console: &mut console::Console, key: keymap::Key) -> console::Actio
 /// machine, which is here. Neither half can drift into the other: a matcher that
 /// could read a clock would be untestable, and a window that decided what words
 /// meant would be a second place where that is decided.
-fn answer(
-    helper: &mut console::Console,
-    question: &[u8],
+struct AnswerContext<'a> {
     tick: u64,
-    files: &mut Option<dir::Table>,
-    disk: Option<&mut Disk>,
-) {
+    files: &'a mut Option<dir::Table>,
+    disk: Option<&'a mut Disk>,
+    face: &'a mut desktop::Desktop,
+    notepad: &'a mut editor::Editor,
+    shell: &'a mut console::Console,
+    coined: &'a mut u32,
+    network: Option<&'a Network>,
+}
+
+fn answer(helper: &mut console::Console, question: &[u8], context: AnswerContext<'_>) {
+    let AnswerContext {
+        tick,
+        files,
+        disk,
+        face,
+        notepad,
+        shell,
+        coined,
+        network,
+    } = context;
     match assistant::ask(question) {
         assistant::Answer::Remember => {
             let text = assistant::remembered_text(question).unwrap_or(b"");
@@ -2152,10 +2688,44 @@ fn answer(
             helper.print(b"virtio-blk disk, 16 mib");
             helper.print(b"virtio-snd, 1 output stream 1 input");
         }
+        assistant::Answer::Network => match network {
+            Some(adapter) if adapter.online() => {
+                helper.print(b"Ag cevrimici: 10.0.2.15. DNS testi basarili.");
+                helper.print(b"VirtIO surucusu ve Internet gecidi calisiyor.");
+            }
+            Some(adapter) if adapter.gateway_reachable => {
+                helper.print(b"Ag gecidine ulasiyorum ama DNS yanit vermiyor.");
+            }
+            Some(_) => helper.print(b"Ag karti bulundu fakat Internet rotasi yok."),
+            None => helper.print(b"Bu makinede desteklenen bir ag karti bulunamadi."),
+        },
+        assistant::Answer::OpenFiles => {
+            face.open(desktop::Window::Files);
+            helper.print(b"Dosyalar penceresini actim.");
+        }
+        assistant::Answer::OpenEditor => {
+            if notepad.file_id().is_none() {
+                create_new_text(shell, disk, files, notepad, face, coined);
+            }
+            face.open(desktop::Window::Editor);
+            helper.print(b"Not Defteri'ni actim. Ctrl+S ile kaydedebilirsin.");
+        }
+        assistant::Answer::OpenNetwork => {
+            face.open(desktop::Window::Network);
+            helper.print(b"Ag ve Internet penceresini actim.");
+        }
+        assistant::Answer::OpenDrivers => {
+            face.open(desktop::Window::Drivers);
+            helper.print(b"Surucu Yoneticisi'ni actim.");
+        }
+        assistant::Answer::NewText => {
+            create_new_text(shell, disk, files, notepad, face, coined);
+            helper.print(b"Yeni metin belgesini olusturdum.");
+        }
         assistant::Answer::Unknown => {
-            helper.print(b"I cannot answer that. I am not a language model");
-            helper.print(b"and I will not guess. Ask about uptime, processes,");
-            helper.print(b"files, devices, memory, or the network.");
+            helper.print(b"Bunu henuz anlayamiyorum; tahmin etmeyecegim.");
+            helper.print(b"Dosyalar, ag, suruculer, gorevler veya sureyi sor.");
+            helper.print(b"English commands are supported too.");
         }
     }
 }
@@ -2477,6 +3047,96 @@ fn make_folder(
     }
 }
 
+/// Creates an empty text file in the folder Explorer is showing and opens it
+/// in Notepad. The directory update is rolled back when the disk refuses it.
+fn create_new_text(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: &mut Option<dir::Table>,
+    notepad: &mut editor::Editor,
+    face: &mut desktop::Desktop,
+    coined: &mut u32,
+) {
+    let Some(table) = files.as_mut() else {
+        shell.print(b"no directory on this disk");
+        return;
+    };
+    *coined += 1;
+    let mut name = *b"NOTE00.TXT";
+    name[4] = b'0' + ((*coined / 10) % 10) as u8;
+    name[5] = b'0' + (*coined % 10) as u8;
+    let before = *table;
+    match table.create(face.cwd, &name, dir::Kind::File) {
+        Ok(id) => {
+            let after = *table;
+            if store(shell, disk, &after) {
+                notepad.open(id, &name, b"");
+                face.open(desktop::Window::Editor);
+                shell.print(b"text document created");
+            } else {
+                *table = before;
+                shell.print(b"the text document was not created");
+            }
+        }
+        Err(dir::Error::Exists) => shell.print(b"that text document already exists"),
+        Err(dir::Error::Full) => shell.print(b"the directory is full"),
+        Err(dir::Error::NoParent) => shell.print(b"that folder is not there any more"),
+        Err(_) => shell.print(b"the text document could not be created"),
+    }
+}
+
+fn open_text(
+    notepad: &mut editor::Editor,
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: Option<&dir::Table>,
+    id: u16,
+) -> bool {
+    let Some(table) = files else {
+        return false;
+    };
+    let Some(entry) = table.entry(id) else {
+        return false;
+    };
+    if entry.kind != dir::Kind::File.code() {
+        return false;
+    }
+    let mut name = [0u8; dir::NAME_MAX];
+    let name_len = entry.label().len();
+    name[..name_len].copy_from_slice(entry.label());
+    let mut bytes = [0u8; editor::CAPACITY];
+    let Some(length) = read_file(shell, disk, table, id, &mut bytes) else {
+        return false;
+    };
+    notepad.open(id, &name[..name_len], &bytes[..length]);
+    true
+}
+
+fn save_editor(
+    notepad: &mut editor::Editor,
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: &mut Option<dir::Table>,
+) {
+    let Some(id) = notepad.file_id() else {
+        shell.print(b"there is no text document to save");
+        notepad.saved(false);
+        return;
+    };
+    let Some(table) = files.as_mut() else {
+        shell.print(b"there is no directory to save into");
+        notepad.saved(false);
+        return;
+    };
+    let ok = write_file(shell, disk, table, id, notepad.text());
+    notepad.saved(ok);
+    if ok {
+        shell.print(b"text document saved");
+    }
+}
+
+const _: () = assert!(editor::CAPACITY == dir::MAX_FILE_BYTES);
+
 /// Reads one sector and prints the first bytes of it.
 fn read_sector(shell: &mut console::Console, disk: Option<&mut Disk>, sector: u64) {
     let Some(disk) = disk else {
@@ -2571,6 +3231,7 @@ struct Session<'a> {
     face: &'a mut desktop::Desktop,
     disk: Option<&'a mut Disk>,
     files: &'a mut Option<dir::Table>,
+    notepad: &'a mut editor::Editor,
     /// How many folders the menu has named, so the next one gets a new name.
     coined: &'a mut u32,
     grant: u64,
@@ -2583,6 +3244,7 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
         face,
         disk,
         files,
+        notepad,
         coined,
         grant,
         tick,
@@ -2617,11 +3279,12 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
                     face.open(desktop::Window::Files);
                     make_folder(shell, disk, files, &name, face.cwd);
                 }
+                1 => create_new_text(shell, disk, files, notepad, face, coined),
                 // Refresh. Everything on this desktop is redrawn from the
                 // state it describes, so there is nothing to reload — the
                 // repaint below is the whole of it, and saying so is better
                 // than an entry that quietly does nothing.
-                1 => {}
+                2 => {}
                 _ => {
                     face.open(desktop::Window::Tasks);
                 }
@@ -2632,6 +3295,9 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
         }
         desktop::Click::Start(item) => {
             if let Some(window) = desktop::start_window(item) {
+                if window == desktop::Window::Editor && notepad.file_id().is_none() {
+                    create_new_text(shell, disk, files, notepad, face, coined);
+                }
                 face.open(window);
                 return true;
             }
@@ -2643,6 +3309,27 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
             true
         }
         desktop::Click::OpenStart | desktop::Click::Minimise(_) | desktop::Click::Drag => true,
+        desktop::Click::FileNewFolder => {
+            *coined += 1;
+            let mut name = *b"FOLDER 00";
+            name[7] = b'0' + ((*coined / 10) % 10) as u8;
+            name[8] = b'0' + (*coined % 10) as u8;
+            make_folder(shell, disk, files, &name, face.cwd);
+            true
+        }
+        desktop::Click::FileNewText => {
+            create_new_text(shell, disk, files, notepad, face, coined);
+            true
+        }
+        desktop::Click::EditorSave => {
+            save_editor(notepad, shell, disk, files);
+            true
+        }
+        desktop::Click::EditorCursor { row, column } => {
+            notepad.place(row, column);
+            face.open(desktop::Window::Editor);
+            true
+        }
         desktop::Click::File(row) => {
             let Some(table) = files.as_ref() else {
                 return false;
@@ -2665,23 +3352,28 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
                     // what there is to say — and saying that is better than a
                     // click that does nothing and leaves somebody wondering
                     // whether the click worked.
-                    let mut line = [b' '; console::COLUMNS];
-                    let label = entry.label();
-                    let take = label.len().min(console::COLUMNS - 20);
-                    line[..take].copy_from_slice(&label[..take]);
-                    let tail = b" bytes: ";
-                    line[take..take + tail.len()].copy_from_slice(tail);
-                    let mut digits = [0u8; 20];
-                    let rendered = console::decimal(entry.length, &mut digits);
-                    let at = take + tail.len();
-                    line[at..at + rendered.len()].copy_from_slice(rendered);
-                    shell.print(&line[..at + rendered.len()]);
-                    false
+                    let id = entry.id;
+                    if open_text(notepad, shell, disk, files.as_ref(), id) {
+                        face.open(desktop::Window::Editor);
+                    }
+                    true
                 }
                 None => false,
             }
         }
         // Opening or closing a window changes what the static layer holds.
+        desktop::Click::Close(desktop::Window::Editor) => {
+            if notepad.dirty() {
+                save_editor(notepad, shell, disk, files);
+            }
+            true
+        }
+        desktop::Click::Open(desktop::Window::Editor) => {
+            if notepad.file_id().is_none() {
+                create_new_text(shell, disk, files, notepad, face, coined);
+            }
+            true
+        }
         desktop::Click::Open(_) | desktop::Click::Close(_) => true,
         desktop::Click::None => true,
     }
@@ -2734,6 +3426,217 @@ unsafe fn draw_tasks(screen: &Screen, rect: desktop::Rect) {
         desktop::write_number(&mut totals[24..31], list.switches);
         screen.text(x + 16, y + h - 44, &totals, colour::DIM);
     }
+}
+
+/// The desktop Notepad. Text is edited in-place and saved with the button or
+/// Ctrl+S; the status bar makes the difference between memory and disk visible.
+unsafe fn draw_editor(screen: &Screen, rect: desktop::Rect, notepad: &editor::Editor) {
+    let desktop::Rect { x, y, w, h } = rect;
+    let save = desktop::Desktop::editor_save_rect(rect);
+    let text_top = y + desktop::EDITOR_TEXT_TOP;
+    let status_h = 26u64;
+    let text_bottom = y + h - status_h;
+    // SAFETY: the caller owns the framebuffer; every primitive clips.
+    unsafe {
+        screen.fill(
+            x + 1,
+            y + desktop::EDITOR_TOOLBAR_TOP,
+            w - 2,
+            desktop::EDITOR_TOOLBAR_HEIGHT,
+            colour::PANEL,
+        );
+        screen.fill(save.x, save.y, save.w, save.h, colour::PANEL_BUTTON);
+        screen.fill(save.x, save.y + save.h - 2, save.w, 2, colour::ACCENT);
+        screen.text(save.x + 16, save.y + 7, b"SAVE", colour::TEXT);
+        screen.text(x + 108, save.y + 7, notepad.name(), colour::TEXT);
+        if notepad.dirty() {
+            screen.text(
+                x + 108 + notepad.name().len() as u64 * CELL_W,
+                save.y + 7,
+                b" *",
+                colour::ACCENT,
+            );
+        }
+
+        screen.fill(
+            x + 1,
+            text_top - 5,
+            w - 2,
+            text_bottom - text_top + 5,
+            0x000E_141C,
+        );
+        let rows = ((text_bottom - text_top) / desktop::EDITOR_CELL_HEIGHT) as usize;
+        let columns = ((w - desktop::EDITOR_TEXT_LEFT - 16) / desktop::EDITOR_CELL_WIDTH) as usize;
+        for row in 0..rows {
+            let Some(line) = notepad.line(row) else {
+                break;
+            };
+            screen.text(
+                x + desktop::EDITOR_TEXT_LEFT,
+                text_top + row as u64 * desktop::EDITOR_CELL_HEIGHT,
+                &line[..line.len().min(columns)],
+                colour::TEXT,
+            );
+        }
+
+        let (caret_row, caret_column) = notepad.cursor_line_column();
+        if caret_row < rows && caret_column <= columns {
+            screen.fill(
+                x + desktop::EDITOR_TEXT_LEFT + caret_column as u64 * desktop::EDITOR_CELL_WIDTH,
+                text_top + caret_row as u64 * desktop::EDITOR_CELL_HEIGHT,
+                2,
+                desktop::EDITOR_CELL_HEIGHT,
+                colour::ACCENT,
+            );
+        }
+
+        screen.fill(x + 1, y + h - status_h, w - 2, status_h - 1, colour::PANEL);
+        let status = match notepad.status() {
+            editor::Status::Ready => &b"READY"[..],
+            editor::Status::Modified => &b"MODIFIED - CTRL+S TO SAVE"[..],
+            editor::Status::Saved => &b"SAVED TO WHISEZ DISK"[..],
+            editor::Status::SaveFailed => &b"SAVE FAILED"[..],
+            editor::Status::Full => &b"FILE LIMIT REACHED (4096 BYTES)"[..],
+        };
+        screen.text(x + 12, y + h - 20, status, colour::DIM);
+        let (line, column) = notepad.cursor_line_column();
+        let mut position = *b"LN 000  COL 000";
+        desktop::write_number(&mut position[3..6], line as u64 + 1);
+        desktop::write_number(&mut position[11..14], column as u64 + 1);
+        screen.text(x + w - 142, y + h - 20, &position, colour::DIM);
+    }
+}
+
+/// Connection panel. The live network driver replaces these fields as its
+/// state changes; until then the UI reports the actual offline state.
+unsafe fn draw_network(screen: &Screen, rect: desktop::Rect, network: Option<&Network>) {
+    let desktop::Rect { x, y, w, .. } = rect;
+    let mut ip_text = [0u8; 15];
+    let mut gateway_text = [0u8; 15];
+    let mut dns_text = [0u8; 15];
+    let mut mac_text = [0u8; 17];
+    let (headline, link, internet, ip, gateway, dns, mac) = match network {
+        Some(adapter) => (
+            if adapter.online() {
+                &b"CONNECTED - DNS VERIFIED"[..]
+            } else if adapter.gateway_reachable {
+                &b"CONNECTED - DNS UNAVAILABLE"[..]
+            } else {
+                &b"ADAPTER READY - NO ROUTE"[..]
+            },
+            if adapter.link_up {
+                &b"UP"[..]
+            } else {
+                &b"DOWN"[..]
+            },
+            if adapter.online() {
+                &b"ONLINE"[..]
+            } else {
+                &b"LIMITED"[..]
+            },
+            format_ipv4(adapter.ip, &mut ip_text),
+            format_ipv4(adapter.gateway, &mut gateway_text),
+            format_ipv4(adapter.dns, &mut dns_text),
+            format_mac(adapter.mac, &mut mac_text),
+        ),
+        None => (
+            &b"NO SUPPORTED ADAPTER"[..],
+            &b"DOWN"[..],
+            &b"OFFLINE"[..],
+            &b"NOT ASSIGNED"[..],
+            &b"NOT AVAILABLE"[..],
+            &b"NOT AVAILABLE"[..],
+            &b"--:--:--:--:--:--"[..],
+        ),
+    };
+    unsafe {
+        screen.fill(x + 24, y + 52, 58, 58, 0x0011_2838);
+        screen.fill(x + 36, y + 88, 8, 14, colour::ACCENT);
+        screen.fill(x + 50, y + 76, 8, 26, colour::ACCENT);
+        screen.fill(x + 64, y + 64, 8, 38, colour::ACCENT);
+        screen.text(x + 104, y + 54, b"VIRTIO ETHERNET", colour::TEXT);
+        screen.text(x + 104, y + 78, headline, colour::ACCENT);
+        screen.text(x + 24, y + 142, b"STATUS", colour::DIM);
+        screen.fill(x + 24, y + 166, w - 48, 1, colour::PANEL_EDGE);
+        for (row, label, value) in [
+            (184, &b"LINK"[..], link),
+            (212, &b"IP ADDRESS"[..], ip),
+            (240, &b"INTERNET"[..], internet),
+            (268, &b"GATEWAY"[..], gateway),
+            (296, &b"DNS"[..], dns),
+            (324, &b"MAC"[..], mac),
+        ] {
+            screen.text(x + 24, y + row, label, colour::DIM);
+            screen.text(x + 170, y + row, value, colour::TEXT);
+        }
+    }
+}
+
+/// Driver Manager lists the built-in ring-3 drivers that are actually part of
+/// this image. WhisezOS intentionally does not execute arbitrary kernel code.
+unsafe fn draw_drivers(screen: &Screen, rect: desktop::Rect, network: Option<&Network>) {
+    let desktop::Rect { x, y, w, .. } = rect;
+    let network_state: &[u8] = match network {
+        Some(adapter) if adapter.online() => b"RUNNING",
+        Some(_) => b"LIMITED",
+        None => b"NOT FOUND",
+    };
+    let rows: [(&[u8], &[u8]); 7] = [
+        (b"FRAMEBUFFER DISPLAY", b"RUNNING"),
+        (b"I8042 KEYBOARD", b"RUNNING"),
+        (b"I8042 MOUSE", b"RUNNING"),
+        (b"RTC CLOCK", b"RUNNING"),
+        (b"VIRTIO BLOCK", b"RUNNING"),
+        (b"VIRTIO SOUND", b"RUNNING"),
+        (b"VIRTIO NETWORK", network_state),
+    ];
+    unsafe {
+        screen.text(x + 20, y + 48, b"DEVICE", colour::DIM);
+        screen.text(x + w - 156, y + 48, b"STATUS", colour::DIM);
+        screen.fill(x + 20, y + 70, w - 40, 1, colour::PANEL_EDGE);
+        for (index, (name, state)) in rows.iter().enumerate() {
+            let row = y + 82 + index as u64 * 42;
+            if index.is_multiple_of(2) {
+                screen.fill(x + 20, row - 6, w - 40, 36, 0x0014_1C27);
+            }
+            screen.fill(x + 28, row + 3, 10, 10, colour::ACCENT);
+            screen.text(x + 52, row, name, colour::TEXT);
+            screen.text(x + w - 156, row, state, colour::ACCENT);
+        }
+        screen.text(
+            x + 20,
+            y + 400,
+            b"SANDBOXED USER-SPACE DRIVERS - SIGNED IMAGE ONLY",
+            colour::DIM,
+        );
+    }
+}
+
+fn format_ipv4(address: [u8; 4], out: &mut [u8; 15]) -> &[u8] {
+    let mut at = 0usize;
+    for (index, octet) in address.iter().enumerate() {
+        let mut digits = [0u8; 20];
+        let rendered = console::decimal(u64::from(*octet), &mut digits);
+        out[at..at + rendered.len()].copy_from_slice(rendered);
+        at += rendered.len();
+        if index != address.len() - 1 {
+            out[at] = b'.';
+            at += 1;
+        }
+    }
+    &out[..at]
+}
+
+fn format_mac(address: [u8; 6], out: &mut [u8; 17]) -> &[u8] {
+    for (index, byte) in address.iter().enumerate() {
+        let at = index * 3;
+        out[at] = hex_digit(byte >> 4);
+        out[at + 1] = hex_digit(byte & 0x0F);
+        if index != address.len() - 1 {
+            out[at + 2] = b':';
+        }
+    }
+    out
 }
 
 /// Four panes: familiar Windows shell grammar, drawn in WhisezOS cyan.
@@ -3822,6 +4725,13 @@ fn control_request(
 /// whether it is talking to a disk or a sound card. `failure_base` is where this
 /// device's exit codes start, so a failure names which device it was.
 fn virtio_handshake(pid: u64, common: u64, failure_base: u64) -> bool {
+    let _ = virtio_handshake_features(pid, common, 0, failure_base);
+    true
+}
+
+/// Performs the common modern-virtio handshake and accepts only explicitly
+/// requested low-word features. Returns the subset the device actually offers.
+fn virtio_handshake_features(pid: u64, common: u64, requested_low: u32, failure_base: u64) -> u32 {
     // SAFETY: `common` is inside a device window this process was given.
     unsafe {
         mmio_write8(common + u64::from(common::DEVICE_STATUS), 0);
@@ -3839,8 +4749,11 @@ fn virtio_handshake(pid: u64, common: u64, failure_base: u64) -> bool {
             status::ACKNOWLEDGE | status::DRIVER,
         );
 
+        mmio_write32(common + u64::from(common::DEVICE_FEATURE_SELECT), 0);
+        let offered_low = mmio_read32(common + u64::from(common::DEVICE_FEATURE));
+        let accepted_low = offered_low & requested_low;
         mmio_write32(common + u64::from(common::DRIVER_FEATURE_SELECT), 0);
-        mmio_write32(common + u64::from(common::DRIVER_FEATURE), 0);
+        mmio_write32(common + u64::from(common::DRIVER_FEATURE), accepted_low);
         mmio_write32(
             common + u64::from(common::DRIVER_FEATURE_SELECT),
             FEATURE_VERSION_1_WORD,
@@ -3858,8 +4771,8 @@ fn virtio_handshake(pid: u64, common: u64, failure_base: u64) -> bool {
             say(pid, &[b"device rejected the negotiated features"]);
             exit(failure_base + 1);
         }
+        accepted_low
     }
-    true
 }
 
 /// Builds one queue and hands its three ring addresses to the device.

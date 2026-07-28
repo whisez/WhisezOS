@@ -46,15 +46,15 @@ pub const USER_STACK_BYTES: u64 = 64 * 1024;
 /// Most regions a process can hold: one per loadable segment, the stack, every
 /// device window it maps, and every DMA buffer it takes.
 ///
-/// Sixteen because init now drives three devices. Three loadable segments and
-/// a stack, three device windows — framebuffer, disk, sound card — and five DMA
-/// buffers comes to twelve, and a region table with no headroom is one that has
-/// to be raised again on the next driver.
+/// Twenty-four because init now drives four devices. Three loadable segments
+/// and a stack, four device windows — framebuffer, disk, sound card, network —
+/// and nine DMA buffers come to seventeen. The remaining slots leave room for
+/// a driver to grow without failing halfway through queue setup.
 ///
 /// At eight, the block driver was refused its last allocation partway through
 /// bringing up a queue. That is the worst moment to run out: the device is half
 /// configured and the process has no way to undo it.
-pub const MAX_USER_REGIONS: usize = 16;
+pub const MAX_USER_REGIONS: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserError {

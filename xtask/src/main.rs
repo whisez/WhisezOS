@@ -408,6 +408,11 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
         "none,id=snd0"
     };
     let sound_device = "virtio-sound-pci,audiodev=snd0";
+    // User-mode networking gives the guest an isolated NAT gateway while the
+    // device itself remains a real modern virtio adapter driven from ring 3.
+    let network_backend = "user,id=net0,restrict=off";
+    let network_device =
+        "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off,mac=52:54:00:12:34:56";
 
     // Headless when capturing, windowed when a person is watching. The kernel
     // draws its console to the framebuffer as well as the serial port, so the
@@ -460,6 +465,10 @@ fn run_kernel_qemu(machine: &str, ram: &str, serial: Option<&Path>, windowed: bo
             audio_backend,
             "-device",
             sound_device,
+            "-netdev",
+            network_backend,
+            "-device",
+            network_device,
             // A control socket, so the screen can be captured from outside the
             // guest. Looking at what is actually drawn is the only way to check
             // a claim about the display: the serial log says what the kernel
@@ -636,6 +645,7 @@ const REQUIRED_LINES: &[&str] = &[
     // file this file attaches — a number neither side hardcodes twice.
     "[kernel] virtio-block is device 4",
     "[kernel] virtio-sound is device 5",
+    "[kernel] virtio-network is device 6",
     "[init 1] disk ready from ring 3: 0x0000000000008000 sectors",
     // A virtqueue, and a real block transfer through it. The write-then-read
     // is what makes the comparison mean anything: the disk image is a fresh

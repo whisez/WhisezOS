@@ -163,6 +163,8 @@ pub enum DeviceKind {
     Keyboard = 5,
     /// The mouse half of the same chip, on its own interrupt.
     Mouse = 6,
+    /// A virtio Ethernet adapter driven from ring 3.
+    Network = 7,
 }
 
 /// `SYS_TASK_LIST(buffer, capacity) -> bytes written`.

@@ -53,6 +53,14 @@ pub enum Answer {
     Files,
     /// What hardware there is.
     Devices,
+    /// Current network state, read by the session.
+    Network,
+    /// Open one of the desktop tools.
+    OpenFiles,
+    OpenEditor,
+    OpenNetwork,
+    OpenDrivers,
+    NewText,
     /// Write what follows the keyword into the notes file.
     Remember,
     /// Read the notes file back.
@@ -71,7 +79,15 @@ pub const NOTES: &[u8] = b"NOTES.MD";
 /// Plurals are listed rather than stemmed. "notes" is not "note" to a
 /// whole-word match, and "what are your notes" is the plainest way somebody
 /// asks — it reached the who-am-I answer instead, because "you" was in it.
-const MEMORY_WORDS: [&[u8]; 4] = [b"remember", b"note", b"notes", b"memorise"];
+const MEMORY_WORDS: [&[u8]; 7] = [
+    b"remember",
+    b"note",
+    b"notes",
+    b"memorise",
+    b"hatirla",
+    b"notlar",
+    b"kaydet",
+];
 
 /// What to write down, out of a question that asks for something to be.
 ///
@@ -143,32 +159,53 @@ struct Topic {
 /// was asked for.
 const TOPICS: &[Topic] = &[
     Topic {
-        words: &[b"uptime", b"long", b"running"],
+        words: &[b"uptime", b"long", b"running", b"sure", b"acik"],
         answer: Answer::Uptime,
     },
     Topic {
-        words: &[b"process", b"processes", b"tasks"],
+        words: &[b"process", b"processes", b"tasks", b"surec", b"gorev"],
         answer: Answer::Processes,
     },
     Topic {
-        words: &[b"file", b"files", b"folder", b"folders", b"disk", b"ls"],
+        words: &[
+            b"file",
+            b"files",
+            b"folder",
+            b"folders",
+            b"disk",
+            b"ls",
+            b"dosya",
+            b"dosyalar",
+            b"klasor",
+        ],
         answer: Answer::Files,
     },
     Topic {
-        words: &[b"device", b"devices", b"hardware", b"sound", b"mouse"],
+        words: &[
+            b"device",
+            b"devices",
+            b"hardware",
+            b"sound",
+            b"mouse",
+            b"aygit",
+            b"donanim",
+            b"ses",
+            b"fare",
+            b"surucu",
+        ],
         answer: Answer::Devices,
     },
     Topic {
-        words: &[b"who", b"you", b"yourself"],
+        words: &[b"who", b"you", b"yourself", b"kimsin", b"nesin"],
         answer: Answer::Say(&[
             b"I am not a language model and there is none here.",
-            b"I answer a fixed set of questions about this machine",
-            b"from what the kernel and the disk report.",
-            b"Ask: uptime, processes, files, devices, memory, help.",
+            b"Ben yerel WhisezOS sistem asistaninin ilk surumuyum.",
+            b"Kernel, disk, ag ve surucu durumunu okuyabilirim.",
+            b"Sor: sistem, dosyalar, ag, suruculer, yardim.",
         ]),
     },
     Topic {
-        words: &[b"memory", b"ram", b"free"],
+        words: &[b"memory", b"ram", b"free", b"bellek", b"bos"],
         answer: Answer::Say(&[
             b"The kernel does not report free memory to ring 3 yet.",
             b"The task manager shows DMA regions and device",
@@ -176,19 +213,29 @@ const TOPICS: &[Topic] = &[
         ]),
     },
     Topic {
-        words: &[b"internet", b"network", b"wifi", b"ip", b"browser"],
-        answer: Answer::Say(&[
-            b"There is no network. No driver, no stack, no card",
-            b"attached. Nothing here can reach anything outside",
-            b"this machine, and nothing here pretends to.",
-        ]),
+        words: &[
+            b"internet",
+            b"internete",
+            b"internette",
+            b"network",
+            b"wifi",
+            b"ip",
+            b"browser",
+            b"ag",
+            b"baglanti",
+            b"baglan",
+            b"bagli",
+            b"cevrimici",
+            b"online",
+        ],
+        answer: Answer::Network,
     },
     Topic {
-        words: &[b"help", b"can", b"do"],
+        words: &[b"help", b"can", b"do", b"yardim", b"yapabilirsin"],
         answer: Answer::Say(&[
-            b"Ask about: uptime, processes, files, devices,",
-            b"memory, network. Or ask who I am.",
-            b"For commands, open the shell and type help.",
+            b"Dosyalari, Not Defteri'ni, agi ve suruculeri acabilirim.",
+            b"Sistem suresi, gorevler, donanim ve agi sorabilirsin.",
+            b"English: files, network, devices, uptime, help.",
         ]),
     },
 ];
@@ -213,6 +260,52 @@ pub fn ask(question: &[u8]) -> Answer {
             Answer::Remember
         };
     }
+    let open = has_any(question, &[b"open", b"show", b"ac", b"goster"]);
+    if open
+        && has_any(
+            question,
+            &[b"notepad", b"editor", b"metin", b"notdefteri", b"not"],
+        )
+    {
+        return Answer::OpenEditor;
+    }
+    if open
+        && has_any(
+            question,
+            &[
+                b"file",
+                b"files",
+                b"folder",
+                b"dosya",
+                b"dosyalari",
+                b"klasor",
+            ],
+        )
+    {
+        return Answer::OpenFiles;
+    }
+    if open && has_any(question, &[b"network", b"internet", b"ag", b"baglanti"]) {
+        return Answer::OpenNetwork;
+    }
+    if open
+        && has_any(
+            question,
+            &[
+                b"driver",
+                b"drivers",
+                b"surucu",
+                b"suruculer",
+                b"suruculeri",
+            ],
+        )
+    {
+        return Answer::OpenDrivers;
+    }
+    if has_any(question, &[b"new", b"create", b"yeni", b"olustur"])
+        && has_any(question, &[b"text", b"txt", b"metin", b"dosya"])
+    {
+        return Answer::NewText;
+    }
     for topic in TOPICS {
         for word in topic.words {
             if contains_word(question, word) {
@@ -221,6 +314,10 @@ pub fn ask(question: &[u8]) -> Answer {
         }
     }
     Answer::Unknown
+}
+
+fn has_any(question: &[u8], words: &[&[u8]]) -> bool {
+    words.iter().any(|word| contains_word(question, word))
 }
 
 /// Whether a question contains a word, as a whole word and ignoring case.
@@ -269,7 +366,7 @@ mod tests {
     fn it_answers_the_question_it_was_asked() {
         assert_eq!(ask(b"uptime"), Answer::Uptime);
         assert_eq!(ask(b"what processes are there"), Answer::Processes);
-        assert_eq!(ask(b"show me the files"), Answer::Files);
+        assert_eq!(ask(b"what files are on disk"), Answer::Files);
         assert_eq!(ask(b"what devices does this have"), Answer::Devices);
     }
 
@@ -317,13 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn it_does_not_claim_a_network_it_does_not_have() {
-        let Answer::Say(lines) = ask(b"can I get on the internet") else {
-            panic!("the assistant dodged the question");
-        };
-        assert!(lines
-            .iter()
-            .any(|line| line.windows(2).any(|w| w == b"no" || w == b"No")));
+    fn network_questions_ask_the_session_for_live_state() {
+        assert_eq!(ask(b"can I get on the internet"), Answer::Network);
+        assert_eq!(ask(b"ag baglantisi var mi"), Answer::Network);
+        assert_eq!(ask(b"internete bagli miyim"), Answer::Network);
+        assert_eq!(ask(b"su an internette miyim"), Answer::Network);
+    }
+
+    #[test]
+    fn turkish_questions_and_desktop_actions_are_understood() {
+        assert_eq!(ask(b"sistem ne kadar suredir acik"), Answer::Uptime);
+        assert_eq!(ask(b"dosyalari goster"), Answer::OpenFiles);
+        assert_eq!(ask(b"not defterini ac"), Answer::OpenEditor);
+        assert_eq!(ask(b"suruculeri goster"), Answer::OpenDrivers);
+        assert_eq!(ask(b"yeni metin dosyasi olustur"), Answer::NewText);
     }
 
     #[test]

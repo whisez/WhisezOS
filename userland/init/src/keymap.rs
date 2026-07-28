@@ -47,6 +47,14 @@ pub mod code {
     pub const LEFT_ALT: u8 = 0x38;
     pub const SPACE: u8 = 0x39;
     pub const CAPS_LOCK: u8 = 0x3A;
+    pub const S: u8 = 0x1F;
+    pub const HOME: u8 = 0x47;
+    pub const UP: u8 = 0x48;
+    pub const LEFT: u8 = 0x4B;
+    pub const RIGHT: u8 = 0x4D;
+    pub const END: u8 = 0x4F;
+    pub const DOWN: u8 = 0x50;
+    pub const DELETE: u8 = 0x53;
 }
 
 /// Unshifted characters, indexed by scancode. Zero means "not a character".
@@ -72,6 +80,15 @@ pub enum Key {
     Char(u8),
     Enter,
     Backspace,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Delete,
+    /// The conventional Ctrl+S save shortcut.
+    Save,
     /// Nothing a shell acts on: a release, a modifier, or a key with no
     /// character.
     None,
@@ -82,6 +99,7 @@ pub enum Key {
 pub struct Modifiers {
     pub shift: bool,
     pub caps: bool,
+    pub control: bool,
 }
 
 impl Modifiers {
@@ -111,6 +129,10 @@ pub fn decode(scancode: u8, modifiers: &mut Modifiers) -> Key {
             modifiers.shift = !released;
             return Key::None;
         }
+        code::LEFT_CONTROL => {
+            modifiers.control = !released;
+            return Key::None;
+        }
         // Caps lock toggles on press and does nothing on release. Toggling on
         // both would leave it exactly as it started.
         code::CAPS_LOCK if !released => {
@@ -127,6 +149,7 @@ pub fn decode(scancode: u8, modifiers: &mut Modifiers) -> Key {
     match code {
         code::ENTER => Key::Enter,
         code::BACKSPACE => Key::Backspace,
+        code::S if modifiers.control => Key::Save,
         _ => {
             let index = code as usize;
             if index >= UNSHIFTED.len() {
@@ -152,6 +175,28 @@ pub fn decode(scancode: u8, modifiers: &mut Modifiers) -> Key {
                 Key::Char(byte)
             }
         }
+    }
+}
+
+/// Decodes the byte following an `EXTENDED` prefix.
+///
+/// Navigation keys use the same numeric codes as keypad keys but only after
+/// the prefix. Keeping this separate stops an ordinary keypad press from
+/// moving the Notepad caret.
+#[must_use]
+pub const fn decode_extended(scancode: u8) -> Key {
+    if scancode & RELEASE != 0 {
+        return Key::None;
+    }
+    match scancode {
+        code::HOME => Key::Home,
+        code::UP => Key::Up,
+        code::LEFT => Key::Left,
+        code::RIGHT => Key::Right,
+        code::END => Key::End,
+        code::DOWN => Key::Down,
+        code::DELETE => Key::Delete,
+        _ => Key::None,
     }
 }
 
@@ -241,6 +286,25 @@ mod tests {
         let mut m = Modifiers::default();
         assert_eq!(press(code::ENTER, &mut m), Key::Enter);
         assert_eq!(press(code::BACKSPACE, &mut m), Key::Backspace);
+    }
+
+    #[test]
+    fn control_s_is_save_and_release_restores_plain_s() {
+        let mut m = Modifiers::default();
+        assert_eq!(press(code::LEFT_CONTROL, &mut m), Key::None);
+        assert_eq!(press(code::S, &mut m), Key::Save);
+        assert_eq!(press(code::LEFT_CONTROL | RELEASE, &mut m), Key::None);
+        assert_eq!(press(code::S, &mut m), Key::Char(b's'));
+    }
+
+    #[test]
+    fn extended_navigation_keys_are_named() {
+        assert_eq!(decode_extended(code::LEFT), Key::Left);
+        assert_eq!(decode_extended(code::RIGHT), Key::Right);
+        assert_eq!(decode_extended(code::UP), Key::Up);
+        assert_eq!(decode_extended(code::DOWN), Key::Down);
+        assert_eq!(decode_extended(code::DELETE), Key::Delete);
+        assert_eq!(decode_extended(code::LEFT | RELEASE), Key::None);
     }
 
     #[test]

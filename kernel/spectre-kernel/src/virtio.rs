@@ -42,6 +42,8 @@ pub const VENDOR: u16 = 0x1AF4;
 
 /// Modern virtio device IDs are 0x1040 plus the device type.
 pub const DEVICE_ID_BASE: u16 = 0x1040;
+/// Device type 1: an Ethernet adapter.
+pub const TYPE_NETWORK: u16 = 1;
 /// Device type 2: a block device.
 pub const TYPE_BLOCK: u16 = 2;
 /// Device type 25: a sound card, with playback and capture.
@@ -53,7 +55,11 @@ pub const TYPE_SOUND: u16 = 25;
 /// does not know that a block device has sectors or that a sound device has
 /// streams — the transport is identical and everything above it is the
 /// driver's. Adding a type here is one line because that is all it should be.
-pub const KNOWN_TYPES: &[(u16, &str)] = &[(TYPE_BLOCK, "block"), (TYPE_SOUND, "sound")];
+pub const KNOWN_TYPES: &[(u16, &str)] = &[
+    (TYPE_NETWORK, "network"),
+    (TYPE_BLOCK, "block"),
+    (TYPE_SOUND, "sound"),
+];
 
 /// Which known type this header is, if any.
 #[must_use]
@@ -488,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn a_virtio_block_device_is_recognised_and_a_network_one_is_not() {
+    fn known_virtio_device_types_are_recognised_without_confusing_each_other() {
         let block = pci::Header {
             vendor: VENDOR,
             device: DEVICE_ID_BASE + TYPE_BLOCK,
@@ -505,10 +511,12 @@ mod tests {
         assert!(is_virtio(&block, TYPE_BLOCK));
 
         let network = pci::Header {
-            device: DEVICE_ID_BASE + 1,
+            device: DEVICE_ID_BASE + TYPE_NETWORK,
             ..block
         };
         assert!(!is_virtio(&network, TYPE_BLOCK));
+        assert!(is_virtio(&network, TYPE_NETWORK));
+        assert_eq!(device_type(&network), Some((TYPE_NETWORK, "network")));
 
         let impostor = pci::Header {
             vendor: 0x8086,

@@ -71,7 +71,8 @@ pub const DMA_SLOT_SIZE: u64 = 2 * 1024 * 1024;
 ///
 /// Each buffer costs a permitted region in the process's table, so this cannot
 /// be raised without raising `MAX_USER_REGIONS` to match.
-pub const MAX_DMA_REGIONS: u64 = 6;
+/// Disk (2), sound (4), and network (4) can coexist in the desktop session.
+pub const MAX_DMA_REGIONS: u64 = 10;
 
 /// Largest single buffer.
 ///
