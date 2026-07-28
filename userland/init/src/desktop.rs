@@ -106,6 +106,36 @@ pub const fn close_at(window: Window) -> (u64, u64) {
     )
 }
 
+/// Whether a point is inside a window at all.
+#[must_use]
+pub const fn inside(window: Window, x: u64, y: u64) -> bool {
+    let (wx, wy, w, h) = bounds(window);
+    x >= wx && x < wx + w && y >= wy && y < wy + h
+}
+
+/// The order to draw open windows in, back to front.
+///
+/// Everything else first and the front window last, so the one somebody just
+/// clicked is the one they can read. Without this a window opened on top of
+/// another was drawn underneath it, because the draw order was fixed and the
+/// click order was not — and with no way to move a window, a covered window is
+/// a window that is gone.
+#[must_use]
+pub fn draw_order(front: Option<Window>) -> [Window; 5] {
+    let mut out = [Window::Devices; 5];
+    let mut at = 0;
+    for window in ALL_WINDOWS.into_iter().rev() {
+        if Some(window) != front {
+            out[at] = window;
+            at += 1;
+        }
+    }
+    if let Some(window) = front {
+        out[at] = window;
+    }
+    out
+}
+
 /// Whether a point is on a window's close box.
 #[must_use]
 pub const fn on_close(window: Window, x: u64, y: u64) -> bool {
@@ -225,6 +255,13 @@ pub struct Desktop {
     pub tasks_open: bool,
     pub files_open: bool,
     pub assistant_open: bool,
+    /// Which folder the FILES window is showing. The root until somebody goes
+    /// somewhere; back to the root when the window is closed, so opening it
+    /// again does not land wherever it was left days ago with no way to tell.
+    pub cwd: u16,
+    /// Which window is drawn last, and so is on top. Not the same as focus: the
+    /// task manager can be in front without taking the keyboard.
+    pub front: Option<Window>,
     /// Which window keystrokes go to. Set when a window is opened or clicked
     /// into, cleared when it closes — a window that keeps the keyboard after it
     /// is gone is where typing disappears to.
@@ -242,6 +279,8 @@ impl Desktop {
             tasks_open: false,
             files_open: false,
             assistant_open: false,
+            cwd: 0,
+            front: None,
             focus: None,
         }
     }
@@ -267,9 +306,12 @@ impl Desktop {
             Window::Files => self.files_open = true,
             Window::Assistant => self.assistant_open = true,
         }
+        // Focus follows the window that takes text. Opening the task manager
+        // while somebody is typing must not swallow the next key.
         if window.takes_text() {
             self.focus = Some(window);
         }
+        self.front = Some(window);
         Click::Open(window)
     }
 
@@ -279,8 +321,14 @@ impl Desktop {
             Window::Shell => self.shell_open = false,
             Window::Devices => self.devices_open = false,
             Window::Tasks => self.tasks_open = false,
-            Window::Files => self.files_open = false,
+            Window::Files => {
+                self.files_open = false;
+                self.cwd = 0;
+            }
             Window::Assistant => self.assistant_open = false,
+        }
+        if self.front == Some(window) {
+            self.front = None;
         }
         if self.focus == Some(window) {
             // Handed to whatever else is open and takes text, so that closing
@@ -390,6 +438,15 @@ impl Desktop {
             }
         }
 
+        // Clicking a window brings it forward and gives it the keyboard. With
+        // no way to move a window, overlap is permanent, and a window that can
+        // be covered with no way to raise it is a window that is gone.
+        for window in ALL_WINDOWS {
+            if self.is_open(window) && inside(window, x, y) {
+                return self.open(window);
+            }
+        }
+
         match Self::icon_under(x, y, width) {
             Some(index) => {
                 self.selected = Some(index);
@@ -476,6 +533,64 @@ mod tests {
             assert!(desktop.is_open(window));
             assert_eq!(desktop.selected, Some(index));
         }
+    }
+
+    #[test]
+    fn every_open_window_is_drawn_exactly_once() {
+        // A window drawn twice is a window drawn under itself; one drawn never
+        // is one that is gone. Both are silent on a screen nothing tests.
+        for front in [None, Some(Window::Shell), Some(Window::Devices)] {
+            let order = draw_order(front);
+            for window in ALL_WINDOWS {
+                let times = order.iter().filter(|drawn| **drawn == window).count();
+                assert_eq!(times, 1, "{window:?} drawn {times} times");
+            }
+        }
+    }
+
+    #[test]
+    fn the_front_window_is_drawn_last() {
+        for front in ALL_WINDOWS {
+            let order = draw_order(Some(front));
+            assert_eq!(*order.last().expect("five windows"), front);
+        }
+    }
+
+    #[test]
+    fn clicking_a_window_brings_it_forward() {
+        // With no way to move a window, a window that can be covered and not
+        // raised is a window that is gone.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.open(Window::Assistant);
+        assert_eq!(desktop.front, Some(Window::Assistant));
+
+        let (sx, sy, _, _) = bounds(Window::Shell);
+        assert_eq!(
+            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT),
+            Click::Open(Window::Shell)
+        );
+        assert_eq!(desktop.front, Some(Window::Shell));
+        assert_eq!(desktop.focus, Some(Window::Shell));
+    }
+
+    #[test]
+    fn a_click_inside_a_closed_window_reaches_what_is_under_it() {
+        // Otherwise every window leaves a hole in the desktop where it was.
+        let mut desktop = Desktop::new();
+        let (sx, sy, _, _) = bounds(Window::Shell);
+        assert_ne!(
+            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT),
+            Click::Open(Window::Shell)
+        );
+    }
+
+    #[test]
+    fn closing_the_front_window_leaves_nothing_in_front() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Tasks);
+        desktop.close(Window::Tasks);
+        assert_eq!(desktop.front, None);
     }
 
     #[test]

@@ -53,8 +53,78 @@ pub enum Answer {
     Files,
     /// What hardware there is.
     Devices,
+    /// Write what follows the keyword into the notes file.
+    Remember,
+    /// Read the notes file back.
+    Recall,
     /// Nothing matched.
     Unknown,
+}
+
+/// The file the notes go in. A name somebody could have typed themselves, in a
+/// format they can read: the assistant's memory is a file on their disk, not a
+/// private store they have to ask it about.
+pub const NOTES: &[u8] = b"NOTES.MD";
+
+/// The words that mean the notes file.
+///
+/// Plurals are listed rather than stemmed. "notes" is not "note" to a
+/// whole-word match, and "what are your notes" is the plainest way somebody
+/// asks — it reached the who-am-I answer instead, because "you" was in it.
+const MEMORY_WORDS: [&[u8]; 4] = [b"remember", b"note", b"notes", b"memorise"];
+
+/// What to write down, out of a question that asks for something to be.
+///
+/// Everything after the keyword, trimmed. `None` when the question is not about
+/// memory at all; empty when it is a question *about* the notes rather than an
+/// instruction to add to them — "what do you remember" ends at the keyword, and
+/// storing an empty note for it would be the wrong answer to a fair question.
+#[must_use]
+pub fn remembered_text(question: &[u8]) -> Option<&[u8]> {
+    for keyword in MEMORY_WORDS {
+        if let Some(at) = word_end(question, keyword) {
+            return Some(trim(&question[at..]));
+        }
+    }
+    None
+}
+
+/// Where a whole word ends in a question, if it is there.
+fn word_end(question: &[u8], word: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while at < question.len() {
+        if !is_letter(question[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < question.len() && is_letter(question[at]) {
+            at += 1;
+        }
+        let found = &question[start..at];
+        if found.len() == word.len()
+            && found
+                .iter()
+                .zip(word.iter())
+                .all(|(a, b)| lower(*a) == lower(*b))
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Drops spaces and punctuation from both ends of a note.
+fn trim(text: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = text.len();
+    while start < end && matches!(text[start], b' ' | b'\t' | b':' | b',') {
+        start += 1;
+    }
+    while end > start && matches!(text[end - 1], b' ' | b'\t' | b'.' | b'?' | b'!') {
+        end -= 1;
+    }
+    &text[start..end]
 }
 
 /// A topic: the words that reach it, and what it answers.
@@ -132,6 +202,16 @@ const TOPICS: &[Topic] = &[
 pub fn ask(question: &[u8]) -> Answer {
     if question.len() > QUESTION_LIMIT {
         return Answer::Unknown;
+    }
+    // Checked before the topics, because a note can be about anything and would
+    // otherwise be answered as whatever it happens to mention. "remember that
+    // the disk is nearly full" is not a question about the disk.
+    if let Some(text) = remembered_text(question) {
+        return if text.is_empty() {
+            Answer::Recall
+        } else {
+            Answer::Remember
+        };
     }
     for topic in TOPICS {
         for word in topic.words {
@@ -244,6 +324,63 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.windows(2).any(|w| w == b"no" || w == b"No")));
+    }
+
+    #[test]
+    fn every_memory_word_on_its_own_asks_for_the_notes() {
+        // A word in the list that some earlier rule claims is a word that looks
+        // like it works and does not.
+        for word in MEMORY_WORDS {
+            assert_eq!(
+                ask(word),
+                Answer::Recall,
+                "{:?} does not reach the notes",
+                core::str::from_utf8(word).unwrap_or("?")
+            );
+        }
+    }
+
+    #[test]
+    fn it_writes_down_what_it_is_asked_to_remember() {
+        assert_eq!(ask(b"remember the disk is nearly full"), Answer::Remember);
+        assert_eq!(
+            remembered_text(b"remember the disk is nearly full"),
+            Some(&b"the disk is nearly full"[..])
+        );
+    }
+
+    #[test]
+    fn a_note_is_taken_whole_even_when_it_names_a_topic() {
+        // "remember that the disk is nearly full" is not a question about the
+        // disk. Answering it as one would file the note as a directory listing.
+        assert_eq!(ask(b"note: the disk holds the backups"), Answer::Remember);
+        assert_eq!(ask(b"remember to check the files"), Answer::Remember);
+        assert_eq!(
+            remembered_text(b"note: the disk holds the backups"),
+            Some(&b"the disk holds the backups"[..])
+        );
+    }
+
+    #[test]
+    fn asking_what_it_remembers_is_not_a_note() {
+        // The question ends at the keyword, so there is nothing to write down —
+        // and storing an empty note would be the wrong answer to a fair
+        // question.
+        for phrasing in [
+            &b"what do you remember"[..],
+            b"remember?",
+            b"what are your notes",
+        ] {
+            assert_eq!(ask(phrasing), Answer::Recall, "{phrasing:?}");
+        }
+    }
+
+    #[test]
+    fn the_notes_go_in_a_file_somebody_could_have_made_themselves() {
+        // The assistant's memory is a file on their disk in a format they can
+        // read, not a private store they have to ask it about.
+        assert!(NOTES.ends_with(b".MD"));
+        assert!(crate::dir::name_ok(NOTES), "the disk would refuse the name");
     }
 
     #[test]

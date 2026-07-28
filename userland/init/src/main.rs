@@ -1313,7 +1313,17 @@ fn session(grant: u64) -> ! {
                             {
                                 match action {
                                     console::Action::Ask(line, length) => {
-                                        answer(&mut helper, &line[..length], tick, files.as_ref());
+                                        answer(
+                                            &mut helper,
+                                            &line[..length],
+                                            tick,
+                                            &mut files,
+                                            disk.as_mut(),
+                                        );
+                                        // The notes may have grown, and the
+                                        // FILES window shows what is on the
+                                        // disk.
+                                        painted = false;
                                     }
                                     console::Action::Redraw => painted = false,
                                     console::Action::ReadSector(sector) => {
@@ -1398,15 +1408,25 @@ fn session(grant: u64) -> ! {
             // Once a second rather than every tick. The states do change that
             // fast, but a table redrawn sixty-four times a second is unreadable
             // and costs more than it tells anybody.
-            if face.is_open(desktop::Window::Tasks) && tick / 64 != last_tasks {
-                last_tasks = tick / 64;
-                draw_tasks(&screen);
-            }
-            if face.is_open(desktop::Window::Shell) {
-                draw_shell(&screen, &shell);
-            }
-            if face.is_open(desktop::Window::Assistant) {
-                draw_console(&screen, &helper, desktop::Window::Assistant);
+            // In the same order the frames were drawn in. Text drawn in a
+            // different order from the frames it belongs to is text on top of
+            // the wrong window — the contents of a window that is behind,
+            // painted over the one in front.
+            for window in desktop::draw_order(face.front) {
+                if !face.is_open(window) {
+                    continue;
+                }
+                match window {
+                    desktop::Window::Shell => draw_shell(&screen, &shell),
+                    desktop::Window::Assistant => {
+                        draw_console(&screen, &helper, desktop::Window::Assistant);
+                    }
+                    desktop::Window::Tasks if tick / 64 != last_tasks => {
+                        last_tasks = tick / 64;
+                        draw_tasks(&screen);
+                    }
+                    _ => {}
+                }
             }
             draw_menu(&screen, &face);
             draw_sweep(&screen, tick);
@@ -1668,73 +1688,92 @@ unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop, files: Option<&
         screen.text(12, 9, TITLE, colour::ACCENT);
         screen.text(title_end + 16, 9, b"SESSION", colour::DIM);
 
-        // Two windows. They do not do anything — there is no process behind
-        // either — and they are drawn from the same geometry a real one would
-        // have, so that when there is, this is the code that already worked.
-        if face.is_open(desktop::Window::Devices) {
-            screen.window(desktop::Window::Devices, b"DEVICES", true);
-            screen.text(96, 130, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
-            screen.text(96, 154, b"AUDIO   VIRTIO-SND  1 OUT 1 IN", colour::DIM);
-            screen.text(96, 178, b"CLOCK   RTC         64 HZ", colour::DIM);
-            screen.text(96, 202, b"DISPLAY FRAMEBUFFER 1280X800", colour::DIM);
-            screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
-        }
-
-        if face.is_open(desktop::Window::Files) {
-            let (fx, fy, _, fh) = desktop::bounds(desktop::Window::Files);
-            screen.window(desktop::Window::Files, b"FILES", false);
-            match files {
-                // A disk with a directory and nothing in it says so. An empty
-                // list and a missing filesystem look identical otherwise, and
-                // they call for different things from whoever is reading.
-                Some(table) if table.is_empty() => {
-                    screen.text(fx + 16, fy + 44, b"THE DISK IS EMPTY", colour::DIM);
-                    screen.text(
-                        fx + 16,
-                        fy + 68,
-                        b"RIGHT CLICK FOR A NEW FOLDER",
-                        colour::DIM,
-                    );
-                }
-                Some(table) => {
-                    for (row, entry) in table.children(dir::ROOT).enumerate() {
-                        let at = fy + 44 + row as u64 * 22;
-                        if at > fy + fh - 40 {
-                            screen.text(fx + 16, at, b"...", colour::DIM);
-                            break;
-                        }
-                        let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
-                            b"[DIR] "
-                        } else {
-                            b"      "
-                        };
-                        screen.text(fx + 16, at, mark, colour::ACCENT);
-                        screen.text(fx + 92, at, entry.label(), colour::TEXT);
-                    }
-                }
-                None => {
-                    screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
-                }
+        // Back to front, so the window somebody just clicked is the one they
+        // can read. A fixed order with a click order that is not fixed drew a
+        // newly opened window underneath the one it was opened over.
+        for window in desktop::draw_order(face.front) {
+            if face.is_open(window) {
+                draw_window(screen, window, face, files);
             }
         }
-        if face.is_open(desktop::Window::Tasks) {
-            screen.window(desktop::Window::Tasks, b"TASK MANAGER", false);
-        }
-        if face.is_open(desktop::Window::Assistant) {
-            screen.window(
-                desktop::Window::Assistant,
-                b"ASSISTANT",
-                face.focus == Some(desktop::Window::Assistant),
-            );
-        }
-        if face.is_open(desktop::Window::Shell) {
-            screen.window(
-                desktop::Window::Shell,
-                b"SHELL",
-                face.focus == Some(desktop::Window::Shell),
-            );
-        }
         draw_taskbar(screen, face);
+    }
+}
+
+/// One window and what is in it.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_window(
+    screen: &Screen,
+    window: desktop::Window,
+    face: &desktop::Desktop,
+    files: Option<&dir::Table>,
+) {
+    let focused = face.focus == Some(window);
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        match window {
+            desktop::Window::Devices => {
+                let (dx, dy, _, _) = desktop::bounds(window);
+                screen.window(window, b"DEVICES", focused);
+                screen.text(dx + 16, dy + 40, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
+                screen.text(
+                    dx + 16,
+                    dy + 64,
+                    b"AUDIO   VIRTIO-SND  1 OUT 1 IN",
+                    colour::DIM,
+                );
+                screen.text(dx + 16, dy + 88, b"CLOCK   RTC         64 HZ", colour::DIM);
+                screen.text(
+                    dx + 16,
+                    dy + 112,
+                    b"DISPLAY FRAMEBUFFER 1280X800",
+                    colour::DIM,
+                );
+                screen.text(dx + 16, dy + 160, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
+            }
+            desktop::Window::Files => {
+                let (fx, fy, _, fh) = desktop::bounds(window);
+                screen.window(window, b"FILES", focused);
+                match files {
+                    // A disk with a directory and nothing in it says so. An empty
+                    // list and a missing filesystem look identical otherwise, and
+                    // they call for different things from whoever is reading.
+                    Some(table) if table.is_empty() => {
+                        screen.text(fx + 16, fy + 44, b"THE DISK IS EMPTY", colour::DIM);
+                        screen.text(
+                            fx + 16,
+                            fy + 68,
+                            b"RIGHT CLICK FOR A NEW FOLDER",
+                            colour::DIM,
+                        );
+                    }
+                    Some(table) => {
+                        for (row, entry) in table.children(dir::ROOT).enumerate() {
+                            let at = fy + 44 + row as u64 * 22;
+                            if at > fy + fh - 40 {
+                                screen.text(fx + 16, at, b"...", colour::DIM);
+                                break;
+                            }
+                            let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
+                                b"[DIR] "
+                            } else {
+                                b"      "
+                            };
+                            screen.text(fx + 16, at, mark, colour::ACCENT);
+                            screen.text(fx + 92, at, entry.label(), colour::TEXT);
+                        }
+                    }
+                    None => {
+                        screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
+                    }
+                }
+            }
+            desktop::Window::Tasks => screen.window(window, b"TASK MANAGER", focused),
+            desktop::Window::Assistant => screen.window(window, b"ASSISTANT", focused),
+            desktop::Window::Shell => screen.window(window, b"SHELL", focused),
+        }
     }
 }
 
@@ -1898,8 +1937,8 @@ fn attach_disk(shell: &mut console::Console, grant: u64) -> Option<Disk> {
 /// is the difference between a problem and a loss.
 fn mount(shell: &mut console::Console, disk: Option<&mut Disk>) -> Option<dir::Table> {
     let disk = disk?;
-    if disk.sectors < dir::TABLE_START + dir::TABLE_SECTORS {
-        shell.print(b"disk too small for a directory");
+    if disk.sectors < dir::SECTORS_NEEDED {
+        shell.print(b"disk too small for a directory and its files");
         return None;
     }
 
@@ -2026,15 +2065,26 @@ fn apply_key(console: &mut console::Console, key: keymap::Key) -> console::Actio
 /// machine, which is here. Neither half can drift into the other: a matcher that
 /// could read a clock would be untestable, and a window that decided what words
 /// meant would be a second place where that is decided.
-fn answer(helper: &mut console::Console, question: &[u8], tick: u64, files: Option<&dir::Table>) {
+fn answer(
+    helper: &mut console::Console,
+    question: &[u8],
+    tick: u64,
+    files: &mut Option<dir::Table>,
+    disk: Option<&mut Disk>,
+) {
     match assistant::ask(question) {
+        assistant::Answer::Remember => {
+            let text = assistant::remembered_text(question).unwrap_or(b"");
+            remember(helper, disk, files, text);
+        }
+        assistant::Answer::Recall => recall(helper, disk, files),
         assistant::Answer::Say(lines) => {
             for line in lines {
                 helper.print(line);
             }
         }
         assistant::Answer::Uptime => report_uptime(helper, tick),
-        assistant::Answer::Files => list_folders(helper, files),
+        assistant::Answer::Files => list_folders(helper, files.as_ref()),
         assistant::Answer::Processes => {
             let mut list = abi::TaskList::EMPTY;
             let size = core::mem::size_of::<abi::TaskList>() as u64;
@@ -2065,6 +2115,214 @@ fn answer(helper: &mut console::Console, question: &[u8], tick: u64, files: Opti
             helper.print(b"files, devices, memory, or the network.");
         }
     }
+}
+
+/// Writes a file's bytes and records its length.
+///
+/// The bytes first, then the length. If the machine stops between the two the
+/// file reads back at its old length — shorter than what is on the disk, which
+/// is a file missing its newest lines. The other order gives a file whose
+/// length promises bytes that were never written, which reads back as whatever
+/// the sector happened to hold.
+fn write_file(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    table: &mut dir::Table,
+    id: u16,
+    bytes: &[u8],
+) -> bool {
+    let Some(disk) = disk else {
+        shell.print(b"no disk to write to");
+        return false;
+    };
+    let Some(sector) = dir::data_sector(id) else {
+        shell.print(b"that entry has no room on the disk");
+        return false;
+    };
+    if bytes.len() > dir::MAX_FILE_BYTES {
+        shell.print(b"that is more than a file can hold");
+        return false;
+    }
+
+    // SAFETY: inside this process's own request buffer, and the length was just
+    // checked against the extent the constant beside `STATUS_OFFSET` covers.
+    unsafe {
+        let into = core::slice::from_raw_parts_mut(
+            (disk.region.virt + DATA_OFFSET) as *mut u8,
+            dir::MAX_FILE_BYTES,
+        );
+        into.fill(0);
+        into[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    if !submit_bytes(
+        SESSION_ROLE,
+        &mut disk.queue,
+        &disk.region,
+        blk::OUT,
+        sector,
+        dir::MAX_FILE_BYTES as u32,
+    ) {
+        shell.print(b"the disk would not take the file");
+        return false;
+    }
+
+    if table.set_length(id, bytes.len()).is_err() {
+        shell.print(b"the directory would not record the length");
+        return false;
+    }
+    let saved = *table;
+    store(shell, Some(disk), &saved)
+}
+
+/// Reads a file's bytes into a buffer, returning how many.
+fn read_file(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    table: &dir::Table,
+    id: u16,
+    into: &mut [u8],
+) -> Option<usize> {
+    let Some(disk) = disk else {
+        shell.print(b"no disk to read from");
+        return None;
+    };
+    let entry = table.entry(id)?;
+    let length = (entry.length as usize)
+        .min(dir::MAX_FILE_BYTES)
+        .min(into.len());
+    let sector = dir::data_sector(id)?;
+    if length == 0 {
+        return Some(0);
+    }
+
+    if !submit_bytes(
+        SESSION_ROLE,
+        &mut disk.queue,
+        &disk.region,
+        blk::IN,
+        sector,
+        dir::MAX_FILE_BYTES as u32,
+    ) {
+        shell.print(b"the disk would not read the file");
+        return None;
+    }
+
+    // SAFETY: the device just filled this range, which is inside the request
+    // buffer this process owns.
+    unsafe {
+        let from = core::slice::from_raw_parts(
+            (disk.region.virt + DATA_OFFSET) as *const u8,
+            dir::MAX_FILE_BYTES,
+        );
+        into[..length].copy_from_slice(&from[..length]);
+    }
+    Some(length)
+}
+
+/// Appends a line to the notes file, making it if it is not there.
+///
+/// Read, append, write back. The file is small enough to hold whole, and a
+/// format nobody can append to without reading is a format that stays small —
+/// which is the honest description of this one, not an accident of it.
+fn remember(
+    helper: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: &mut Option<dir::Table>,
+    text: &[u8],
+) {
+    let Some(table) = files.as_mut() else {
+        helper.print(b"there is no disk to write notes to");
+        return;
+    };
+    let Some(disk) = disk else {
+        helper.print(b"there is no disk to write notes to");
+        return;
+    };
+
+    let id = match find_in_root(table, assistant::NOTES) {
+        Some(id) => id,
+        None => match table.create(dir::ROOT, assistant::NOTES, dir::Kind::File) {
+            Ok(id) => id,
+            Err(_) => {
+                helper.print(b"the directory would not take a notes file");
+                return;
+            }
+        },
+    };
+
+    let mut buffer = [0u8; dir::MAX_FILE_BYTES];
+    let Some(held) = read_file(helper, Some(disk), table, id, &mut buffer) else {
+        return;
+    };
+
+    // "- " so the file reads as a markdown list, which is what the name
+    // promises. A file called NOTES.MD that is not markdown is a small lie in
+    // a place somebody will open with something else.
+    let addition = 2 + text.len() + 1;
+    if held + addition > dir::MAX_FILE_BYTES {
+        helper.print(b"the notes file is full; there is no more room");
+        return;
+    }
+    let mut at = held;
+    buffer[at] = b'-';
+    buffer[at + 1] = b' ';
+    at += 2;
+    buffer[at..at + text.len()].copy_from_slice(text);
+    at += text.len();
+    buffer[at] = b'\n';
+    at += 1;
+
+    // The table is copied out because writing it needs the disk, which the
+    // table is borrowed from the same struct as.
+    let mut updated = *table;
+    if write_file(helper, Some(disk), &mut updated, id, &buffer[..at]) {
+        *table = updated;
+        helper.print(b"written to NOTES.MD on the disk");
+    }
+}
+
+/// Reads the notes file back.
+fn recall(helper: &mut console::Console, disk: Option<&mut Disk>, files: &mut Option<dir::Table>) {
+    let Some(table) = files.as_ref() else {
+        helper.print(b"there is no disk to read notes from");
+        return;
+    };
+    let Some(id) = find_in_root(table, assistant::NOTES) else {
+        helper.print(b"I have not been asked to remember anything.");
+        helper.print(b"Say: remember <something>");
+        return;
+    };
+
+    let mut buffer = [0u8; dir::MAX_FILE_BYTES];
+    let Some(held) = read_file(helper, disk, table, id, &mut buffer) else {
+        return;
+    };
+    if held == 0 {
+        helper.print(b"NOTES.MD is on the disk and it is empty.");
+        return;
+    }
+
+    helper.print(b"from NOTES.MD:");
+    let mut start = 0;
+    while start < held {
+        let mut end = start;
+        while end < held && buffer[end] != b'\n' {
+            end += 1;
+        }
+        if end > start {
+            helper.print(&buffer[start..end]);
+        }
+        start = end + 1;
+    }
+}
+
+/// Finds an entry by name in the root, whatever its kind.
+fn find_in_root(table: &dir::Table, name: &[u8]) -> Option<u16> {
+    table
+        .children(dir::ROOT)
+        .find(|entry| entry.label() == name)
+        .map(|entry| entry.id)
 }
 
 /// Prints what is in the root, for the shell.

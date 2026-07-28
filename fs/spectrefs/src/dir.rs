@@ -61,6 +61,42 @@ pub const ROOT: u16 = 0;
 /// The first id a created entry can take. Zero is the root.
 pub const FIRST_ID: u16 = 1;
 
+/// Where file contents begin, and how much room each file gets.
+///
+/// # One fixed extent per id, rather than an allocator
+///
+/// A file's bytes live at `data_sector(id)` and nowhere else. No free list, no
+/// fragmentation, no way for two files to be handed the same block — the whole
+/// question that a real allocator exists to answer is removed by not asking it.
+///
+/// What it costs: every file reserves its room whether or not it uses any, and
+/// no file can outgrow the extent. Both are real limits and both are stated
+/// rather than discovered — `MAX_FILE_BYTES` is what a file may hold, and a
+/// write past it is refused instead of running into the next file.
+///
+/// The gap before `DATA_START` is deliberate. The table needs room to grow and
+/// a format that has to move every file to make it is a format nobody grows.
+pub const DATA_START: u64 = 64;
+pub const SECTORS_PER_FILE: u64 = 8;
+pub const MAX_FILE_BYTES: usize = (SECTORS_PER_FILE as usize) * SECTOR;
+
+/// Sectors a disk must have for this to fit.
+pub const SECTORS_NEEDED: u64 =
+    DATA_START + (MAX_ENTRIES as u64 + FIRST_ID as u64) * SECTORS_PER_FILE;
+
+/// Where an entry's bytes live.
+///
+/// `None` for the root and for an id past what the table can hold: an id
+/// outside the range has no extent, and returning one anyway would hand back a
+/// sector belonging to something else.
+#[must_use]
+pub const fn data_sector(id: u16) -> Option<u64> {
+    if id < FIRST_ID || id as usize >= FIRST_ID as usize + MAX_ENTRIES {
+        return None;
+    }
+    Some(DATA_START + (id as u64) * SECTORS_PER_FILE)
+}
+
 /// What an entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -108,6 +144,13 @@ pub enum Error {
     Full,
     /// The buffer handed in is not the size of the table.
     BadBuffer,
+    /// No entry with that id.
+    NoEntry,
+    /// The entry is a directory, and a directory has no contents to read or
+    /// write — what is "in" it is the entries naming it as parent.
+    NotAFile,
+    /// More bytes than a file can hold.
+    TooLong,
 }
 
 /// One entry. `#[repr(C)]` because it is written to a disk that outlives the
@@ -213,6 +256,33 @@ impl Table {
     /// The entries directly inside a directory.
     pub fn children(&self, parent: u16) -> impl Iterator<Item = &Entry> {
         self.entries().iter().filter(move |e| e.parent == parent)
+    }
+
+    /// The entry with this id.
+    #[must_use]
+    pub fn entry(&self, id: u16) -> Option<&Entry> {
+        self.entries().iter().find(|entry| entry.id == id)
+    }
+
+    /// Records how many bytes a file holds.
+    ///
+    /// The bytes themselves are written by whoever owns the disk; this is the
+    /// length that makes them readable afterwards. Kept together with the name
+    /// so that a table which survives a restart describes files that do too — a
+    /// file whose length lives anywhere else is a file that reads back as
+    /// whatever the sector happened to contain.
+    pub fn set_length(&mut self, id: u16, length: usize) -> Result<(), Error> {
+        if length > MAX_FILE_BYTES {
+            return Err(Error::TooLong);
+        }
+        let Some(index) = self.entries().iter().position(|entry| entry.id == id) else {
+            return Err(Error::NoEntry);
+        };
+        if self.entries[index].kind != Kind::File.code() {
+            return Err(Error::NotAFile);
+        }
+        self.entries[index].length = length as u64;
+        Ok(())
     }
 
     /// Makes an entry, returning its id.
@@ -394,6 +464,89 @@ mod tests {
         let mut bytes = [0u8; Table::BYTES];
         table.encode(&mut bytes).expect("encodes");
         bytes
+    }
+
+    #[test]
+    fn no_two_files_share_a_sector() {
+        // The whole reason there is no allocator: with one fixed extent per id,
+        // two files landing on one block is not a bug that can happen. This is
+        // the check that keeps it that way if the constants move.
+        let mut seen: heapless::Vec<(u64, u64), MAX_ENTRIES> = heapless::Vec::new();
+        for id in FIRST_ID..FIRST_ID + MAX_ENTRIES as u16 {
+            let at = data_sector(id).expect("every id the table can hold has room");
+            let end = at + SECTORS_PER_FILE;
+            for (other_at, other_end) in &seen {
+                assert!(
+                    end <= *other_at || at >= *other_end,
+                    "two files were given the same sectors"
+                );
+            }
+            seen.push((at, end)).expect("fits");
+        }
+    }
+
+    #[test]
+    fn file_contents_do_not_land_on_the_table() {
+        // Which would be a file that eats the directory listing it appears in.
+        let first = data_sector(FIRST_ID).expect("has room");
+        assert!(first >= TABLE_START + TABLE_SECTORS);
+        assert!(first >= DATA_START);
+    }
+
+    #[test]
+    fn an_id_with_no_extent_is_refused_rather_than_given_one_anyway() {
+        // The root has no contents, and an id past the table has no room. Both
+        // would otherwise be handed a sector belonging to something else.
+        assert_eq!(data_sector(ROOT), None);
+        assert_eq!(data_sector(FIRST_ID + MAX_ENTRIES as u16), None);
+        assert_eq!(data_sector(u16::MAX), None);
+    }
+
+    #[test]
+    fn everything_fits_on_a_disk_that_says_it_does() {
+        let last = data_sector(FIRST_ID + MAX_ENTRIES as u16 - 1).expect("has room");
+        assert!(last + SECTORS_PER_FILE <= SECTORS_NEEDED);
+    }
+
+    #[test]
+    fn a_length_survives_the_trip() {
+        let mut table = Table::new();
+        let id = table.create(ROOT, b"NOTES.MD", Kind::File).expect("makes");
+        table.set_length(id, 41).expect("records");
+        let back = Table::decode(&encoded(&table)).expect("decodes");
+        assert_eq!(back.entry(id).expect("is there").length, 41);
+    }
+
+    #[test]
+    fn a_directory_has_no_contents_to_set_a_length_on() {
+        // What is "in" a directory is the entries naming it as parent, and a
+        // length on one would be a number describing nothing.
+        let mut table = Table::new();
+        let id = table
+            .create(ROOT, b"NOTES", Kind::Directory)
+            .expect("makes");
+        assert_eq!(table.set_length(id, 10), Err(Error::NotAFile));
+    }
+
+    #[test]
+    fn a_file_cannot_be_longer_than_its_extent() {
+        // Refused rather than clamped: a length past the extent would read back
+        // whatever the next file holds.
+        let mut table = Table::new();
+        let id = table.create(ROOT, b"BIG", Kind::File).expect("makes");
+        assert_eq!(
+            table.set_length(id, MAX_FILE_BYTES + 1),
+            Err(Error::TooLong)
+        );
+        table
+            .set_length(id, MAX_FILE_BYTES)
+            .expect("the whole extent fits");
+    }
+
+    #[test]
+    fn a_length_on_nothing_is_refused() {
+        let mut table = Table::new();
+        assert_eq!(table.set_length(999, 1), Err(Error::NoEntry));
     }
 
     #[test]
