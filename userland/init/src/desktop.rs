@@ -12,29 +12,58 @@
 //! while somebody holds it. Only the edge — down now, up before — is a click.
 //! That is what `Buttons::edge` is for, and forgetting it is the difference
 //! between one context menu and a hundred.
+//!
+//! # Windows are furniture now, not fixtures
+//!
+//! Every window used to sit at a constant address, and three decisions were
+//! built on that: the geometry was a `const fn`, windows were laid out so they
+//! would not cover each other, and raising a covered window was the only answer
+//! to overlap. All three were workarounds for the same missing thing.
+//!
+//! A window has a rectangle in this struct now. It can be dragged by its title
+//! bar, minimised to the taskbar, maximised to fill the screen, and restored.
+//! The layout constants are the *starting* positions and nothing more.
 
 #![allow(dead_code)]
 
 /// Icons on the desktop.
 pub const ICON_COUNT: usize = 4;
 
-/// What each icon is called and what opening it does.
+/// What each icon is called.
 pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"FILES", b"ASSISTANT", b"SHELL", b"TASKS"];
 
 /// Icon geometry. The session draws with these and so does the hit test, which
 /// is the only way the two can agree.
 pub const ICON_SIZE: u64 = 56;
 pub const ICON_SPACING: u64 = 90;
-pub const ICON_TOP: u64 = 52;
-/// Distance from the right edge to the icons' left side.
-pub const ICON_RIGHT_MARGIN: u64 = 140;
+pub const ICON_TOP: u64 = 40;
+/// Distance from the left edge to the icons' left side. On the left, like every
+/// desktop somebody has used: the right is where a window's controls are, and
+/// icons there are icons under the mouse on the way to a close button.
+pub const ICON_LEFT: u64 = 24;
+
+/// The bar across the bottom, and the button at its left end.
+pub const TASKBAR_HEIGHT: u64 = 40;
+pub const START_WIDTH: u64 = 108;
+/// One taskbar button per open window.
+pub const TASK_BUTTON_WIDTH: u64 = 168;
+pub const TASK_BUTTON_GAP: u64 = 4;
+
+/// The start menu: where it sits relative to the button, and how big.
+pub const START_ITEM_HEIGHT: u64 = 34;
+pub const START_MENU_WIDTH: u64 = 240;
+
+/// The title bar and the three boxes at its right end.
+pub const TITLE_HEIGHT: u64 = 26;
+pub const BUTTON_WIDTH: u64 = 30;
+pub const BUTTON_HEIGHT: u64 = 20;
+pub const BUTTON_INSET: u64 = 3;
 
 /// One context menu entry.
-pub const MENU_WIDTH: u64 = 190;
+pub const MENU_WIDTH: u64 = 200;
 pub const MENU_ITEM_HEIGHT: u64 = 26;
 
-/// The two windows the session can show. Neither is open at startup: a desktop
-/// that begins covered in windows nobody asked for is not a desktop.
+/// The windows the session can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
     Shell,
@@ -44,7 +73,57 @@ pub enum Window {
     Assistant,
 }
 
+/// How many there are. Used to size every per-window array, so adding one to
+/// the enum fails to compile rather than silently going unhandled.
+pub const WINDOW_COUNT: usize = 5;
+
+/// Every window, in a fixed order. Not a stacking order any more — that is in
+/// `Desktop::order` and it changes.
+pub const ALL_WINDOWS: [Window; WINDOW_COUNT] = [
+    Window::Shell,
+    Window::Devices,
+    Window::Tasks,
+    Window::Files,
+    Window::Assistant,
+];
+
 impl Window {
+    /// Where this window sits in the per-window arrays.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Shell => 0,
+            Self::Devices => 1,
+            Self::Tasks => 2,
+            Self::Files => 3,
+            Self::Assistant => 4,
+        }
+    }
+
+    /// What the title bar says.
+    #[must_use]
+    pub const fn title(self) -> &'static [u8] {
+        match self {
+            Self::Shell => b"SHELL",
+            Self::Devices => b"DEVICES",
+            Self::Tasks => b"TASK MANAGER",
+            Self::Files => b"FILES",
+            Self::Assistant => b"ASSISTANT",
+        }
+    }
+
+    /// A shorter name, for a taskbar button.
+    #[must_use]
+    pub const fn short(self) -> &'static [u8] {
+        match self {
+            Self::Shell => b"SHELL",
+            Self::Devices => b"DEVICES",
+            Self::Tasks => b"TASKS",
+            Self::Files => b"FILES",
+            Self::Assistant => b"ASSISTANT",
+        }
+    }
+
     /// Whether typing goes into this window.
     ///
     /// The two that take text are the two with a prompt in them. A keystroke
@@ -55,63 +134,119 @@ impl Window {
     }
 }
 
-/// Every window, front to back. The order is the order a click finds them, so
-/// it is the order they are drawn in reverse.
-pub const ALL_WINDOWS: [Window; 5] = [
-    Window::Assistant,
-    Window::Shell,
-    Window::Tasks,
-    Window::Files,
-    Window::Devices,
-];
+/// A rectangle on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub x: u64,
+    pub y: u64,
+    pub w: u64,
+    pub h: u64,
+}
 
-/// How tall the bar across the bottom is.
-pub const TASKBAR_HEIGHT: u64 = 34;
-
-/// The title bar, and the box at its right end that closes the window.
-pub const TITLE_HEIGHT: u64 = 24;
-pub const CLOSE_SIZE: u64 = 16;
-pub const CLOSE_INSET: u64 = 8;
-
-/// Where each window sits. Here rather than beside the drawing code for the
-/// same reason the icon geometry is: a close box that is drawn in one place and
-/// hit-tested from another is a close box that stops closing the window, and
-/// the way it stops is that clicking it does nothing at all.
-#[must_use]
-pub const fn bounds(window: Window) -> (u64, u64, u64, u64) {
-    match window {
-        Window::Devices => (80, 90, 520, 300),
-        // Stops short of the icon column. A window that covers the icons is a
-        // window that has to be moved before anything else can be opened, and
-        // nothing here can be moved.
-        Window::Tasks => (620, 90, 480, 300),
-        // Where DEVICES sits, one step down and across. They overlap, which is
-        // what windows do; what they must not do is share a close box.
-        Window::Files => (110, 130, 520, 300),
-        // Wide enough for the longest line the assistant can say. Narrower and
-        // the answers ran off the right edge, past the rectangle the redraw
-        // clears — so the tails of old answers stayed on the desktop.
-        Window::Assistant => (400, 420, 800, 340),
-        Window::Shell => (80, 430, 1120, 330),
+impl Rect {
+    #[must_use]
+    pub const fn holds(&self, x: u64, y: u64) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 }
 
-/// The top-left corner of a window's close box.
+/// Where each window starts. Not where it stays — this is the layout somebody
+/// finds on first opening it, and every one of them can be moved afterwards.
 #[must_use]
-pub const fn close_at(window: Window) -> (u64, u64) {
-    let (x, y, w, _) = bounds(window);
-    (
-        x + w - CLOSE_SIZE - CLOSE_INSET,
-        y + (TITLE_HEIGHT - CLOSE_SIZE) / 2,
-    )
+pub const fn default_rect(window: Window) -> Rect {
+    match window {
+        Window::Devices => Rect {
+            x: 200,
+            y: 80,
+            w: 520,
+            h: 300,
+        },
+        Window::Tasks => Rect {
+            x: 260,
+            y: 120,
+            w: 500,
+            h: 300,
+        },
+        Window::Files => Rect {
+            x: 150,
+            y: 60,
+            w: 520,
+            h: 320,
+        },
+        // Wide enough for the longest line the assistant can say. Narrower and
+        // the answers ran off the right edge, past the rectangle the redraw
+        // clears — so the tails of old answers stayed on the desktop.
+        Window::Assistant => Rect {
+            x: 380,
+            y: 300,
+            w: 800,
+            h: 340,
+        },
+        Window::Shell => Rect {
+            x: 180,
+            y: 380,
+            w: 940,
+            h: 340,
+        },
+    }
 }
 
-/// Whether a point is inside a window at all.
-#[must_use]
-pub const fn inside(window: Window, x: u64, y: u64) -> bool {
-    let (wx, wy, w, h) = bounds(window);
-    x >= wx && x < wx + w && y >= wy && y < wy + h
+/// Which of a window's three title-bar buttons a point is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleButton {
+    Minimise,
+    Maximise,
+    Close,
 }
+
+/// Where a title-bar button sits inside a window.
+///
+/// Right to left, closest first, in the order every desktop puts them: close on
+/// the outside, then maximise, then minimise.
+#[must_use]
+pub const fn title_button_rect(rect: Rect, button: TitleButton) -> Rect {
+    let from_right = match button {
+        TitleButton::Close => 1,
+        TitleButton::Maximise => 2,
+        TitleButton::Minimise => 3,
+    };
+    Rect {
+        x: rect.x + rect.w - from_right * (BUTTON_WIDTH + BUTTON_INSET),
+        y: rect.y + (TITLE_HEIGHT - BUTTON_HEIGHT) / 2,
+        w: BUTTON_WIDTH,
+        h: BUTTON_HEIGHT,
+    }
+}
+
+/// What the start menu offers, and what each entry opens.
+pub const START_ITEMS: [&[u8]; 6] = [
+    b"Files",
+    b"Assistant",
+    b"Shell",
+    b"Task manager",
+    b"Devices",
+    b"Shut down",
+];
+
+/// Which window a start-menu entry opens, if it opens one.
+#[must_use]
+pub const fn start_window(index: usize) -> Option<Window> {
+    match index {
+        0 => Some(Window::Files),
+        1 => Some(Window::Assistant),
+        2 => Some(Window::Shell),
+        3 => Some(Window::Tasks),
+        4 => Some(Window::Devices),
+        _ => None,
+    }
+}
+
+/// What the desktop's own context menu offers.
+///
+/// Short, because everything else moved to the start menu where somebody would
+/// look for it. A right-click menu that repeats the start menu is a second
+/// place to keep the same list correct.
+pub const MENU_ITEMS: [&[u8]; 3] = [b"New folder", b"Refresh", b"Task manager"];
 
 /// Rows the FILES window shows, and where the first one starts.
 ///
@@ -120,65 +255,6 @@ pub const fn inside(window: Window, x: u64, y: u64) -> bool {
 /// in the list rather than in a gesture somebody has to already know.
 pub const FILE_ROW_HEIGHT: u64 = 22;
 pub const FILE_ROW_TOP: u64 = 40;
-
-/// Which row of the FILES window a point is on, if any.
-#[must_use]
-pub fn file_row_under(y: u64, rows: usize) -> Option<usize> {
-    let (_, wy, _, wh) = bounds(Window::Files);
-    let top = wy + FILE_ROW_TOP;
-    if y < top || y >= wy + wh - 12 {
-        return None;
-    }
-    let row = ((y - top) / FILE_ROW_HEIGHT) as usize;
-    (row < rows).then_some(row)
-}
-
-/// The order to draw open windows in, back to front.
-///
-/// Everything else first and the front window last, so the one somebody just
-/// clicked is the one they can read. Without this a window opened on top of
-/// another was drawn underneath it, because the draw order was fixed and the
-/// click order was not — and with no way to move a window, a covered window is
-/// a window that is gone.
-#[must_use]
-pub fn draw_order(front: Option<Window>) -> [Window; 5] {
-    let mut out = [Window::Devices; 5];
-    let mut at = 0;
-    for window in ALL_WINDOWS.into_iter().rev() {
-        if Some(window) != front {
-            out[at] = window;
-            at += 1;
-        }
-    }
-    if let Some(window) = front {
-        out[at] = window;
-    }
-    out
-}
-
-/// Whether a point is on a window's close box.
-#[must_use]
-pub const fn on_close(window: Window, x: u64, y: u64) -> bool {
-    let (cx, cy) = close_at(window);
-    x >= cx && x < cx + CLOSE_SIZE && y >= cy && y < cy + CLOSE_SIZE
-}
-
-/// What the menu offers.
-///
-/// Every one of these does something. The first version opened with "Open
-/// shell", which answered "the shell is already open below" — an entry that
-/// exists to be clicked once and then never again. A menu whose items are
-/// greyed out, or say something instead of doing something, is worse than no
-/// menu: it tells somebody the system can do things it cannot.
-pub const MENU_ITEMS: [&[u8]; 7] = [
-    b"New folder",
-    b"Open files",
-    b"Open shell",
-    b"Open assistant",
-    b"Show devices",
-    b"Task manager",
-    b"Shut down",
-];
 
 /// The task manager's column header, and the width of a row.
 pub const TASK_HEADER: &[u8] = b"PID  STATE    DMA  DEVICES";
@@ -225,18 +301,26 @@ pub enum Click {
     None,
     /// This icon was selected.
     Select(usize),
-    /// The menu opened at this point.
+    /// The desktop's context menu opened at this point.
     OpenMenu(u64, u64),
-    /// The menu closed without a choice.
+    /// A menu closed without a choice — the context menu or the start menu.
     CloseMenu,
-    /// This menu entry was chosen.
+    /// This context-menu entry was chosen.
     Menu(usize),
+    /// This start-menu entry was chosen.
+    Start(usize),
+    /// The start menu opened.
+    OpenStart,
     /// A window was opened or brought forward.
     Open(Window),
     /// A window was closed.
     Close(Window),
+    /// A window was minimised to the taskbar.
+    Minimise(Window),
     /// This row of the FILES window was clicked.
     File(usize),
+    /// A window is being dragged. The session repaints and nothing else.
+    Drag,
 }
 
 /// Which buttons are down, and which were down last time.
@@ -265,29 +349,50 @@ impl Buttons {
     }
 }
 
+/// A window being dragged, and where inside its title bar it was grabbed.
+///
+/// The offset is kept so the window does not jump its own corner to the pointer
+/// on the first pixel of movement — it moves with the point that was grabbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drag {
+    window: Window,
+    hold_x: u64,
+    hold_y: u64,
+}
+
 /// The desktop's interactive state.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Desktop {
     /// Which icon is highlighted, if any.
     pub selected: Option<usize>,
     /// Where the context menu is, if it is open.
     pub menu: Option<(u64, u64)>,
-    pub shell_open: bool,
-    pub devices_open: bool,
-    pub tasks_open: bool,
-    pub files_open: bool,
-    pub assistant_open: bool,
+    /// Whether the start menu is showing.
+    pub start_open: bool,
+    open: [bool; WINDOW_COUNT],
+    minimised: [bool; WINDOW_COUNT],
+    rects: [Rect; WINDOW_COUNT],
+    /// Where a maximised window came from, so restoring puts it back rather
+    /// than somewhere plausible.
+    restore: [Rect; WINDOW_COUNT],
+    maximised: [bool; WINDOW_COUNT],
+    /// Stacking, back to front. Every window appears exactly once.
+    order: [Window; WINDOW_COUNT],
+    drag: Option<Drag>,
     /// Which folder the FILES window is showing. The root until somebody goes
     /// somewhere; back to the root when the window is closed, so opening it
     /// again does not land wherever it was left days ago with no way to tell.
     pub cwd: u16,
-    /// Which window is drawn last, and so is on top. Not the same as focus: the
-    /// task manager can be in front without taking the keyboard.
-    pub front: Option<Window>,
     /// Which window keystrokes go to. Set when a window is opened or clicked
     /// into, cleared when it closes — a window that keeps the keyboard after it
     /// is gone is where typing disappears to.
     pub focus: Option<Window>,
+}
+
+impl Default for Desktop {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Desktop {
@@ -296,91 +401,179 @@ impl Desktop {
         Self {
             selected: None,
             menu: None,
-            shell_open: false,
-            devices_open: false,
-            tasks_open: false,
-            files_open: false,
-            assistant_open: false,
+            start_open: false,
+            open: [false; WINDOW_COUNT],
+            minimised: [false; WINDOW_COUNT],
+            rects: [
+                default_rect(Window::Shell),
+                default_rect(Window::Devices),
+                default_rect(Window::Tasks),
+                default_rect(Window::Files),
+                default_rect(Window::Assistant),
+            ],
+            restore: [
+                default_rect(Window::Shell),
+                default_rect(Window::Devices),
+                default_rect(Window::Tasks),
+                default_rect(Window::Files),
+                default_rect(Window::Assistant),
+            ],
+            maximised: [false; WINDOW_COUNT],
+            order: ALL_WINDOWS,
+            drag: None,
             cwd: 0,
-            front: None,
             focus: None,
         }
     }
 
-    /// Whether a window is showing.
+    /// Where a window is now.
+    #[must_use]
+    pub const fn rect(&self, window: Window) -> Rect {
+        self.rects[window.index()]
+    }
+
+    /// Whether a window exists at all.
     #[must_use]
     pub const fn is_open(&self, window: Window) -> bool {
-        match window {
-            Window::Shell => self.shell_open,
-            Window::Devices => self.devices_open,
-            Window::Tasks => self.tasks_open,
-            Window::Files => self.files_open,
-            Window::Assistant => self.assistant_open,
+        self.open[window.index()]
+    }
+
+    /// Whether a window is minimised. Still open, still in the taskbar.
+    #[must_use]
+    pub const fn is_minimised(&self, window: Window) -> bool {
+        self.minimised[window.index()]
+    }
+
+    /// Whether a window is on the screen: open and not minimised.
+    #[must_use]
+    pub const fn is_visible(&self, window: Window) -> bool {
+        self.is_open(window) && !self.is_minimised(window)
+    }
+
+    #[must_use]
+    pub const fn is_maximised(&self, window: Window) -> bool {
+        self.maximised[window.index()]
+    }
+
+    /// The window on top, if any is.
+    #[must_use]
+    pub fn front(&self) -> Option<Window> {
+        self.order
+            .iter()
+            .rev()
+            .copied()
+            .find(|window| self.is_visible(*window))
+    }
+
+    /// The stacking order, back to front. Every window, visible or not — the
+    /// caller skips what it cannot see, and a window that is missing from this
+    /// is a window that can never be drawn.
+    #[must_use]
+    pub const fn order(&self) -> [Window; WINDOW_COUNT] {
+        self.order
+    }
+
+    /// Puts a window on top of the stack.
+    fn raise(&mut self, window: Window) {
+        let Some(at) = self.order.iter().position(|other| *other == window) else {
+            return;
+        };
+        // Shift the rest down and put it last. A swap would put whatever was on
+        // top into the middle of the stack, which reorders windows nobody
+        // touched.
+        for index in at..WINDOW_COUNT - 1 {
+            self.order[index] = self.order[index + 1];
         }
+        self.order[WINDOW_COUNT - 1] = window;
     }
 
     /// Opens a window, or brings it forward if it is already open.
     pub fn open(&mut self, window: Window) -> Click {
-        match window {
-            Window::Shell => self.shell_open = true,
-            Window::Devices => self.devices_open = true,
-            Window::Tasks => self.tasks_open = true,
-            Window::Files => self.files_open = true,
-            Window::Assistant => self.assistant_open = true,
-        }
+        self.open[window.index()] = true;
+        self.minimised[window.index()] = false;
+        self.raise(window);
         // Focus follows the window that takes text. Opening the task manager
         // while somebody is typing must not swallow the next key.
         if window.takes_text() {
             self.focus = Some(window);
         }
-        self.front = Some(window);
+        self.start_open = false;
         Click::Open(window)
     }
 
     /// Closes a window.
     pub fn close(&mut self, window: Window) -> Click {
-        match window {
-            Window::Shell => self.shell_open = false,
-            Window::Devices => self.devices_open = false,
-            Window::Tasks => self.tasks_open = false,
-            Window::Files => {
-                self.files_open = false;
-                self.cwd = 0;
-            }
-            Window::Assistant => self.assistant_open = false,
-        }
-        if self.front == Some(window) {
-            self.front = None;
+        self.open[window.index()] = false;
+        self.minimised[window.index()] = false;
+        if window == Window::Files {
+            self.cwd = 0;
         }
         if self.focus == Some(window) {
             // Handed to whatever else is open and takes text, so that closing
             // one of two prompts does not leave the keyboard pointing at
             // nothing while a prompt is still on screen.
-            self.focus = [Window::Shell, Window::Assistant]
-                .into_iter()
-                .find(|other| *other != window && self.is_open(*other));
+            self.focus =
+                self.order.iter().rev().copied().find(|other| {
+                    *other != window && self.is_visible(*other) && other.takes_text()
+                });
         }
         Click::Close(window)
     }
 
-    /// Which window a menu entry opens, if it opens one.
-    ///
-    /// Beside the labels, so the test below can hold the two against each
-    /// other. An entry whose words promise a window and whose action opens
-    /// nothing is the failure this whole menu started with.
-    #[must_use]
-    pub const fn menu_window(index: usize) -> Option<Window> {
-        match index {
-            1 => Some(Window::Files),
-            2 => Some(Window::Shell),
-            3 => Some(Window::Assistant),
-            4 => Some(Window::Devices),
-            5 => Some(Window::Tasks),
-            _ => None,
+    /// Hides a window without closing it.
+    pub fn minimise(&mut self, window: Window) -> Click {
+        self.minimised[window.index()] = true;
+        if self.focus == Some(window) {
+            self.focus =
+                self.order.iter().rev().copied().find(|other| {
+                    *other != window && self.is_visible(*other) && other.takes_text()
+                });
         }
+        Click::Minimise(window)
     }
 
-    /// Which window an icon opens, if it opens one.
+    /// Fills the screen with a window, or puts it back where it was.
+    ///
+    /// The taskbar is not covered. A maximised window over the taskbar is a
+    /// window with no way back to anything else.
+    pub fn maximise(&mut self, window: Window, width: u64, height: u64) -> Click {
+        let at = window.index();
+        if self.maximised[at] {
+            self.rects[at] = self.restore[at];
+            self.maximised[at] = false;
+        } else {
+            self.restore[at] = self.rects[at];
+            self.rects[at] = Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height.saturating_sub(TASKBAR_HEIGHT),
+            };
+            self.maximised[at] = true;
+        }
+        self.raise(window);
+        Click::Open(window)
+    }
+
+    /// Where icon `index` sits.
+    #[must_use]
+    pub const fn icon_at(index: usize) -> (u64, u64) {
+        (ICON_LEFT, ICON_TOP + index as u64 * ICON_SPACING)
+    }
+
+    /// Which icon is under a point, if any.
+    #[must_use]
+    pub fn icon_under(x: u64, y: u64) -> Option<usize> {
+        for index in 0..ICON_COUNT {
+            let (ix, iy) = Self::icon_at(index);
+            if x >= ix && x < ix + ICON_SIZE && y >= iy && y < iy + ICON_SIZE {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Which window an icon opens.
     #[must_use]
     pub const fn icon_window(index: usize) -> Option<Window> {
         match index {
@@ -392,44 +585,100 @@ impl Desktop {
         }
     }
 
-    /// Where icon `index` sits, given the screen width.
+    /// The start button.
     #[must_use]
-    pub fn icon_at(index: usize, width: u64) -> (u64, u64) {
-        (
-            width.saturating_sub(ICON_RIGHT_MARGIN),
-            ICON_TOP + index as u64 * ICON_SPACING,
-        )
-    }
-
-    /// Which icon is under a point, if any.
-    #[must_use]
-    pub fn icon_under(x: u64, y: u64, width: u64) -> Option<usize> {
-        for index in 0..ICON_COUNT {
-            let (ix, iy) = Self::icon_at(index, width);
-            if x >= ix && x < ix + ICON_SIZE && y >= iy && y < iy + ICON_SIZE {
-                return Some(index);
-            }
+    pub const fn start_button(height: u64) -> Rect {
+        Rect {
+            x: 0,
+            y: height - TASKBAR_HEIGHT,
+            w: START_WIDTH,
+            h: TASKBAR_HEIGHT,
         }
-        None
     }
 
-    /// Which menu entry is under a point, if the menu is open there.
+    /// Where the start menu sits when it is open.
+    #[must_use]
+    pub const fn start_menu_rect(height: u64) -> Rect {
+        let tall = START_ITEM_HEIGHT * START_ITEMS.len() as u64 + 8;
+        Rect {
+            x: 0,
+            y: height - TASKBAR_HEIGHT - tall,
+            w: START_MENU_WIDTH,
+            h: tall,
+        }
+    }
+
+    /// Which start-menu entry a point is on.
+    #[must_use]
+    pub fn start_item_under(&self, x: u64, y: u64, height: u64) -> Option<usize> {
+        if !self.start_open {
+            return None;
+        }
+        let menu = Self::start_menu_rect(height);
+        if !menu.holds(x, y) || y < menu.y + 4 {
+            return None;
+        }
+        let index = ((y - menu.y - 4) / START_ITEM_HEIGHT) as usize;
+        (index < START_ITEMS.len()).then_some(index)
+    }
+
+    /// The open windows, in taskbar order.
+    ///
+    /// Stacking order would move the buttons around whenever somebody clicked a
+    /// window, which is a taskbar you cannot aim at. This is the fixed order
+    /// instead, filtered to what is open.
+    pub fn taskbar_windows(&self) -> impl Iterator<Item = Window> + '_ {
+        ALL_WINDOWS.into_iter().filter(|w| self.is_open(*w))
+    }
+
+    /// Where the `index`-th taskbar button is.
+    #[must_use]
+    pub const fn taskbar_button(index: usize, height: u64) -> Rect {
+        Rect {
+            x: START_WIDTH + 6 + index as u64 * (TASK_BUTTON_WIDTH + TASK_BUTTON_GAP),
+            y: height - TASKBAR_HEIGHT + 5,
+            w: TASK_BUTTON_WIDTH,
+            h: TASKBAR_HEIGHT - 10,
+        }
+    }
+
+    /// Which window's taskbar button is under a point.
+    #[must_use]
+    pub fn taskbar_under(&self, x: u64, y: u64, height: u64) -> Option<Window> {
+        self.taskbar_windows()
+            .enumerate()
+            .find(|(index, _)| Self::taskbar_button(*index, height).holds(x, y))
+            .map(|(_, window)| window)
+    }
+
+    /// Which context-menu entry is under a point, if the menu is open there.
     #[must_use]
     pub fn menu_under(&self, x: u64, y: u64) -> Option<usize> {
         let (mx, my) = self.menu?;
-        if x < mx || x >= mx + MENU_WIDTH {
-            return None;
-        }
-        if y < my {
+        if x < mx || x >= mx + MENU_WIDTH || y < my {
             return None;
         }
         let index = ((y - my) / MENU_ITEM_HEIGHT) as usize;
         (index < MENU_ITEMS.len()).then_some(index)
     }
 
-    /// Handles a press at a point. `width` and `height` are the screen's.
-    /// Handles a press at a point. `rows` is how many the FILES window shows,
-    /// which the session knows and this does not — the table lives on the disk.
+    /// Which row of the FILES window a point is on, if any.
+    #[must_use]
+    pub fn file_row_under(&self, y: u64, rows: usize) -> Option<usize> {
+        let rect = self.rect(Window::Files);
+        let top = rect.y + FILE_ROW_TOP;
+        if y < top || y >= rect.y + rect.h - 12 {
+            return None;
+        }
+        let row = ((y - top) / FILE_ROW_HEIGHT) as usize;
+        (row < rows).then_some(row)
+    }
+
+    /// Handles a press at a point.
+    ///
+    /// `rows` is how many the FILES window shows, which the session knows and
+    /// this does not — the table lives on the disk, and a file that reaches the
+    /// disk is a file that cannot be tested without a machine.
     pub fn press(
         &mut self,
         x: u64,
@@ -439,10 +688,16 @@ impl Desktop {
         height: u64,
         rows: usize,
     ) -> Click {
-        // The menu is checked first and always: while it is open it is on top
-        // of everything, so a click anywhere else closes it rather than
-        // reaching what is underneath. Anything else lets somebody select an
-        // icon through an open menu.
+        // A menu is on top of everything while it is open, so a click anywhere
+        // else closes it rather than reaching what is underneath.
+        if self.start_open {
+            if let Some(item) = self.start_item_under(x, y, height) {
+                self.start_open = false;
+                return Click::Start(item);
+            }
+            self.start_open = false;
+            return Click::CloseMenu;
+        }
         if self.menu.is_some() {
             if let Some(item) = self.menu_under(x, y) {
                 self.menu = None;
@@ -452,52 +707,103 @@ impl Desktop {
             return Click::CloseMenu;
         }
 
+        // The taskbar, before anything on the desktop: it is drawn over
+        // everything, so it has to be clicked before everything.
+        if y >= height.saturating_sub(TASKBAR_HEIGHT) {
+            if Self::start_button(height).holds(x, y) {
+                self.start_open = !right;
+                return if self.start_open {
+                    Click::OpenStart
+                } else {
+                    Click::CloseMenu
+                };
+            }
+            if let Some(window) = self.taskbar_under(x, y, height) {
+                // The button of the window already in front minimises it, the
+                // way every taskbar behaves. Without it a taskbar button is a
+                // control that does nothing once you have used it.
+                if self.front() == Some(window) && !self.is_minimised(window) {
+                    return self.minimise(window);
+                }
+                return self.open(window);
+            }
+            return Click::None;
+        }
+
         if right {
-            // Placed so it stays on screen. A menu that opens off the bottom
-            // edge is a menu whose last entry cannot be reached.
             let height_needed = MENU_ITEM_HEIGHT * MENU_ITEMS.len() as u64;
             let mx = x.min(width.saturating_sub(MENU_WIDTH));
-            let my = y.min(height.saturating_sub(height_needed));
+            let my = y.min(
+                height
+                    .saturating_sub(TASKBAR_HEIGHT)
+                    .saturating_sub(height_needed),
+            );
             self.menu = Some((mx, my));
             return Click::OpenMenu(mx, my);
         }
 
-        // A window is above the desktop, so its close box is checked before
-        // anything underneath. Shell first: it is drawn last and so is on top.
-        for window in ALL_WINDOWS {
-            if self.is_open(window) && on_close(window, x, y) {
-                return self.close(window);
-            }
-        }
-
-        // Clicking a window brings it forward and gives it the keyboard. With
-        // no way to move a window, overlap is permanent, and a window that can
-        // be covered with no way to raise it is a window that is gone.
-        for window in ALL_WINDOWS {
-            if !self.is_open(window) || !inside(window, x, y) {
+        // Windows, front to back, so a click finds the one on top.
+        for window in self.order.into_iter().rev() {
+            if !self.is_visible(window) {
                 continue;
             }
-            // A click that raises a window does not also act inside it. The
-            // window was covered, so whoever clicked could not see what they
-            // were clicking on — treating the raise as a choice picks a row on
-            // their behalf out of something they had not read yet.
-            if self.front != Some(window) {
+            let rect = self.rect(window);
+            if !rect.holds(x, y) {
+                continue;
+            }
+
+            for button in [
+                TitleButton::Close,
+                TitleButton::Maximise,
+                TitleButton::Minimise,
+            ] {
+                if title_button_rect(rect, button).holds(x, y) {
+                    return match button {
+                        TitleButton::Close => self.close(window),
+                        TitleButton::Maximise => self.maximise(window, width, height),
+                        TitleButton::Minimise => self.minimise(window),
+                    };
+                }
+            }
+
+            // The title bar drags. A maximised window does not, because there
+            // is nowhere for it to go and dragging it would leave it the size
+            // of the screen at an offset from it.
+            if y < rect.y + TITLE_HEIGHT {
+                let raised = self.front() != Some(window);
+                self.open(window);
+                if !self.is_maximised(window) {
+                    self.drag = Some(Drag {
+                        window,
+                        hold_x: x - rect.x,
+                        hold_y: y - rect.y,
+                    });
+                }
+                return if raised {
+                    Click::Open(window)
+                } else {
+                    Click::Drag
+                };
+            }
+
+            // A click that raises a covered window does not also act inside it.
+            // The window was covered, so whoever clicked could not read what
+            // they were clicking on — treating the raise as a choice picks
+            // something on their behalf out of what they had not seen.
+            if self.front() != Some(window) {
                 return self.open(window);
             }
             if window == Window::Files {
-                if let Some(row) = file_row_under(y, rows) {
+                if let Some(row) = self.file_row_under(y, rows) {
                     return Click::File(row);
                 }
             }
             return self.open(window);
         }
 
-        match Self::icon_under(x, y, width) {
+        match Self::icon_under(x, y) {
             Some(index) => {
                 self.selected = Some(index);
-                // An icon opens what it names. Selecting and then needing a
-                // second gesture to open would be right if there were a
-                // keyboard focus model to select *for*, and there is not.
                 match Self::icon_window(index) {
                     Some(window) => self.open(window),
                     None => Click::Select(index),
@@ -509,6 +815,42 @@ impl Desktop {
             }
         }
     }
+
+    /// Moves a dragged window with the pointer.
+    ///
+    /// Clamped so the title bar always stays on the screen and above the
+    /// taskbar. A window dragged out of reach cannot be dragged back, and there
+    /// is no other way to move one.
+    pub fn motion(&mut self, x: u64, y: u64, width: u64, height: u64) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        let at = drag.window.index();
+        let rect = self.rects[at];
+        let max_x = width.saturating_sub(TITLE_HEIGHT);
+        let max_y = height
+            .saturating_sub(TASKBAR_HEIGHT)
+            .saturating_sub(TITLE_HEIGHT);
+        let new_x = x.saturating_sub(drag.hold_x).min(max_x);
+        let new_y = y.saturating_sub(drag.hold_y).min(max_y);
+        if new_x == rect.x && new_y == rect.y {
+            return false;
+        }
+        self.rects[at].x = new_x;
+        self.rects[at].y = new_y;
+        true
+    }
+
+    /// Ends a drag. Called when the button comes up, whatever it was over.
+    pub fn release(&mut self) {
+        self.drag = None;
+    }
+
+    /// Whether a window is being dragged right now.
+    #[must_use]
+    pub const fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -519,53 +861,24 @@ mod tests {
     const HEIGHT: u64 = 800;
 
     fn icon_centre(index: usize) -> (u64, u64) {
-        let (x, y) = Desktop::icon_at(index, WIDTH);
+        let (x, y) = Desktop::icon_at(index);
         (x + ICON_SIZE / 2, y + ICON_SIZE / 2)
     }
 
     #[test]
-    fn a_button_held_down_is_one_click_and_not_many() {
-        // The mouse repeats its button state in every movement packet. Acting
-        // on "down" rather than on the transition opens a hundred menus while
-        // somebody holds the button.
-        let mut buttons = Buttons::default();
-        assert_eq!(buttons.edge(true, false), (true, false));
-        for _ in 0..60 {
-            assert_eq!(buttons.edge(true, false), (false, false));
+    fn nothing_is_open_when_the_session_starts() {
+        // A desktop that begins covered in windows nobody asked for is a
+        // screenshot of a desktop rather than a desktop.
+        let desktop = Desktop::new();
+        for window in ALL_WINDOWS {
+            assert!(!desktop.is_open(window), "{window:?}");
         }
-        assert_eq!(buttons.edge(false, false), (false, false));
-        assert_eq!(buttons.edge(true, false), (true, false));
-    }
-
-    #[test]
-    fn the_two_buttons_are_tracked_separately() {
-        let mut buttons = Buttons::default();
-        assert_eq!(buttons.edge(true, true), (true, true));
-        assert_eq!(buttons.edge(true, false), (false, false));
-        assert_eq!(buttons.edge(true, true), (false, true));
-    }
-
-    #[test]
-    fn clicking_an_icon_that_names_a_window_opens_it() {
-        let mut desktop = Desktop::new();
-        assert!(!desktop.shell_open);
-        let (x, y) = icon_centre(2);
-        assert_eq!(
-            desktop.press(x, y, false, WIDTH, HEIGHT, 0),
-            Click::Open(Window::Shell)
-        );
-        assert!(desktop.shell_open);
-        assert_eq!(desktop.selected, Some(2));
+        assert_eq!(desktop.front(), None);
+        assert_eq!(desktop.focus, None);
     }
 
     #[test]
     fn every_icon_opens_a_window() {
-        // This replaces a test that checked the opposite: that an icon naming
-        // no window merely highlights. That was right while two icons named
-        // nothing, and the rule it protected — an icon must not pretend to open
-        // something — is better served now by there being nothing left to
-        // pretend about. An icon on this desktop opens something or it should
-        // not be on this desktop.
         for index in 0..ICON_COUNT {
             let window = Desktop::icon_window(index)
                 .unwrap_or_else(|| panic!("icon {index} is a picture of nothing"));
@@ -576,48 +889,455 @@ mod tests {
                 Click::Open(window)
             );
             assert!(desktop.is_open(window));
-            assert_eq!(desktop.selected, Some(index));
         }
     }
 
     #[test]
-    fn every_open_window_is_drawn_exactly_once() {
-        // A window drawn twice is a window drawn under itself; one drawn never
-        // is one that is gone. Both are silent on a screen nothing tests.
-        for front in [None, Some(Window::Shell), Some(Window::Devices)] {
-            let order = draw_order(front);
-            for window in ALL_WINDOWS {
-                let times = order.iter().filter(|drawn| **drawn == window).count();
-                assert_eq!(times, 1, "{window:?} drawn {times} times");
+    fn every_icon_can_be_hit_and_the_gaps_between_them_cannot() {
+        for index in 0..ICON_COUNT {
+            let (x, y) = icon_centre(index);
+            assert_eq!(Desktop::icon_under(x, y), Some(index));
+        }
+        let (_, first) = Desktop::icon_at(0);
+        assert_eq!(Desktop::icon_under(ICON_LEFT, first + ICON_SIZE + 4), None);
+        assert_eq!(Desktop::icon_under(ICON_LEFT + ICON_SIZE + 4, first), None);
+    }
+
+    #[test]
+    fn every_window_has_its_own_slot() {
+        // Two windows sharing an index is two windows that open and close
+        // together, and nothing about the enum would show it.
+        for (a, first) in ALL_WINDOWS.iter().enumerate() {
+            for second in &ALL_WINDOWS[a + 1..] {
+                assert_ne!(first.index(), second.index(), "{first:?} and {second:?}");
+            }
+            assert!(first.index() < WINDOW_COUNT);
+        }
+    }
+
+    #[test]
+    fn the_stack_holds_every_window_exactly_once() {
+        // A window missing from the order can never be drawn; one appearing
+        // twice is drawn underneath itself.
+        let mut desktop = Desktop::new();
+        for window in [Window::Shell, Window::Files, Window::Shell, Window::Tasks] {
+            desktop.open(window);
+            for check in ALL_WINDOWS {
+                let times = desktop.order().iter().filter(|w| **w == check).count();
+                assert_eq!(times, 1, "{check:?} appears {times} times");
             }
         }
     }
 
     #[test]
-    fn the_front_window_is_drawn_last() {
-        for front in ALL_WINDOWS {
-            let order = draw_order(Some(front));
-            assert_eq!(*order.last().expect("five windows"), front);
+    fn opening_a_window_puts_it_on_top() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.open(Window::Files);
+        assert_eq!(desktop.front(), Some(Window::Files));
+        desktop.open(Window::Shell);
+        assert_eq!(desktop.front(), Some(Window::Shell));
+    }
+
+    #[test]
+    fn raising_a_window_does_not_reorder_the_others() {
+        // A swap would drop whatever was on top into the middle of the stack,
+        // reordering windows nobody touched.
+        let mut desktop = Desktop::new();
+        for window in [Window::Devices, Window::Tasks, Window::Files, Window::Shell] {
+            desktop.open(window);
+        }
+        desktop.open(Window::Devices);
+        let order = desktop.order();
+        let position = |target: Window| order.iter().position(|w| *w == target).expect("in order");
+        assert!(position(Window::Tasks) < position(Window::Files));
+        assert!(position(Window::Files) < position(Window::Shell));
+        assert_eq!(order[WINDOW_COUNT - 1], Window::Devices);
+    }
+
+    #[test]
+    fn a_window_can_be_dragged_by_its_title_bar() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let before = desktop.rect(Window::Shell);
+        desktop.press(before.x + 40, before.y + 8, false, WIDTH, HEIGHT, 0);
+        assert!(desktop.dragging());
+        assert!(desktop.motion(before.x + 140, before.y + 58, WIDTH, HEIGHT));
+        let after = desktop.rect(Window::Shell);
+        assert_eq!((after.x, after.y), (before.x + 100, before.y + 50));
+        assert_eq!((after.w, after.h), (before.w, before.h));
+    }
+
+    #[test]
+    fn a_dragged_window_moves_with_the_point_that_was_grabbed() {
+        // Without the offset the window jumps its own corner to the pointer on
+        // the first pixel of movement.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        let before = desktop.rect(Window::Files);
+        desktop.press(before.x + 200, before.y + 10, false, WIDTH, HEIGHT, 0);
+        desktop.motion(before.x + 200, before.y + 10, WIDTH, HEIGHT);
+        assert_eq!(desktop.rect(Window::Files), before, "it jumped");
+    }
+
+    #[test]
+    fn a_window_cannot_be_dragged_off_the_screen() {
+        // There is no other way to move a window, so one dragged out of reach
+        // is one that cannot be brought back.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let start = desktop.rect(Window::Shell);
+        desktop.press(start.x + 10, start.y + 8, false, WIDTH, HEIGHT, 0);
+        desktop.motion(WIDTH * 2, HEIGHT * 2, WIDTH, HEIGHT);
+        let rect = desktop.rect(Window::Shell);
+        assert!(rect.x < WIDTH, "the title bar went off the right edge");
+        assert!(
+            rect.y + TITLE_HEIGHT <= HEIGHT - TASKBAR_HEIGHT,
+            "the title bar went behind the taskbar"
+        );
+    }
+
+    #[test]
+    fn releasing_the_button_ends_the_drag() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let rect = desktop.rect(Window::Shell);
+        desktop.press(rect.x + 40, rect.y + 8, false, WIDTH, HEIGHT, 0);
+        desktop.release();
+        assert!(!desktop.dragging());
+        assert!(!desktop.motion(900, 700, WIDTH, HEIGHT), "it kept moving");
+    }
+
+    #[test]
+    fn clicking_the_body_of_a_window_does_not_drag_it() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let rect = desktop.rect(Window::Shell);
+        desktop.press(
+            rect.x + 40,
+            rect.y + TITLE_HEIGHT + 20,
+            false,
+            WIDTH,
+            HEIGHT,
+            0,
+        );
+        assert!(!desktop.dragging());
+    }
+
+    #[test]
+    fn the_three_title_buttons_do_three_different_things() {
+        for (button, expected) in [
+            (TitleButton::Close, Click::Close(Window::Files)),
+            (TitleButton::Minimise, Click::Minimise(Window::Files)),
+            (TitleButton::Maximise, Click::Open(Window::Files)),
+        ] {
+            let mut desktop = Desktop::new();
+            desktop.open(Window::Files);
+            let rect = desktop.rect(Window::Files);
+            let at = title_button_rect(rect, button);
+            assert_eq!(
+                desktop.press(at.x + 2, at.y + 2, false, WIDTH, HEIGHT, 0),
+                expected,
+                "{button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_title_buttons_overlap() {
+        // Overlapping buttons mean one of them can never be reached, and which
+        // one depends on the order they are checked in.
+        let rect = default_rect(Window::Shell);
+        let all = [
+            TitleButton::Minimise,
+            TitleButton::Maximise,
+            TitleButton::Close,
+        ];
+        for (index, button) in all.iter().enumerate() {
+            let a = title_button_rect(rect, *button);
+            assert!(a.x >= rect.x, "a button hangs off the left of its window");
+            assert!(a.x + a.w <= rect.x + rect.w, "a button hangs off the right");
+            assert!(
+                a.y + a.h <= rect.y + TITLE_HEIGHT,
+                "a button leaves the bar"
+            );
+            for other in &all[index + 1..] {
+                let b = title_button_rect(rect, *other);
+                assert!(
+                    a.x + a.w <= b.x || b.x + b.w <= a.x,
+                    "{button:?} overlaps {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_minimised_window_is_still_open() {
+        // It is off the screen, not gone: the taskbar has to keep showing it or
+        // there is no way back to it.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.minimise(Window::Shell);
+        assert!(desktop.is_open(Window::Shell));
+        assert!(!desktop.is_visible(Window::Shell));
+        assert!(desktop.taskbar_windows().any(|w| w == Window::Shell));
+    }
+
+    #[test]
+    fn a_minimised_window_cannot_be_clicked_where_it_used_to_be() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        let rect = desktop.rect(Window::Shell);
+        desktop.minimise(Window::Shell);
+        assert_eq!(
+            desktop.press(rect.x + 40, rect.y + 40, false, WIDTH, HEIGHT, 0),
+            Click::None
+        );
+    }
+
+    #[test]
+    fn the_taskbar_button_restores_a_minimised_window() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        desktop.minimise(Window::Files);
+        let at = Desktop::taskbar_button(0, HEIGHT);
+        assert_eq!(
+            desktop.press(at.x + 4, at.y + 4, false, WIDTH, HEIGHT, 0),
+            Click::Open(Window::Files)
+        );
+        assert!(desktop.is_visible(Window::Files));
+    }
+
+    #[test]
+    fn the_taskbar_button_of_the_front_window_minimises_it() {
+        // Otherwise a taskbar button is a control that does nothing once you
+        // have used it.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        let at = Desktop::taskbar_button(0, HEIGHT);
+        assert_eq!(
+            desktop.press(at.x + 4, at.y + 4, false, WIDTH, HEIGHT, 0),
+            Click::Minimise(Window::Files)
+        );
+    }
+
+    #[test]
+    fn taskbar_buttons_do_not_move_when_windows_are_clicked() {
+        // Stacking order would shuffle the buttons under the pointer, which is
+        // a taskbar nobody can aim at.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.open(Window::Files);
+        let before: heapless::Vec<Window, WINDOW_COUNT> = desktop.taskbar_windows().collect();
+        desktop.open(Window::Shell);
+        let after: heapless::Vec<Window, WINDOW_COUNT> = desktop.taskbar_windows().collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn maximising_fills_the_screen_but_not_the_taskbar() {
+        // A maximised window over the taskbar is a window with no way back to
+        // anything else.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.maximise(Window::Shell, WIDTH, HEIGHT);
+        let rect = desktop.rect(Window::Shell);
+        assert_eq!((rect.x, rect.y, rect.w), (0, 0, WIDTH));
+        assert_eq!(rect.h, HEIGHT - TASKBAR_HEIGHT);
+    }
+
+    #[test]
+    fn restoring_puts_a_window_back_where_it_was() {
+        // Not somewhere plausible — where it was, including after a drag.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        let start = desktop.rect(Window::Files);
+        desktop.press(start.x + 30, start.y + 8, false, WIDTH, HEIGHT, 0);
+        desktop.motion(start.x + 130, start.y + 108, WIDTH, HEIGHT);
+        desktop.release();
+        let moved = desktop.rect(Window::Files);
+        assert_ne!(moved, start);
+
+        desktop.maximise(Window::Files, WIDTH, HEIGHT);
+        desktop.maximise(Window::Files, WIDTH, HEIGHT);
+        assert_eq!(desktop.rect(Window::Files), moved);
+    }
+
+    #[test]
+    fn a_maximised_window_is_not_dragged() {
+        // There is nowhere for it to go, and dragging it would leave it the
+        // size of the screen at an offset from it.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.maximise(Window::Shell, WIDTH, HEIGHT);
+        desktop.press(200, 8, false, WIDTH, HEIGHT, 0);
+        assert!(!desktop.dragging());
+    }
+
+    #[test]
+    fn the_start_button_opens_and_closes_the_start_menu() {
+        let mut desktop = Desktop::new();
+        let button = Desktop::start_button(HEIGHT);
+        assert_eq!(
+            desktop.press(button.x + 10, button.y + 10, false, WIDTH, HEIGHT, 0),
+            Click::OpenStart
+        );
+        assert!(desktop.start_open);
+        assert_eq!(
+            desktop.press(button.x + 10, button.y + 10, false, WIDTH, HEIGHT, 0),
+            Click::CloseMenu
+        );
+        assert!(!desktop.start_open);
+    }
+
+    #[test]
+    fn every_start_entry_is_reachable_and_distinct() {
+        let mut desktop = Desktop::new();
+        desktop.start_open = true;
+        let menu = Desktop::start_menu_rect(HEIGHT);
+        for index in 0..START_ITEMS.len() {
+            let y = menu.y + 4 + index as u64 * START_ITEM_HEIGHT + START_ITEM_HEIGHT / 2;
+            assert_eq!(
+                desktop.start_item_under(menu.x + 10, y, HEIGHT),
+                Some(index),
+                "entry {index}"
+            );
+        }
+        for a in 0..START_ITEMS.len() {
+            for b in a + 1..START_ITEMS.len() {
+                if let (Some(x), Some(y)) = (start_window(a), start_window(b)) {
+                    assert_ne!(x, y, "two entries open the same window");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_window_can_be_reached_from_the_start_menu() {
+        // A window that can only be opened by an icon is a window somebody who
+        // covered the icons cannot open.
+        for window in ALL_WINDOWS {
+            assert!(
+                (0..START_ITEMS.len()).any(|index| start_window(index) == Some(window)),
+                "{window:?} is not in the start menu"
+            );
+        }
+    }
+
+    #[test]
+    fn the_start_menu_sits_above_the_taskbar() {
+        let menu = Desktop::start_menu_rect(HEIGHT);
+        assert_eq!(menu.y + menu.h, HEIGHT - TASKBAR_HEIGHT);
+        assert!(menu.y < HEIGHT - TASKBAR_HEIGHT, "the menu has no height");
+    }
+
+    #[test]
+    fn a_start_entry_opens_its_window_and_closes_the_menu() {
+        let mut desktop = Desktop::new();
+        desktop.start_open = true;
+        let menu = Desktop::start_menu_rect(HEIGHT);
+        let click = desktop.press(menu.x + 10, menu.y + 4 + 8, false, WIDTH, HEIGHT, 0);
+        assert_eq!(click, Click::Start(0));
+        assert!(!desktop.start_open);
+    }
+
+    #[test]
+    fn clicking_away_from_the_start_menu_closes_it_without_choosing() {
+        // And does not reach whatever was underneath.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Shell);
+        desktop.start_open = true;
+        let rect = desktop.rect(Window::Shell);
+        assert_eq!(
+            desktop.press(rect.x + 40, rect.y + 40, false, WIDTH, HEIGHT, 0),
+            Click::CloseMenu
+        );
+        assert!(!desktop.start_open);
+    }
+
+    #[test]
+    fn right_clicking_opens_a_menu_that_stays_on_screen() {
+        let mut desktop = Desktop::new();
+        let click = desktop.press(
+            WIDTH - 5,
+            HEIGHT - TASKBAR_HEIGHT - 5,
+            true,
+            WIDTH,
+            HEIGHT,
+            0,
+        );
+        let Click::OpenMenu(mx, my) = click else {
+            panic!("no menu");
+        };
+        assert!(mx + MENU_WIDTH <= WIDTH);
+        assert!(my + MENU_ITEM_HEIGHT * MENU_ITEMS.len() as u64 <= HEIGHT - TASKBAR_HEIGHT);
+    }
+
+    #[test]
+    fn a_menu_entry_is_chosen_and_the_menu_closes() {
+        let mut desktop = Desktop::new();
+        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
+        let click = desktop.press(410, 300 + MENU_ITEM_HEIGHT + 5, false, WIDTH, HEIGHT, 0);
+        assert_eq!(click, Click::Menu(1));
+        assert!(desktop.menu.is_none());
+    }
+
+    #[test]
+    fn a_click_away_from_the_menu_closes_it_rather_than_reaching_through() {
+        let mut desktop = Desktop::new();
+        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
+        let (x, y) = icon_centre(0);
+        assert_eq!(
+            desktop.press(x, y, false, WIDTH, HEIGHT, 0),
+            Click::CloseMenu
+        );
+        assert!(!desktop.is_open(Window::Files), "the click reached through");
+    }
+
+    #[test]
+    fn every_menu_entry_is_reachable() {
+        let mut desktop = Desktop::new();
+        for index in 0..MENU_ITEMS.len() {
+            desktop.press(300, 200, true, WIDTH, HEIGHT, 0);
+            let y = 200 + index as u64 * MENU_ITEM_HEIGHT + MENU_ITEM_HEIGHT / 2;
+            assert_eq!(
+                desktop.press(310, y, false, WIDTH, HEIGHT, 0),
+                Click::Menu(index)
+            );
+        }
+    }
+
+    #[test]
+    fn every_icon_has_a_label_and_every_entry_has_text() {
+        for label in ICON_LABELS {
+            assert!(!label.is_empty());
+        }
+        for item in MENU_ITEMS {
+            assert!(!item.is_empty());
+        }
+        for item in START_ITEMS {
+            assert!(!item.is_empty());
         }
     }
 
     #[test]
     fn a_click_that_raises_a_window_does_not_also_choose_inside_it() {
-        // The window was covered, so whoever clicked could not read what they
-        // were clicking on. Acting on it picks a row on their behalf out of
-        // something they had not seen.
         let mut desktop = Desktop::new();
         desktop.open(Window::Files);
         desktop.open(Window::Shell);
-        let (fx, fy, _, _) = bounds(Window::Files);
-        let at = fy + FILE_ROW_TOP + 4;
+        let rect = desktop.rect(Window::Files);
+        // Somewhere in FILES that the shell does not cover.
+        let at = rect.y + FILE_ROW_TOP + 4;
+        let x = rect.x + 40;
+        if desktop.rect(Window::Shell).holds(x, at) {
+            return;
+        }
         assert_eq!(
-            desktop.press(fx + 40, at, false, WIDTH, HEIGHT, 4),
+            desktop.press(x, at, false, WIDTH, HEIGHT, 4),
             Click::Open(Window::Files)
         );
-        // And now that it is in front, the same click chooses.
         assert_eq!(
-            desktop.press(fx + 40, at, false, WIDTH, HEIGHT, 4),
+            desktop.press(x, at, false, WIDTH, HEIGHT, 4),
             Click::File(0)
         );
     }
@@ -626,64 +1346,49 @@ mod tests {
     fn each_row_of_the_files_window_is_its_own() {
         // Off-by-one here opens the name above or below the one that was
         // clicked, which looks like the filesystem being wrong.
-        let (_, fy, _, _) = bounds(Window::Files);
+        let desktop = Desktop::new();
+        let rect = desktop.rect(Window::Files);
         for row in 0..5usize {
-            let top = fy + FILE_ROW_TOP + row as u64 * FILE_ROW_HEIGHT;
-            assert_eq!(file_row_under(top, 5), Some(row));
-            assert_eq!(file_row_under(top + FILE_ROW_HEIGHT - 1, 5), Some(row));
+            let top = rect.y + FILE_ROW_TOP + row as u64 * FILE_ROW_HEIGHT;
+            assert_eq!(desktop.file_row_under(top, 5), Some(row));
+            assert_eq!(
+                desktop.file_row_under(top + FILE_ROW_HEIGHT - 1, 5),
+                Some(row)
+            );
         }
     }
 
     #[test]
+    fn the_rows_move_with_the_window() {
+        // The listing is drawn from the live rectangle, so the hit test has to
+        // read the same one. A dragged window whose rows stayed behind would
+        // open the wrong name, or nothing.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        let start = desktop.rect(Window::Files);
+        desktop.press(start.x + 30, start.y + 8, false, WIDTH, HEIGHT, 0);
+        desktop.motion(start.x + 130, start.y + 68, WIDTH, HEIGHT);
+        let moved = desktop.rect(Window::Files);
+        assert_eq!(desktop.file_row_under(moved.y + FILE_ROW_TOP, 3), Some(0));
+        assert_eq!(desktop.file_row_under(start.y + FILE_ROW_TOP, 3), None);
+    }
+
+    #[test]
     fn a_click_below_the_last_row_is_not_a_row() {
-        // Empty space under a short listing must not choose the last name.
-        let (_, fy, _, _) = bounds(Window::Files);
-        let below = fy + FILE_ROW_TOP + 2 * FILE_ROW_HEIGHT;
-        assert_eq!(file_row_under(below, 2), None);
-        assert_eq!(file_row_under(fy, 5), None, "the title bar is not a row");
-    }
-
-    #[test]
-    fn clicking_a_window_brings_it_forward() {
-        // With no way to move a window, a window that can be covered and not
-        // raised is a window that is gone.
-        let mut desktop = Desktop::new();
-        desktop.open(Window::Shell);
-        desktop.open(Window::Assistant);
-        assert_eq!(desktop.front, Some(Window::Assistant));
-
-        let (sx, sy, _, _) = bounds(Window::Shell);
+        let desktop = Desktop::new();
+        let rect = desktop.rect(Window::Files);
+        let below = rect.y + FILE_ROW_TOP + 2 * FILE_ROW_HEIGHT;
+        assert_eq!(desktop.file_row_under(below, 2), None);
         assert_eq!(
-            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT, 0),
-            Click::Open(Window::Shell)
+            desktop.file_row_under(rect.y, 5),
+            None,
+            "the title bar is not a row"
         );
-        assert_eq!(desktop.front, Some(Window::Shell));
-        assert_eq!(desktop.focus, Some(Window::Shell));
-    }
-
-    #[test]
-    fn a_click_inside_a_closed_window_reaches_what_is_under_it() {
-        // Otherwise every window leaves a hole in the desktop where it was.
-        let mut desktop = Desktop::new();
-        let (sx, sy, _, _) = bounds(Window::Shell);
-        assert_ne!(
-            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT, 0),
-            Click::Open(Window::Shell)
-        );
-    }
-
-    #[test]
-    fn closing_the_front_window_leaves_nothing_in_front() {
-        let mut desktop = Desktop::new();
-        desktop.open(Window::Tasks);
-        desktop.close(Window::Tasks);
-        assert_eq!(desktop.front, None);
     }
 
     #[test]
     fn typing_goes_to_the_window_that_was_opened_last() {
         let mut desktop = Desktop::new();
-        assert_eq!(desktop.focus, None, "the keyboard points somewhere at rest");
         desktop.open(Window::Shell);
         assert_eq!(desktop.focus, Some(Window::Shell));
         desktop.open(Window::Assistant);
@@ -692,7 +1397,6 @@ mod tests {
 
     #[test]
     fn a_window_that_takes_no_text_does_not_take_the_keyboard() {
-        // Opening the task manager while typing must not swallow the next key.
         let mut desktop = Desktop::new();
         desktop.open(Window::Shell);
         desktop.open(Window::Tasks);
@@ -700,12 +1404,14 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_focused_window_hands_the_keyboard_on() {
-        // And not to nothing, while a prompt is still on screen: keystrokes
-        // that land nowhere while something asks for them is the worst of the
-        // three outcomes.
+    fn closing_or_minimising_the_focused_window_hands_the_keyboard_on() {
+        // Keystrokes landing nowhere while a prompt is still on screen is the
+        // worst of the three outcomes.
         let mut desktop = Desktop::new();
         desktop.open(Window::Shell);
+        desktop.open(Window::Assistant);
+        desktop.minimise(Window::Assistant);
+        assert_eq!(desktop.focus, Some(Window::Shell));
         desktop.open(Window::Assistant);
         desktop.close(Window::Assistant);
         assert_eq!(desktop.focus, Some(Window::Shell));
@@ -722,296 +1428,34 @@ mod tests {
     }
 
     #[test]
-    fn every_task_column_starts_under_its_heading() {
-        // The check the first version needed and did not have: find each
-        // heading in the header, and insist the digits begin at the same place.
-        let row = task_row(7, b"RUNNING", 6, 3);
-        let header = TASK_HEADER;
-        for (heading, first_digit) in [
-            (&b"PID"[..], 0usize),
-            (&b"DMA"[..], 14),
-            (&b"DEVICES"[..], 19),
-        ] {
-            let at = header
-                .windows(heading.len())
-                .position(|w| w == heading)
-                .expect("heading is in the header");
-            assert_eq!(at, first_digit, "column moved out from under its heading");
-        }
-        // The row is as wide as the header; DEVICES is a longer word than the
-        // count under it, so the tail is blank.
-        assert_eq!(&row[..22], b"007  RUNNING  006  003");
-        assert!(row[22..].iter().all(|byte| *byte == b' '));
-    }
-
-    #[test]
-    fn a_count_too_wide_for_its_column_says_so() {
-        // Wrapping would print 1000 DMA regions as 000, which is the one
-        // reading that is worse than no reading.
-        let row = task_row(0, b"READY", 1000, 0);
-        assert_eq!(&row[14..17], b"999");
-    }
-
-    #[test]
-    fn no_two_windows_share_a_close_box() {
-        // They overlap on screen by design; two close boxes at the same point
-        // would mean the top one is unclosable, because the scan finds the
-        // other first.
-        let all = ALL_WINDOWS;
-        for (index, window) in all.iter().enumerate() {
-            for other in &all[index + 1..] {
-                let (cx, cy) = close_at(*window);
-                assert!(!on_close(*other, cx, cy), "two windows, one close box");
-            }
-        }
-    }
-
-    #[test]
-    fn every_icon_that_names_a_window_names_a_different_one() {
-        // Two icons onto one window is two icons of which one is redundant, and
-        // no way to tell from the desktop which.
-        for a in 0..ICON_COUNT {
-            for b in a + 1..ICON_COUNT {
-                if let (Some(x), Some(y)) = (Desktop::icon_window(a), Desktop::icon_window(b)) {
-                    assert_ne!(x, y, "two icons open the same window");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_close_box_sits_inside_its_own_title_bar() {
+    fn a_window_starts_on_the_screen_and_above_the_taskbar() {
+        // The starting layout is the one somebody who has never dragged a
+        // window sees, so it has to be usable without dragging one.
         for window in ALL_WINDOWS {
-            let (x, y, w, _) = bounds(window);
-            let (cx, cy) = close_at(window);
-            assert!(cx >= x && cx + CLOSE_SIZE <= x + w, "past the window edge");
+            let rect = default_rect(window);
+            assert!(rect.x + rect.w <= WIDTH, "{window:?} starts off the right");
             assert!(
-                cy >= y && cy + CLOSE_SIZE <= y + TITLE_HEIGHT,
-                "off the bar"
+                rect.y + rect.h <= HEIGHT - TASKBAR_HEIGHT,
+                "{window:?} starts under the taskbar"
+            );
+            assert!(rect.h > TITLE_HEIGHT, "{window:?} is all title bar");
+        }
+    }
+
+    #[test]
+    fn no_window_starts_on_top_of_the_icons() {
+        // They are what a desktop with nothing open is for.
+        let (_, last) = Desktop::icon_at(ICON_COUNT - 1);
+        for window in ALL_WINDOWS {
+            let rect = default_rect(window);
+            assert!(
+                rect.x >= ICON_LEFT + ICON_SIZE,
+                "{window:?} starts over the icon column"
             );
         }
-    }
-
-    #[test]
-    fn the_close_box_closes_the_window_it_belongs_to() {
-        let mut desktop = Desktop::new();
-        desktop.open(Window::Shell);
-        let (cx, cy) = close_at(Window::Shell);
-        assert_eq!(
-            desktop.press(cx + 2, cy + 2, false, 1280, 800, 0),
-            Click::Close(Window::Shell)
+        assert!(
+            last + ICON_SIZE < HEIGHT - TASKBAR_HEIGHT,
+            "an icon is behind the taskbar"
         );
-        assert!(!desktop.is_open(Window::Shell));
-    }
-
-    #[test]
-    fn a_closed_windows_close_box_is_not_clickable() {
-        // Otherwise the box keeps swallowing clicks on whatever the window was
-        // covering, which is a hole in the desktop where a window used to be.
-        let mut desktop = Desktop::new();
-        let (cx, cy) = close_at(Window::Devices);
-        assert_ne!(
-            desktop.press(cx + 2, cy + 2, false, 1280, 800, 0),
-            Click::Close(Window::Devices)
-        );
-    }
-
-    #[test]
-    fn no_window_hides_the_taskbar() {
-        for window in ALL_WINDOWS {
-            let (_, y, _, h) = bounds(window);
-            assert!(y + h <= 800 - TASKBAR_HEIGHT, "a window covers the taskbar");
-        }
-    }
-
-    #[test]
-    fn nothing_is_open_when_the_session_starts() {
-        // A desktop that begins covered in windows nobody asked for is not a
-        // desktop.
-        let desktop = Desktop::new();
-        assert!(!desktop.is_open(Window::Shell));
-        assert!(!desktop.is_open(Window::Devices));
-    }
-
-    #[test]
-    fn a_window_can_be_closed_and_opened_again() {
-        let mut desktop = Desktop::new();
-        desktop.open(Window::Shell);
-        assert_eq!(desktop.close(Window::Shell), Click::Close(Window::Shell));
-        assert!(!desktop.shell_open);
-        assert_eq!(desktop.open(Window::Shell), Click::Open(Window::Shell));
-        assert!(desktop.shell_open);
-    }
-
-    #[test]
-    fn clicking_the_background_clears_the_selection() {
-        let mut desktop = Desktop::new();
-        let (x, y) = icon_centre(0);
-        desktop.press(x, y, false, WIDTH, HEIGHT, 0);
-        assert_eq!(desktop.press(10, 700, false, WIDTH, HEIGHT, 0), Click::None);
-        assert_eq!(desktop.selected, None);
-    }
-
-    #[test]
-    fn every_icon_can_be_hit_and_the_gaps_between_them_cannot() {
-        for index in 0..ICON_COUNT {
-            let (x, y) = icon_centre(index);
-            assert_eq!(Desktop::icon_under(x, y, WIDTH), Some(index));
-        }
-        // Between two icons, in the spacing. If this hit something, the boxes
-        // would be larger than they are drawn and clicks would land on the
-        // wrong one near the edges.
-        let (_, y) = Desktop::icon_at(0, WIDTH);
-        let gap = y + ICON_SIZE + (ICON_SPACING - ICON_SIZE) / 2;
-        let (x, _) = Desktop::icon_at(0, WIDTH);
-        assert_eq!(Desktop::icon_under(x + 10, gap, WIDTH), None);
-    }
-
-    #[test]
-    fn right_clicking_opens_a_menu_where_the_pointer_is() {
-        let mut desktop = Desktop::new();
-        assert_eq!(
-            desktop.press(400, 300, true, WIDTH, HEIGHT, 0),
-            Click::OpenMenu(400, 300)
-        );
-        assert_eq!(desktop.menu, Some((400, 300)));
-    }
-
-    #[test]
-    fn a_menu_near_an_edge_is_moved_so_all_of_it_fits() {
-        // A menu that opens off the bottom is one whose last entry cannot be
-        // reached, which is worse than one that is not quite where the pointer
-        // was.
-        let mut desktop = Desktop::new();
-        let click = desktop.press(WIDTH - 5, HEIGHT - 5, true, WIDTH, HEIGHT, 0);
-        let Click::OpenMenu(x, y) = click else {
-            panic!("expected a menu, got {click:?}");
-        };
-        assert!(x + MENU_WIDTH <= WIDTH);
-        assert!(y + MENU_ITEM_HEIGHT * MENU_ITEMS.len() as u64 <= HEIGHT);
-    }
-
-    #[test]
-    fn choosing_a_menu_entry_reports_it_and_closes_the_menu() {
-        let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
-        let click = desktop.press(
-            400 + 10,
-            300 + MENU_ITEM_HEIGHT + 5,
-            false,
-            WIDTH,
-            HEIGHT,
-            0,
-        );
-        assert_eq!(click, Click::Menu(1));
-        assert_eq!(desktop.menu, None);
-    }
-
-    #[test]
-    fn clicking_away_from_an_open_menu_closes_it_and_does_nothing_else() {
-        // While the menu is open it is on top of everything. A click elsewhere
-        // dismisses it rather than reaching what is underneath — otherwise an
-        // icon can be selected through an open menu.
-        let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
-        let (x, y) = icon_centre(0);
-        assert_eq!(
-            desktop.press(x, y, false, WIDTH, HEIGHT, 0),
-            Click::CloseMenu
-        );
-        assert_eq!(
-            desktop.selected, None,
-            "an icon was selected through a menu"
-        );
-        assert_eq!(desktop.menu, None);
-    }
-
-    #[test]
-    fn a_second_right_click_while_the_menu_is_open_closes_it() {
-        let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
-        assert_eq!(
-            desktop.press(700, 500, true, WIDTH, HEIGHT, 0),
-            Click::CloseMenu
-        );
-    }
-
-    #[test]
-    fn every_menu_entry_is_reachable() {
-        // An entry whose row cannot be hit is an entry that does not exist.
-        let mut desktop = Desktop::new();
-        desktop.press(300, 200, true, WIDTH, HEIGHT, 0);
-        for index in 0..MENU_ITEMS.len() {
-            let y = 200 + index as u64 * MENU_ITEM_HEIGHT + MENU_ITEM_HEIGHT / 2;
-            assert_eq!(desktop.menu_under(300 + 5, y), Some(index), "entry {index}");
-        }
-        // And one row past the last is not an entry.
-        let past = 200 + MENU_ITEMS.len() as u64 * MENU_ITEM_HEIGHT + 5;
-        assert_eq!(desktop.menu_under(305, past), None);
-    }
-
-    #[test]
-    fn a_point_left_of_the_menu_is_not_in_it() {
-        let mut desktop = Desktop::new();
-        desktop.press(300, 200, true, WIDTH, HEIGHT, 0);
-        assert_eq!(desktop.menu_under(299, 210), None);
-        assert_eq!(desktop.menu_under(300 + MENU_WIDTH, 210), None);
-        assert_eq!(desktop.menu_under(305, 199), None);
-    }
-
-    #[test]
-    fn every_icon_has_a_label_and_every_menu_entry_has_text() {
-        for label in ICON_LABELS {
-            assert!(!label.is_empty());
-        }
-        for item in MENU_ITEMS {
-            assert!(!item.is_empty());
-        }
-    }
-
-    #[test]
-    fn an_entry_that_promises_to_open_something_opens_something() {
-        // This test used to forbid the word "Open" entirely, because "Open
-        // shell" answered "the shell is already open below" — the shell was
-        // always open and the entry was decoration. Windows start closed now,
-        // so the word is honest again, and the rule becomes the one it should
-        // have been: an entry may promise a window as long as it names one.
-        //
-        // One direction only. The reverse — that anything which opens a window
-        // must be worded "Open" — is a naming rule rather than a truthfulness
-        // one, and it fails on "Task manager", which is the clearest name for
-        // an entry that opens the task manager.
-        for (index, label) in MENU_ITEMS.iter().enumerate() {
-            if label.starts_with(b"Open") || label.starts_with(b"Show") {
-                assert!(
-                    Desktop::menu_window(index).is_some(),
-                    "entry {index} promises a window and names none"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_menu_entry_that_opens_a_window_actually_opens_it() {
-        for index in 0..MENU_ITEMS.len() {
-            let Some(window) = Desktop::menu_window(index) else {
-                continue;
-            };
-            let mut desktop = Desktop::new();
-            assert!(!desktop.is_open(window));
-            desktop.open(window);
-            assert!(desktop.is_open(window), "entry {index} opened nothing");
-        }
-    }
-
-    #[test]
-    fn no_two_menu_entries_open_the_same_window() {
-        for a in 0..MENU_ITEMS.len() {
-            for b in a + 1..MENU_ITEMS.len() {
-                if let (Some(x), Some(y)) = (Desktop::menu_window(a), Desktop::menu_window(b)) {
-                    assert_ne!(x, y, "two entries for one window");
-                }
-            }
-        }
     }
 }

@@ -963,19 +963,31 @@ mod colour {
     pub const SCALE_LIGHT: u32 = 0x000C_2036;
     pub const ICON: u32 = 0x0018_3050;
     pub const SELECTED: u32 = 0x0025_5A88;
-    pub const MENU: u32 = 0x0016_2440;
+    pub const MENU: u32 = 0x00F2_F2F2;
+    pub const MENU_EDGE: u32 = 0x00C0_C0C0;
+    pub const MENU_TEXT: u32 = 0x0020_2020;
     pub const ICON_EDGE: u32 = 0x0019_E6FF;
-    pub const PANEL: u32 = 0x000C_1830;
+    /// The taskbar and the start button.
+    pub const PANEL: u32 = 0x001F_1F1F;
+    pub const PANEL_EDGE: u32 = 0x003A_3A3A;
+    pub const START: u32 = 0x000A_6EBD;
     pub const ACCENT: u32 = 0x0019_E6FF;
     pub const TEXT: u32 = 0x00D8_E8F8;
     pub const DIM: u32 = 0x0064_8098;
+    /// Window chrome. Light, like every desktop this is meant to resemble; the
+    /// contents stay dark because that is what the two consoles have always
+    /// been and a terminal on white is a different thing to read.
     pub const WINDOW: u32 = 0x0012_1E36;
-    pub const WINDOW_BAR: u32 = 0x001B_2C4C;
+    pub const WINDOW_EDGE: u32 = 0x005A_6A80;
+    pub const WINDOW_BAR: u32 = 0x00D6_DEE8;
+    pub const WINDOW_BAR_ON: u32 = 0x000A_6EBD;
+    pub const BAR_TEXT: u32 = 0x0020_2830;
+    pub const BAR_TEXT_ON: u32 = 0x00FF_FFFF;
+    pub const CLOSE_HOT: u32 = 0x00C4_2B1C;
     pub const SHADOW: u32 = 0x0000_0206;
 }
 
 /// Height of the bar across the top.
-const PANEL_HEIGHT: u64 = 32;
 /// How much the glyphs are scaled. A 6x7 glyph is unreadable unscaled at this
 /// resolution.
 const TEXT_SCALE: u64 = 2;
@@ -1076,33 +1088,60 @@ impl Screen {
     ///
     /// # Safety
     /// As `put`.
-    unsafe fn window(&self, which: desktop::Window, title: &[u8], focused: bool) {
-        let (x, y, w, h) = desktop::bounds(which);
-        let (cx, cy) = desktop::close_at(which);
+    unsafe fn window(&self, rect: desktop::Rect, title: &[u8], focused: bool) {
+        let desktop::Rect { x, y, w, h } = rect;
+        // The active window's bar is coloured and the others' are not. One bit
+        // of state, drawn rather than described — and the one bit somebody
+        // needs to know before they start typing.
+        let (bar, ink) = if focused {
+            (colour::WINDOW_BAR_ON, colour::BAR_TEXT_ON)
+        } else {
+            (colour::WINDOW_BAR, colour::BAR_TEXT)
+        };
+
         // SAFETY: as `put`.
         unsafe {
             self.fill(x + 4, y + 4, w, h, colour::SHADOW);
             self.fill(x, y, w, h, colour::WINDOW);
-            self.fill(x, y, w, desktop::TITLE_HEIGHT, colour::WINDOW_BAR);
-            // The close box: a square with a cross in it, drawn from the same
-            // constants the hit test reads.
-            self.fill(
-                cx,
-                cy,
-                desktop::CLOSE_SIZE,
-                desktop::CLOSE_SIZE,
-                colour::SHADOW,
-            );
-            for step in 3..desktop::CLOSE_SIZE - 3 {
-                self.put(cx + step, cy + step, colour::TEXT);
-                self.put(cx + desktop::CLOSE_SIZE - 1 - step, cy + step, colour::TEXT);
+            // A border, so a window on top of another has an edge rather than
+            // bleeding into it.
+            self.fill(x, y, w, 1, colour::WINDOW_EDGE);
+            self.fill(x, y + h - 1, w, 1, colour::WINDOW_EDGE);
+            self.fill(x, y, 1, h, colour::WINDOW_EDGE);
+            self.fill(x + w - 1, y, 1, h, colour::WINDOW_EDGE);
+            self.fill(x + 1, y + 1, w - 2, desktop::TITLE_HEIGHT - 1, bar);
+            self.text(x + 10, y + 7, title, ink);
+
+            for button in [
+                desktop::TitleButton::Minimise,
+                desktop::TitleButton::Maximise,
+                desktop::TitleButton::Close,
+            ] {
+                let at = desktop::title_button_rect(rect, button);
+                let mid_y = at.y + at.h / 2;
+                let mid_x = at.x + at.w / 2;
+                match button {
+                    // A line along the bottom: what the window becomes.
+                    desktop::TitleButton::Minimise => {
+                        self.fill(mid_x - 5, mid_y + 4, 10, 2, ink);
+                    }
+                    // An outline: the shape it grows into.
+                    desktop::TitleButton::Maximise => {
+                        self.fill(mid_x - 5, mid_y - 5, 11, 1, ink);
+                        self.fill(mid_x - 5, mid_y + 5, 11, 1, ink);
+                        self.fill(mid_x - 5, mid_y - 5, 1, 11, ink);
+                        self.fill(mid_x + 5, mid_y - 5, 1, 11, ink);
+                    }
+                    // A cross, on red, because it is the one that loses work.
+                    desktop::TitleButton::Close => {
+                        self.fill(at.x, at.y, at.w, at.h, colour::CLOSE_HOT);
+                        for step in 0..10u64 {
+                            self.put(mid_x - 5 + step, mid_y - 5 + step, colour::BAR_TEXT_ON);
+                            self.put(mid_x + 4 - step, mid_y - 5 + step, colour::BAR_TEXT_ON);
+                        }
+                    }
+                }
             }
-            // The focused window is the one with the accent stripe. One bit of
-            // state, drawn rather than described.
-            if focused {
-                self.fill(x, y, 3, h, colour::ACCENT);
-            }
-            self.text(x + 10, y + 6, title, colour::TEXT);
         }
     }
 }
@@ -1282,6 +1321,21 @@ fn session(grant: u64) -> ! {
                                         right,
                                     ));
                                 }
+                                // A drag is the one thing that happens while a
+                                // button is held rather than on its edge, so it
+                                // is followed here, packet by packet.
+                                if !buttons.left {
+                                    face.release();
+                                } else if face.dragging()
+                                    && face.motion(
+                                        pointer.x.max(0) as u64,
+                                        pointer.y.max(0) as u64,
+                                        screen.width,
+                                        screen.height,
+                                    )
+                                {
+                                    painted = false;
+                                }
                             }
                         } else if extended {
                             // The byte after the prefix is a different key from
@@ -1356,7 +1410,11 @@ fn session(grant: u64) -> ! {
                                         // Already inside the enclosing
                                         // `unsafe`, which is what makes the
                                         // port reads above legal.
-                                        draw_shell(&screen, &shell);
+                                        draw_shell(
+                                            &screen,
+                                            &shell,
+                                            face.rect(desktop::Window::Shell),
+                                        );
                                         let _ = call(SYS_SHUTDOWN, grant, 0);
                                         // Only reached if the machine
                                         // refused, which the kernel has
@@ -1406,10 +1464,15 @@ fn session(grant: u64) -> ! {
         // granted, and every draw below is clipped to its geometry.
         unsafe {
             if !painted {
+                // Whatever the pointer saved is now a picture of the frame
+                // before this one. Restoring it would stamp a patch of the old
+                // screen wherever the cursor happened to be — which is what
+                // left a menu-coloured square behind when the start menu
+                // closed underneath it.
+                pointer.forget();
                 painted = true;
-                draw_desktop(&screen, &face, files.as_ref());
+                draw_desktop(&screen, &face, files.as_ref(), tick);
             }
-            draw_status(&screen, tick, keys, &pointer);
             // Once a second rather than every tick. The states do change that
             // fast, but a table redrawn sixty-four times a second is unreadable
             // and costs more than it tells anybody.
@@ -1417,24 +1480,25 @@ fn session(grant: u64) -> ! {
             // different order from the frames it belongs to is text on top of
             // the wrong window — the contents of a window that is behind,
             // painted over the one in front.
-            for window in desktop::draw_order(face.front) {
-                if !face.is_open(window) {
+            for window in face.order() {
+                if !face.is_visible(window) {
                     continue;
                 }
                 match window {
-                    desktop::Window::Shell => draw_shell(&screen, &shell),
+                    desktop::Window::Shell => {
+                        draw_shell(&screen, &shell, face.rect(desktop::Window::Shell));
+                    }
                     desktop::Window::Assistant => {
-                        draw_console(&screen, &helper, desktop::Window::Assistant);
+                        draw_console(&screen, &helper, face.rect(desktop::Window::Assistant));
                     }
                     desktop::Window::Tasks if tick / 64 != last_tasks => {
                         last_tasks = tick / 64;
-                        draw_tasks(&screen);
+                        draw_tasks(&screen, face.rect(desktop::Window::Tasks));
                     }
                     _ => {}
                 }
             }
             draw_menu(&screen, &face);
-            draw_sweep(&screen, tick);
             draw_pointer(&screen, &mut pointer);
         }
 
@@ -1462,6 +1526,16 @@ fn session(grant: u64) -> ! {
 }
 
 impl Pointer {
+    /// Forgets what is underneath, because the screen changed under it.
+    ///
+    /// Called before a full repaint. The saved patch is a picture of the frame
+    /// before, and restoring it stamps that patch wherever the cursor happened
+    /// to be — which is what left a menu-coloured square on the desktop when
+    /// the start menu closed underneath the pointer.
+    fn forget(&mut self) {
+        self.saved_at = None;
+    }
+
     /// Copies the desktop under where the cursor is about to go.
     ///
     /// # Safety
@@ -1568,7 +1642,7 @@ unsafe fn draw_wallpaper(screen: &Screen) {
     const SCALE_H: u64 = 56;
 
     let mut row = 0u64;
-    let mut y = PANEL_HEIGHT;
+    let mut y = 0;
     while y < screen.height {
         // Every other row is offset by half a scale, which is what stops the
         // pattern reading as a grid.
@@ -1580,7 +1654,7 @@ unsafe fn draw_wallpaper(screen: &Screen) {
         let mut x = 0u64;
         while x < screen.width + SCALE_W {
             // Darker further down, so the light appears to come from above.
-            let depth = (y - PANEL_HEIGHT) * 100 / screen.height.max(1);
+            let depth = y * 100 / screen.height.max(1);
             let base = if (x / SCALE_W + row).is_multiple_of(3) {
                 colour::SCALE_LIGHT
             } else {
@@ -1640,7 +1714,7 @@ unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
     // they stop agreeing is that clicks land next to what they look like they
     // land on.
     for (index, label) in desktop::ICON_LABELS.iter().enumerate() {
-        let (x, y) = desktop::Desktop::icon_at(index, screen.width);
+        let (x, y) = desktop::Desktop::icon_at(index);
         let selected = face.selected == Some(index);
         let body = if selected {
             colour::SELECTED
@@ -1669,7 +1743,12 @@ unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
 ///
 /// # Safety
 /// `screen` must describe a framebuffer window this process holds.
-unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop, files: Option<&dir::Table>) {
+unsafe fn draw_desktop(
+    screen: &Screen,
+    face: &desktop::Desktop,
+    files: Option<&dir::Table>,
+    tick: u64,
+) {
     // SAFETY: the caller guarantees the window; every call clips to geometry.
     unsafe {
         screen.gradient(
@@ -1681,27 +1760,16 @@ unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop, files: Option<&
         draw_wallpaper(screen);
         draw_icons(screen, face);
 
-        // The panel across the top, and what it says.
-        screen.fill(0, 0, screen.width, PANEL_HEIGHT, colour::PANEL);
-        screen.fill(0, PANEL_HEIGHT, screen.width, 2, colour::ACCENT);
-        // Placed by arithmetic rather than by eye. A glyph is `GLYPH_WIDTH`
-        // wide before scaling, so eight characters of title occupy exactly
-        // this much — guessing put the second word twelve pixels inside the
-        // first and produced "WHISEZOSSESSION" on screen.
-        const TITLE: &[u8] = b"WHISEZOS";
-        let title_end = 12 + TITLE.len() as u64 * font::GLYPH_WIDTH as u64 * TEXT_SCALE;
-        screen.text(12, 9, TITLE, colour::ACCENT);
-        screen.text(title_end + 16, 9, b"SESSION", colour::DIM);
-
         // Back to front, so the window somebody just clicked is the one they
         // can read. A fixed order with a click order that is not fixed drew a
         // newly opened window underneath the one it was opened over.
-        for window in desktop::draw_order(face.front) {
-            if face.is_open(window) {
+        for window in face.order() {
+            if face.is_visible(window) {
                 draw_window(screen, window, face, files);
             }
         }
-        draw_taskbar(screen, face);
+        draw_taskbar(screen, face, tick);
+        draw_start_menu(screen, face);
     }
 }
 
@@ -1715,13 +1783,17 @@ unsafe fn draw_window(
     face: &desktop::Desktop,
     files: Option<&dir::Table>,
 ) {
-    let focused = face.focus == Some(window);
+    // The window in front is the active one, whether or not it takes text. A
+    // task manager on top with the shell's bar coloured says the shell is where
+    // the click went, which is not where it went.
+    let focused = face.front() == Some(window);
+    let rect = face.rect(window);
+    let desktop::Rect { x: dx, y: dy, .. } = rect;
     // SAFETY: the caller guarantees the window; every draw clips.
     unsafe {
+        screen.window(rect, window.title(), focused);
         match window {
             desktop::Window::Devices => {
-                let (dx, dy, _, _) = desktop::bounds(window);
-                screen.window(window, b"DEVICES", focused);
                 screen.text(dx + 16, dy + 40, b"DISK    VIRTIO-BLK  16 MIB", colour::DIM);
                 screen.text(
                     dx + 16,
@@ -1739,8 +1811,7 @@ unsafe fn draw_window(
                 screen.text(dx + 16, dy + 160, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
             }
             desktop::Window::Files => {
-                let (fx, fy, _, _) = desktop::bounds(window);
-                screen.window(window, b"FILES", focused);
+                let (fx, fy) = (dx, dy);
                 let Some(table) = files else {
                     // A missing filesystem and an empty one look identical
                     // otherwise, and they call for different things from
@@ -1785,9 +1856,9 @@ unsafe fn draw_window(
                     screen.text(fx + 92, at, label, colour::TEXT);
                 }
             }
-            desktop::Window::Tasks => screen.window(window, b"TASK MANAGER", focused),
-            desktop::Window::Assistant => screen.window(window, b"ASSISTANT", focused),
-            desktop::Window::Shell => screen.window(window, b"SHELL", focused),
+            // Their contents are drawn by the live layer, which runs on a
+            // different schedule: the frames here, the text there.
+            desktop::Window::Tasks | desktop::Window::Assistant | desktop::Window::Shell => {}
         }
     }
 }
@@ -1801,47 +1872,6 @@ unsafe fn draw_window(
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_status(screen: &Screen, tick: u64, keys: u64, pointer: &Pointer) {
-    let seconds = tick / 64;
-    let mut stamp = *b"UP 00:00:00";
-    let hours = (seconds / 3600) % 100;
-    let minutes = (seconds / 60) % 60;
-    let secs = seconds % 60;
-    stamp[3] = b'0' + (hours / 10) as u8;
-    stamp[4] = b'0' + (hours % 10) as u8;
-    stamp[6] = b'0' + (minutes / 10) as u8;
-    stamp[7] = b'0' + (minutes % 10) as u8;
-    stamp[9] = b'0' + (secs / 10) as u8;
-    stamp[10] = b'0' + (secs % 10) as u8;
-
-    let mut readout = *b"KEYS 000  X 0000 Y 0000  ";
-    let k = keys % 1000;
-    readout[5] = b'0' + (k / 100) as u8;
-    readout[6] = b'0' + (k / 10 % 10) as u8;
-    readout[7] = b'0' + (k % 10) as u8;
-    let px = pointer.x.clamp(0, 9999) as u64;
-    let py = pointer.y.clamp(0, 9999) as u64;
-    for (offset, value) in [(12u64, px), (19, py)] {
-        for digit in 0..4u64 {
-            let place = 10u64.pow(3 - digit as u32);
-            readout[(offset + digit) as usize] = b'0' + (value / place % 10) as u8;
-        }
-    }
-    if pointer.left {
-        readout[24] = b'*';
-    }
-
-    let x = screen.width.saturating_sub(160);
-    // SAFETY: the caller guarantees the window.
-    unsafe {
-        // The panel behind each first: glyphs are drawn as set pixels only, so
-        // without this the previous digit stays underneath the new one.
-        screen.fill(x, 4, 150, 24, colour::PANEL);
-        screen.text(x, 9, &stamp, colour::TEXT);
-        screen.fill(260, 4, 400, 24, colour::PANEL);
-        screen.text(260, 9, &readout, colour::DIM);
-    }
-}
 
 /// Everything needed to read a sector, once the disk has been brought up.
 struct Disk {
@@ -2050,7 +2080,8 @@ fn store(shell: &mut console::Console, disk: Option<&mut Disk>, table: &dir::Tab
 // rectangle the redraw clears, so it stays on the desktop after the window
 // closes.
 const _: () = assert!(
-    (desktop::bounds(desktop::Window::Assistant).2 - 20) / CELL_W >= assistant::LINE_MAX as u64
+    (desktop::default_rect(desktop::Window::Assistant).w - 20) / CELL_W
+        >= assistant::LINE_MAX as u64
 );
 
 /// Puts one key into a console and says what it asked for.
@@ -2577,13 +2608,6 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
         desktop::Click::CloseMenu => true,
         desktop::Click::OpenMenu(_, _) => false,
         desktop::Click::Menu(item) => {
-            // The entries that only open a window take it from the same table
-            // the labels come from, so a reordering cannot make an entry do
-            // what the one above it says.
-            if let Some(window) = desktop::Desktop::menu_window(item) {
-                face.open(window);
-                return true;
-            }
             match item {
                 0 => {
                     // The menu has no way to ask for a name — there is no text
@@ -2596,18 +2620,32 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
                     face.open(desktop::Window::Files);
                     make_folder(shell, disk, files, &name, face.cwd);
                 }
+                // Refresh. Everything on this desktop is redrawn from the
+                // state it describes, so there is nothing to reload — the
+                // repaint below is the whole of it, and saying so is better
+                // than an entry that quietly does nothing.
+                1 => {}
                 _ => {
-                    shell.print(b"shutting down");
-                    // An ordinary system call. It returns only if the machine
-                    // refused, which the kernel has already reported.
-                    let _ = call(SYS_SHUTDOWN, grant, 0);
-                    shell.print(b"the machine refused to power off");
+                    face.open(desktop::Window::Tasks);
                 }
             }
-            let _ = tick;
+            let _ = (tick, grant);
             face.selected = None;
             true
         }
+        desktop::Click::Start(item) => {
+            if let Some(window) = desktop::start_window(item) {
+                face.open(window);
+                return true;
+            }
+            shell.print(b"shutting down");
+            // An ordinary system call. It returns only if the machine refused,
+            // which the kernel has already reported.
+            let _ = call(SYS_SHUTDOWN, grant, 0);
+            shell.print(b"the machine refused to power off");
+            true
+        }
+        desktop::Click::OpenStart | desktop::Click::Minimise(_) | desktop::Click::Drag => true,
         desktop::Click::File(row) => {
             let Some(table) = files.as_ref() else {
                 return false;
@@ -2661,8 +2699,8 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_tasks(screen: &Screen) {
-    let (x, y, w, h) = desktop::bounds(desktop::Window::Tasks);
+unsafe fn draw_tasks(screen: &Screen, rect: desktop::Rect) {
+    let desktop::Rect { x, y, w, h } = rect;
     let mut list = abi::TaskList::EMPTY;
     let size = core::mem::size_of::<abi::TaskList>() as u64;
     let ok = call(SYS_TASK_LIST, (&raw mut list) as u64, size).is_ok();
@@ -2708,33 +2746,73 @@ unsafe fn draw_tasks(screen: &Screen) {
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop) {
+unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop, tick: u64) {
     let top = screen.height.saturating_sub(desktop::TASKBAR_HEIGHT);
+    let start = desktop::Desktop::start_button(screen.height);
 
     // SAFETY: the caller guarantees the window; every draw clips.
     unsafe {
         screen.fill(0, top, screen.width, desktop::TASKBAR_HEIGHT, colour::PANEL);
-        screen.fill(0, top, screen.width, 1, colour::ACCENT);
-        screen.text(12, top + 10, b"WHISEZOS", colour::ACCENT);
+        screen.fill(0, top, screen.width, 1, colour::PANEL_EDGE);
 
-        // One button per open window. An empty taskbar is the honest picture of
-        // a desktop with nothing running, which is what this is until a process
-        // can create a window of its own.
-        let mut x = 130u64;
-        for (window, label) in [
-            (desktop::Window::Shell, b"SHELL   ".as_slice()),
-            (desktop::Window::Devices, b"DEVICES ".as_slice()),
-            (desktop::Window::Tasks, b"TASKS   ".as_slice()),
-            (desktop::Window::Files, b"FILES   ".as_slice()),
-            (desktop::Window::Assistant, b"ASSIST  ".as_slice()),
-        ] {
-            if !face.is_open(window) {
-                continue;
+        screen.fill(start.x, start.y, start.w, start.h, colour::START);
+        screen.text(start.x + 16, top + 13, b"START", colour::BAR_TEXT_ON);
+
+        // One button per open window, in a fixed order. A minimised window gets
+        // a flatter button: it is the only thing on screen that says the window
+        // is still there, so it has to look different from one that is showing.
+        for (index, window) in face.taskbar_windows().enumerate() {
+            let at = desktop::Desktop::taskbar_button(index, screen.height);
+            if at.x + at.w > screen.width {
+                break;
             }
-            screen.fill(x, top + 5, 130, desktop::TASKBAR_HEIGHT - 10, colour::ICON);
-            screen.fill(x, top + 5, 2, desktop::TASKBAR_HEIGHT - 10, colour::ACCENT);
-            screen.text(x + 10, top + 10, label, colour::TEXT);
-            x += 142;
+            let showing = face.is_visible(window);
+            let body = if showing {
+                colour::PANEL_EDGE
+            } else {
+                colour::PANEL
+            };
+            screen.fill(at.x, at.y, at.w, at.h, body);
+            if face.front() == Some(window) {
+                screen.fill(at.x, at.y + at.h - 2, at.w, 2, colour::START);
+            }
+            let ink = if showing { colour::TEXT } else { colour::DIM };
+            screen.text(at.x + 10, at.y + 6, window.short(), ink);
+        }
+
+        // The clock, at the far end. The only number here that changes on its
+        // own, which is why it is worth the corner it takes.
+        let seconds = tick / 64;
+        let mut stamp = *b"00:00:00";
+        desktop::write_number(&mut stamp[0..2], (seconds / 3600) % 100);
+        desktop::write_number(&mut stamp[3..5], (seconds / 60) % 60);
+        desktop::write_number(&mut stamp[6..8], seconds % 60);
+        screen.text(screen.width - 120, top + 13, &stamp, colour::TEXT);
+    }
+}
+
+/// The start menu, drawn over everything when it is open.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_start_menu(screen: &Screen, face: &desktop::Desktop) {
+    if !face.start_open {
+        return;
+    }
+    let menu = desktop::Desktop::start_menu_rect(screen.height);
+
+    // SAFETY: the caller guarantees the window; every draw clips.
+    unsafe {
+        screen.fill(menu.x + 4, menu.y + 4, menu.w, menu.h, colour::SHADOW);
+        screen.fill(menu.x, menu.y, menu.w, menu.h, colour::MENU);
+        screen.fill(menu.x, menu.y, menu.w, 1, colour::MENU_EDGE);
+        screen.fill(menu.x + menu.w - 1, menu.y, 1, menu.h, colour::MENU_EDGE);
+        // A stripe down the left, the way a start menu has one.
+        screen.fill(menu.x, menu.y, 6, menu.h, colour::START);
+
+        for (index, item) in desktop::START_ITEMS.iter().enumerate() {
+            let row = menu.y + 4 + index as u64 * desktop::START_ITEM_HEIGHT;
+            screen.text(menu.x + 20, row + 10, item, colour::MENU_TEXT);
         }
     }
 }
@@ -2753,11 +2831,14 @@ unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
     unsafe {
         screen.fill(x + 3, y + 3, desktop::MENU_WIDTH, height, colour::SHADOW);
         screen.fill(x, y, desktop::MENU_WIDTH, height, colour::MENU);
-        screen.fill(x, y, desktop::MENU_WIDTH, 1, colour::ACCENT);
+        screen.fill(x, y, desktop::MENU_WIDTH, 1, colour::MENU_EDGE);
+        screen.fill(x, y + height - 1, desktop::MENU_WIDTH, 1, colour::MENU_EDGE);
+        screen.fill(x, y, 1, height, colour::MENU_EDGE);
+        screen.fill(x + desktop::MENU_WIDTH - 1, y, 1, height, colour::MENU_EDGE);
 
         for (index, item) in desktop::MENU_ITEMS.iter().enumerate() {
             let row = y + index as u64 * desktop::MENU_ITEM_HEIGHT;
-            screen.text(x + 10, row + 6, item, colour::TEXT);
+            screen.text(x + 12, row + 7, item, colour::MENU_TEXT);
         }
     }
 }
@@ -2772,9 +2853,9 @@ unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
+unsafe fn draw_shell(screen: &Screen, shell: &console::Console, rect: desktop::Rect) {
     // SAFETY: as `draw_console`.
-    unsafe { draw_console(screen, shell, desktop::Window::Shell) }
+    unsafe { draw_console(screen, shell, rect) }
 }
 
 /// A console inside its window: the history, then the line being typed.
@@ -2786,8 +2867,13 @@ unsafe fn draw_shell(screen: &Screen, shell: &console::Console) {
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_console(screen: &Screen, shell: &console::Console, which: desktop::Window) {
-    let (wx, wy, ww, wh) = desktop::bounds(which);
+unsafe fn draw_console(screen: &Screen, shell: &console::Console, rect: desktop::Rect) {
+    let desktop::Rect {
+        x: wx,
+        y: wy,
+        w: ww,
+        h: wh,
+    } = rect;
     let text_x = wx + 10;
     let text_y = wy + desktop::TITLE_HEIGHT + 8;
     // As many rows as the window has room for, so a short window shows fewer
@@ -2873,23 +2959,6 @@ unsafe fn draw_pointer(screen: &Screen, pointer: &mut Pointer) {
     }
 }
 
-/// A marker sweeping along the accent line under the panel.
-///
-/// The one thing that moves on every single frame rather than once a second,
-/// so a stalled machine is obvious at a glance instead of after waiting to see
-/// whether the clock advances.
-///
-/// # Safety
-/// As `draw_desktop`.
-unsafe fn draw_sweep(screen: &Screen, tick: u64) {
-    let width = screen.width.max(1);
-    let position = (tick * 6) % width;
-    // SAFETY: the caller guarantees the window.
-    unsafe {
-        screen.fill(0, PANEL_HEIGHT, screen.width, 2, colour::ACCENT);
-        screen.fill(position, PANEL_HEIGHT, 90, 2, colour::TEXT);
-    }
-}
 /// Stays alive without a screen or a clock.
 ///
 /// The session must not exit, so every failure above lands here rather than in
