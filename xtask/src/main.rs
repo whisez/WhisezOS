@@ -49,8 +49,30 @@ enum Cmd {
         #[arg(long, default_value = "whisezos.img")]
         out: PathBuf,
     },
-    /// Build the UEFI preview and boot it in QEMU.
+    /// Boot WhisezOS in QEMU. This is the operating system.
+    ///
+    /// `run` used to build and boot the UEFI preview — a separate program with
+    /// a setup screen and no kernel behind it. Anybody typing the most obvious
+    /// command got that instead of the OS, saw a firmware demo, and reasonably
+    /// reported that the desktop never appeared. The preview is still here as
+    /// `run-preview`; this is the system.
     Run {
+        #[arg(long, default_value = "q35")]
+        machine: String,
+        /// Must clear the memory floor `spd::audit` enforces, which is 8 GiB of
+        /// *usable* memory.
+        #[arg(long, default_value = "9G")]
+        ram: String,
+        /// Send the serial log to a file instead of this terminal.
+        #[arg(long)]
+        log: bool,
+    },
+    /// Build the UEFI visual preview and boot it in QEMU.
+    ///
+    /// Not the operating system: a standalone UEFI application that draws the
+    /// installer mock-up and handles pointer input. It predates the kernel and
+    /// is kept because the setup screen and the PS/2 work live in it.
+    RunPreview {
         #[arg(long, default_value = "q35")]
         machine: String,
         #[arg(long, default_value = "768M")]
@@ -61,6 +83,8 @@ enum Cmd {
     /// Run every test suite, including the host-side kernel logic tests.
     Test,
     /// Boot the production loader and microkernel in QEMU, serial on stdio.
+    ///
+    /// The same thing `run` does. Kept because scripts and habits point at it.
     BootRun {
         #[arg(long, default_value = "q35")]
         machine: String,
@@ -93,7 +117,13 @@ fn main() -> Result<()> {
         Cmd::Userland => build_userland(),
         Cmd::Manifest { key } => build_manifest(key.as_deref()),
         Cmd::Image { out } => build_image(&out),
-        Cmd::Run { machine, ram, gpu } => run_demo_qemu(&machine, &ram, &gpu),
+        Cmd::Run { machine, ram, log } => run_kernel_qemu(
+            &machine,
+            &ram,
+            log.then(|| Path::new("target/boot-serial.log")),
+            true,
+        ),
+        Cmd::RunPreview { machine, ram, gpu } => run_demo_qemu(&machine, &ram, &gpu),
         Cmd::Test => run_tests(),
         Cmd::BootRun { machine, ram, log } => run_kernel_qemu(
             &machine,
