@@ -15,3 +15,6 @@ autobins = false
 [[bin]]
 name = "init"
 path = "src/main.rs"
+
+[build-dependencies]
+png = "0.18"

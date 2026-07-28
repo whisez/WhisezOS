@@ -43,20 +43,23 @@ pub const ICON_TOP: u64 = 40;
 pub const ICON_LEFT: u64 = 24;
 
 /// The bar across the bottom, and the button at its left end.
-pub const TASKBAR_HEIGHT: u64 = 40;
-pub const START_WIDTH: u64 = 108;
+pub const TASKBAR_HEIGHT: u64 = 48;
+pub const START_WIDTH: u64 = 72;
 /// One taskbar button per open window.
 pub const TASK_BUTTON_WIDTH: u64 = 168;
 pub const TASK_BUTTON_GAP: u64 = 4;
 
 /// The start menu: where it sits relative to the button, and how big.
-pub const START_ITEM_HEIGHT: u64 = 34;
-pub const START_MENU_WIDTH: u64 = 240;
+pub const START_ITEM_HEIGHT: u64 = 40;
+pub const START_MENU_WIDTH: u64 = 300;
+pub const START_MENU_HEADER_HEIGHT: u64 = 58;
+pub const START_MENU_FOOTER_HEIGHT: u64 = 48;
+pub const START_MENU_PADDING: u64 = 6;
 
 /// The title bar and the three boxes at its right end.
-pub const TITLE_HEIGHT: u64 = 26;
-pub const BUTTON_WIDTH: u64 = 30;
-pub const BUTTON_HEIGHT: u64 = 20;
+pub const TITLE_HEIGHT: u64 = 30;
+pub const BUTTON_WIDTH: u64 = 34;
+pub const BUTTON_HEIGHT: u64 = 24;
 pub const BUTTON_INSET: u64 = 3;
 
 /// One context menu entry.
@@ -599,7 +602,10 @@ impl Desktop {
     /// Where the start menu sits when it is open.
     #[must_use]
     pub const fn start_menu_rect(height: u64) -> Rect {
-        let tall = START_ITEM_HEIGHT * START_ITEMS.len() as u64 + 8;
+        let tall = START_MENU_HEADER_HEIGHT
+            + START_ITEM_HEIGHT * START_ITEMS.len() as u64
+            + START_MENU_FOOTER_HEIGHT
+            + START_MENU_PADDING * 2;
         Rect {
             x: 0,
             y: height - TASKBAR_HEIGHT - tall,
@@ -615,10 +621,11 @@ impl Desktop {
             return None;
         }
         let menu = Self::start_menu_rect(height);
-        if !menu.holds(x, y) || y < menu.y + 4 {
+        let first = menu.y + START_MENU_PADDING + START_MENU_HEADER_HEIGHT;
+        if !menu.holds(x, y) || y < first {
             return None;
         }
-        let index = ((y - menu.y - 4) / START_ITEM_HEIGHT) as usize;
+        let index = ((y - first) / START_ITEM_HEIGHT) as usize;
         (index < START_ITEMS.len()).then_some(index)
     }
 
@@ -1196,7 +1203,11 @@ mod tests {
         desktop.start_open = true;
         let menu = Desktop::start_menu_rect(HEIGHT);
         for index in 0..START_ITEMS.len() {
-            let y = menu.y + 4 + index as u64 * START_ITEM_HEIGHT + START_ITEM_HEIGHT / 2;
+            let y = menu.y
+                + START_MENU_PADDING
+                + START_MENU_HEADER_HEIGHT
+                + index as u64 * START_ITEM_HEIGHT
+                + START_ITEM_HEIGHT / 2;
             assert_eq!(
                 desktop.start_item_under(menu.x + 10, y, HEIGHT),
                 Some(index),
@@ -1236,7 +1247,9 @@ mod tests {
         let mut desktop = Desktop::new();
         desktop.start_open = true;
         let menu = Desktop::start_menu_rect(HEIGHT);
-        let click = desktop.press(menu.x + 10, menu.y + 4 + 8, false, WIDTH, HEIGHT, 0);
+        let first_item_y =
+            menu.y + START_MENU_PADDING + START_MENU_HEADER_HEIGHT + START_ITEM_HEIGHT / 2;
+        let click = desktop.press(menu.x + 10, first_item_y, false, WIDTH, HEIGHT, 0);
         assert_eq!(click, Click::Start(0));
         assert!(!desktop.start_open);
     }

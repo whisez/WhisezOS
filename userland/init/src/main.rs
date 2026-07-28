@@ -952,39 +952,36 @@ struct Screen {
 
 mod colour {
     /// `0x00RRGGBB`, matching the framebuffer's format.
-    pub const DESKTOP_TOP: u32 = 0x000A_1B33;
-    pub const DESKTOP_BOTTOM: u32 = 0x0001_0308;
-    /// The wallpaper's scales, and the light that catches them.
-    // Quiet, deliberately. The first version of the wallpaper was loud enough
-    // to compete with the windows on top of it, which is the opposite of what
-    // a background is for — a pattern you notice is one you read instead of
-    // reading what is in front of it.
-    pub const SCALE_DARK: u32 = 0x000A_1A2C;
-    pub const SCALE_LIGHT: u32 = 0x000C_2036;
-    pub const ICON: u32 = 0x0018_3050;
-    pub const SELECTED: u32 = 0x0025_5A88;
-    pub const MENU: u32 = 0x00F2_F2F2;
-    pub const MENU_EDGE: u32 = 0x00C0_C0C0;
-    pub const MENU_TEXT: u32 = 0x0020_2020;
-    pub const ICON_EDGE: u32 = 0x0019_E6FF;
-    /// The taskbar and the start button.
-    pub const PANEL: u32 = 0x001F_1F1F;
-    pub const PANEL_EDGE: u32 = 0x003A_3A3A;
-    pub const START: u32 = 0x000A_6EBD;
-    pub const ACCENT: u32 = 0x0019_E6FF;
-    pub const TEXT: u32 = 0x00D8_E8F8;
-    pub const DIM: u32 = 0x0064_8098;
-    /// Window chrome. Light, like every desktop this is meant to resemble; the
-    /// contents stay dark because that is what the two consoles have always
-    /// been and a terminal on white is a different thing to read.
-    pub const WINDOW: u32 = 0x0012_1E36;
-    pub const WINDOW_EDGE: u32 = 0x005A_6A80;
-    pub const WINDOW_BAR: u32 = 0x00D6_DEE8;
-    pub const WINDOW_BAR_ON: u32 = 0x000A_6EBD;
-    pub const BAR_TEXT: u32 = 0x0020_2830;
+    pub const DESKTOP_TOP: u32 = 0x0007_1020;
+    pub const DESKTOP_BOTTOM: u32 = 0x0001_0208;
+    pub const SELECTED: u32 = 0x0030_5F91;
+    pub const MENU: u32 = 0x0015_1D2A;
+    pub const MENU_EDGE: u32 = 0x0041_5268;
+    pub const MENU_TEXT: u32 = 0x00F2_F7FF;
+    pub const MENU_DIM: u32 = 0x008B_A0B8;
+    pub const ICON_EDGE: u32 = 0x0019_DDFF;
+    pub const ICON_FOLDER: u32 = 0x00F2_B84B;
+    pub const ICON_FOLDER_LIGHT: u32 = 0x00FF_D978;
+    pub const ICON_ASSISTANT: u32 = 0x008B_5CFF;
+    pub const ICON_TERMINAL: u32 = 0x0015_2232;
+    pub const ICON_TASKS: u32 = 0x002A_CE9B;
+    /// Dark Windows-like shell chrome with WhisezOS cyan/blue accents.
+    pub const PANEL: u32 = 0x0010_1622;
+    pub const PANEL_EDGE: u32 = 0x0031_4054;
+    pub const PANEL_BUTTON: u32 = 0x001C_2736;
+    pub const START: u32 = 0x0000_78D4;
+    pub const START_DARK: u32 = 0x0015_2232;
+    pub const ACCENT: u32 = 0x0019_DDFF;
+    pub const TEXT: u32 = 0x00EA_F3FF;
+    pub const DIM: u32 = 0x008B_A0B8;
+    pub const WINDOW: u32 = 0x0012_1A28;
+    pub const WINDOW_EDGE: u32 = 0x0053_6780;
+    pub const WINDOW_BAR: u32 = 0x0024_3040;
+    pub const WINDOW_BAR_ON: u32 = 0x0000_78D4;
+    pub const BAR_TEXT: u32 = 0x00D7_E4F2;
     pub const BAR_TEXT_ON: u32 = 0x00FF_FFFF;
     pub const CLOSE_HOT: u32 = 0x00C4_2B1C;
-    pub const SHADOW: u32 = 0x0000_0206;
+    pub const SHADOW: u32 = 0x0000_0105;
 }
 
 /// Height of the bar across the top.
@@ -1101,16 +1098,25 @@ impl Screen {
 
         // SAFETY: as `put`.
         unsafe {
-            self.fill(x + 4, y + 4, w, h, colour::SHADOW);
+            self.fill(x + 7, y + 8, w, h, colour::SHADOW);
             self.fill(x, y, w, h, colour::WINDOW);
             // A border, so a window on top of another has an edge rather than
             // bleeding into it.
-            self.fill(x, y, w, 1, colour::WINDOW_EDGE);
-            self.fill(x, y + h - 1, w, 1, colour::WINDOW_EDGE);
-            self.fill(x, y, 1, h, colour::WINDOW_EDGE);
-            self.fill(x + w - 1, y, 1, h, colour::WINDOW_EDGE);
+            self.fill(x, y, w, 2, colour::WINDOW_EDGE);
+            self.fill(x, y + h - 2, w, 2, colour::WINDOW_EDGE);
+            self.fill(x, y, 2, h, colour::WINDOW_EDGE);
+            self.fill(x + w - 2, y, 2, h, colour::WINDOW_EDGE);
             self.fill(x + 1, y + 1, w - 2, desktop::TITLE_HEIGHT - 1, bar);
-            self.text(x + 10, y + 7, title, ink);
+            if focused {
+                self.fill(
+                    x + 2,
+                    y + desktop::TITLE_HEIGHT - 2,
+                    w - 4,
+                    2,
+                    colour::ACCENT,
+                );
+            }
+            self.text(x + 12, y + 8, title, ink);
 
             for button in [
                 desktop::TitleButton::Minimise,
@@ -1624,87 +1630,42 @@ impl Pointer {
         true
     }
 }
-/// A wallpaper, drawn rather than loaded.
+const WALLPAPER_WIDTH: usize = 1280;
+const WALLPAPER_HEIGHT: usize = 752;
+const WALLPAPER_RGB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whisezos-dragon.rgb"));
+const _: () = assert!(WALLPAPER_RGB.len() == WALLPAPER_WIDTH * WALLPAPER_HEIGHT * 3);
+
+/// The real WhisezOS dragon wallpaper, decoded and cropped by `build.rs`.
 ///
-/// The repository has a dragon in `assets/wallpapers`, and it is a PNG — which
-/// needs a decoder and a filesystem to read it from, and there is neither. So
-/// the pattern is generated: overlapping scales in two shades, laid out on a
-/// staggered grid the way they sit on an animal, fading as they go down so the
-/// screen has a light source.
-///
-/// It is a placeholder for the real thing and not a pretence at it. When there
-/// is a filesystem this is the code that gets deleted.
+/// Init remains dependency-free and freestanding: the host build turns the PNG
+/// into RGB bytes, and this loop only scales those bytes into the framebuffer.
+/// The image is deliberately drawn above the taskbar so its lower edge is not
+/// hidden under shell chrome.
 ///
 /// # Safety
 /// As `draw_desktop`.
 unsafe fn draw_wallpaper(screen: &Screen) {
-    const SCALE_W: u64 = 96;
-    const SCALE_H: u64 = 56;
+    let desktop_height = screen.height.saturating_sub(desktop::TASKBAR_HEIGHT);
+    if screen.width == 0 || desktop_height == 0 {
+        return;
+    }
 
-    let mut row = 0u64;
-    let mut y = 0;
-    while y < screen.height {
-        // Every other row is offset by half a scale, which is what stops the
-        // pattern reading as a grid.
-        let offset = if row.is_multiple_of(2) {
-            0
-        } else {
-            SCALE_W / 2
-        };
-        let mut x = 0u64;
-        while x < screen.width + SCALE_W {
-            // Darker further down, so the light appears to come from above.
-            let depth = y * 100 / screen.height.max(1);
-            let base = if (x / SCALE_W + row).is_multiple_of(3) {
-                colour::SCALE_LIGHT
-            } else {
-                colour::SCALE_DARK
-            };
-            let shaded = fade(base, 100 - depth / 2);
-
-            // A scale: a rounded top and a flat body, drawn taller than the
-            // row spacing so each one overlaps the row above and only its top
-            // shows. Six rows of it read as a horizontal line rather than a
-            // scale, which is what the first version drew.
-            //
-            // The inset is quadratic, which at this size is indistinguishable
-            // from an arc and is two multiplications rather than a square root.
-            const ARC: u64 = 16;
-            for line in 0..SCALE_H + ARC {
-                let inset = if line < ARC {
-                    let from_top = ARC - line;
-                    (from_top * from_top * SCALE_W / 2) / (ARC * ARC)
-                } else {
-                    0
-                };
-                if inset * 2 >= SCALE_W {
-                    continue;
-                }
-                // SAFETY: the caller guarantees the window; `fill` clips.
-                unsafe {
-                    screen.fill(x + offset + inset, y + line, SCALE_W - inset * 2, 1, shaded);
-                }
-            }
-            x += SCALE_W;
+    for y in 0..desktop_height {
+        let source_y = y as usize * WALLPAPER_HEIGHT / desktop_height as usize;
+        for x in 0..screen.width {
+            let source_x = x as usize * WALLPAPER_WIDTH / screen.width as usize;
+            let at = (source_y * WALLPAPER_WIDTH + source_x) * 3;
+            let pixel = ((WALLPAPER_RGB[at] as u32) << 16)
+                | ((WALLPAPER_RGB[at + 1] as u32) << 8)
+                | WALLPAPER_RGB[at + 2] as u32;
+            // SAFETY: `put` clips and the generated byte count is fixed by the
+            // two wallpaper dimensions above.
+            unsafe { screen.put(x, y, pixel) };
         }
-        y += SCALE_H;
-        row += 1;
     }
 }
 
-/// Scales every channel of a colour by `percent`.
-fn fade(colour: u32, percent: u64) -> u32 {
-    let channel = |shift: u32| ((colour >> shift) & 0xFF) as u64 * percent / 100;
-    ((channel(16) as u32) << 16) | ((channel(8) as u32) << 8) | channel(0) as u32
-}
-
-/// Desktop icons.
-///
-/// They do nothing. Nothing can be clicked, because there is no process behind
-/// any of them and no protocol for one to register itself — that is what a
-/// window server is, and there is not one. They are here because a desktop with
-/// no icons is not a desktop, and because the layout is the part that has to be
-/// right before anything can be behind them.
+/// Windows-style desktop shortcuts for the four working session applications.
 ///
 /// # Safety
 /// As `draw_desktop`.
@@ -1716,24 +1677,70 @@ unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
     for (index, label) in desktop::ICON_LABELS.iter().enumerate() {
         let (x, y) = desktop::Desktop::icon_at(index);
         let selected = face.selected == Some(index);
-        let body = if selected {
-            colour::SELECTED
-        } else {
-            colour::ICON
-        };
-
         // SAFETY: the caller guarantees the window; every draw clips.
         unsafe {
-            screen.fill(x, y, desktop::ICON_SIZE, desktop::ICON_SIZE, body);
-            // A lit top-left edge, which is the cheapest thing that stops a
-            // square looking painted on.
-            screen.fill(x, y, desktop::ICON_SIZE, 2, colour::ICON_EDGE);
-            screen.fill(x, y, 2, desktop::ICON_SIZE, colour::ICON_EDGE);
+            if selected {
+                screen.fill(
+                    x.saturating_sub(8),
+                    y.saturating_sub(6),
+                    desktop::ICON_SIZE + 16,
+                    desktop::ICON_SIZE + 30,
+                    colour::SELECTED,
+                );
+            }
+
+            match index {
+                // Files: a familiar yellow folder with a raised tab.
+                0 => {
+                    screen.fill(x + 7, y + 14, 43, 34, colour::ICON_FOLDER);
+                    screen.fill(x + 10, y + 9, 20, 9, colour::ICON_FOLDER_LIGHT);
+                    screen.fill(x + 7, y + 14, 43, 3, colour::ICON_FOLDER_LIGHT);
+                    screen.fill(x + 7, y + 46, 43, 2, colour::SHADOW);
+                }
+                // Assistant: a neon four-point spark.
+                1 => {
+                    let cx = x + desktop::ICON_SIZE / 2;
+                    let cy = y + desktop::ICON_SIZE / 2;
+                    for step in 0..18u64 {
+                        let half = (step.min(17 - step) + 2) / 2;
+                        screen.fill(
+                            cx - half,
+                            y + 10 + step,
+                            half * 2 + 1,
+                            1,
+                            colour::ICON_ASSISTANT,
+                        );
+                        screen.fill(x + 10 + step, cy - half, 1, half * 2 + 1, colour::ICON_EDGE);
+                    }
+                    screen.fill(cx - 3, cy - 3, 7, 7, colour::BAR_TEXT_ON);
+                }
+                // Shell: a dark terminal tile with a prompt.
+                2 => {
+                    screen.fill(x + 5, y + 8, 47, 40, colour::ICON_EDGE);
+                    screen.fill(x + 7, y + 10, 43, 36, colour::ICON_TERMINAL);
+                    screen.text(x + 12, y + 19, b">_", colour::BAR_TEXT_ON);
+                }
+                // Tasks: a small performance graph.
+                _ => {
+                    screen.fill(x + 6, y + 8, 46, 42, colour::ICON_TERMINAL);
+                    screen.fill(x + 11, y + 31, 7, 13, colour::ICON_TASKS);
+                    screen.fill(x + 24, y + 20, 7, 24, colour::ACCENT);
+                    screen.fill(x + 37, y + 13, 7, 31, colour::ICON_ASSISTANT);
+                    screen.fill(x + 9, y + 46, 38, 2, colour::DIM);
+                }
+            }
+
+            // A dark shadow keeps labels readable over the neon wallpaper.
+            screen.text(x + 1, y + desktop::ICON_SIZE + 7, label, colour::SHADOW);
             screen.text(
                 x,
                 y + desktop::ICON_SIZE + 6,
                 label,
-                if selected { colour::TEXT } else { colour::DIM },
+                if selected {
+                    colour::BAR_TEXT_ON
+                } else {
+                    colour::TEXT
+                },
             );
         }
     }
@@ -2729,7 +2736,22 @@ unsafe fn draw_tasks(screen: &Screen, rect: desktop::Rect) {
     }
 }
 
-/// The bar across the bottom: what is open, and the clock.
+/// Four panes: familiar Windows shell grammar, drawn in WhisezOS cyan.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_shell_logo(screen: &Screen, x: u64, y: u64, size: u64, ink: u32) {
+    let pane = size.saturating_sub(3) / 2;
+    // SAFETY: the caller guarantees the framebuffer and `fill` clips.
+    unsafe {
+        screen.fill(x, y, pane, pane, ink);
+        screen.fill(x + pane + 3, y, pane, pane, ink);
+        screen.fill(x, y + pane + 3, pane, pane, ink);
+        screen.fill(x + pane + 3, y + pane + 3, pane, pane, ink);
+    }
+}
+
+/// The Windows-style bar across the bottom: launcher, applications, and tray.
 ///
 /// Part of the static layer, because it changes only when a window opens or
 /// closes — and both of those already repaint it.
@@ -2743,10 +2765,20 @@ unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop, tick: u64) {
     // SAFETY: the caller guarantees the window; every draw clips.
     unsafe {
         screen.fill(0, top, screen.width, desktop::TASKBAR_HEIGHT, colour::PANEL);
-        screen.fill(0, top, screen.width, 1, colour::PANEL_EDGE);
+        screen.fill(0, top, screen.width, 2, colour::PANEL_EDGE);
 
-        screen.fill(start.x, start.y, start.w, start.h, colour::START);
-        screen.text(start.x + 16, top + 13, b"START", colour::BAR_TEXT_ON);
+        screen.fill(
+            start.x,
+            start.y,
+            start.w,
+            start.h,
+            if face.start_open {
+                colour::START
+            } else {
+                colour::START_DARK
+            },
+        );
+        draw_shell_logo(screen, start.x + 24, top + 14, 20, colour::BAR_TEXT_ON);
 
         // One button per open window, in a fixed order. A minimised window gets
         // a flatter button: it is the only thing on screen that says the window
@@ -2758,26 +2790,41 @@ unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop, tick: u64) {
             }
             let showing = face.is_visible(window);
             let body = if showing {
-                colour::PANEL_EDGE
+                colour::PANEL_BUTTON
             } else {
                 colour::PANEL
             };
             screen.fill(at.x, at.y, at.w, at.h, body);
+            screen.fill(at.x, at.y, at.w, 1, colour::PANEL_EDGE);
             if face.front() == Some(window) {
-                screen.fill(at.x, at.y + at.h - 2, at.w, 2, colour::START);
+                screen.fill(at.x, at.y + at.h - 3, at.w, 3, colour::ACCENT);
             }
             let ink = if showing { colour::TEXT } else { colour::DIM };
-            screen.text(at.x + 10, at.y + 6, window.short(), ink);
+            screen.text(at.x + 12, at.y + 10, window.short(), ink);
         }
 
-        // The clock, at the far end. The only number here that changes on its
-        // own, which is why it is worth the corner it takes.
+        // A compact system tray and clock at the far edge.
         let seconds = tick / 64;
         let mut stamp = *b"00:00:00";
         desktop::write_number(&mut stamp[0..2], (seconds / 3600) % 100);
         desktop::write_number(&mut stamp[3..5], (seconds / 60) % 60);
         desktop::write_number(&mut stamp[6..8], seconds % 60);
-        screen.text(screen.width - 120, top + 13, &stamp, colour::TEXT);
+        let tray = screen.width.saturating_sub(238);
+        screen.fill(
+            tray,
+            top + 5,
+            1,
+            desktop::TASKBAR_HEIGHT - 10,
+            colour::PANEL_EDGE,
+        );
+        screen.fill(tray + 16, top + 20, 6, 6, colour::ICON_TASKS);
+        screen.text(tray + 32, top + 17, b"WHISEZ", colour::DIM);
+        screen.text(
+            screen.width.saturating_sub(116),
+            top + 17,
+            &stamp,
+            colour::TEXT,
+        );
     }
 }
 
@@ -2793,17 +2840,58 @@ unsafe fn draw_start_menu(screen: &Screen, face: &desktop::Desktop) {
 
     // SAFETY: the caller guarantees the window; every draw clips.
     unsafe {
-        screen.fill(menu.x + 4, menu.y + 4, menu.w, menu.h, colour::SHADOW);
+        screen.fill(menu.x + 8, menu.y + 8, menu.w, menu.h, colour::SHADOW);
         screen.fill(menu.x, menu.y, menu.w, menu.h, colour::MENU);
-        screen.fill(menu.x, menu.y, menu.w, 1, colour::MENU_EDGE);
-        screen.fill(menu.x + menu.w - 1, menu.y, 1, menu.h, colour::MENU_EDGE);
-        // A stripe down the left, the way a start menu has one.
-        screen.fill(menu.x, menu.y, 6, menu.h, colour::START);
+        screen.fill(menu.x, menu.y, menu.w, 2, colour::MENU_EDGE);
+        screen.fill(menu.x + menu.w - 2, menu.y, 2, menu.h, colour::MENU_EDGE);
+        screen.fill(menu.x, menu.y, 3, menu.h, colour::START);
+
+        let header = menu.y + desktop::START_MENU_PADDING;
+        screen.fill(
+            menu.x + 3,
+            header,
+            menu.w - 5,
+            desktop::START_MENU_HEADER_HEIGHT,
+            colour::START_DARK,
+        );
+        draw_shell_logo(screen, menu.x + 20, header + 17, 20, colour::ACCENT);
+        screen.text(menu.x + 56, header + 12, b"WHISEZOS", colour::BAR_TEXT_ON);
+        screen.text(menu.x + 56, header + 34, b"LOCAL DESKTOP", colour::MENU_DIM);
 
         for (index, item) in desktop::START_ITEMS.iter().enumerate() {
-            let row = menu.y + 4 + index as u64 * desktop::START_ITEM_HEIGHT;
-            screen.text(menu.x + 20, row + 10, item, colour::MENU_TEXT);
+            let row = header
+                + desktop::START_MENU_HEADER_HEIGHT
+                + index as u64 * desktop::START_ITEM_HEIGHT;
+            if index.is_multiple_of(2) {
+                screen.fill(
+                    menu.x + 3,
+                    row,
+                    menu.w - 5,
+                    desktop::START_ITEM_HEIGHT,
+                    0x001A_2432,
+                );
+            }
+            let mark = if index + 1 == desktop::START_ITEMS.len() {
+                colour::CLOSE_HOT
+            } else {
+                colour::START
+            };
+            screen.fill(menu.x + 20, row + 14, 10, 10, mark);
+            screen.text(menu.x + 48, row + 12, item, colour::MENU_TEXT);
         }
+
+        let footer = header
+            + desktop::START_MENU_HEADER_HEIGHT
+            + desktop::START_ITEM_HEIGHT * desktop::START_ITEMS.len() as u64;
+        screen.fill(
+            menu.x + 3,
+            footer,
+            menu.w - 5,
+            desktop::START_MENU_FOOTER_HEIGHT,
+            colour::START_DARK,
+        );
+        screen.fill(menu.x + 20, footer + 20, 7, 7, colour::ICON_TASKS);
+        screen.text(menu.x + 42, footer + 16, b"SYSTEM READY", colour::MENU_DIM);
     }
 }
 
@@ -2821,14 +2909,15 @@ unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
     unsafe {
         screen.fill(x + 3, y + 3, desktop::MENU_WIDTH, height, colour::SHADOW);
         screen.fill(x, y, desktop::MENU_WIDTH, height, colour::MENU);
-        screen.fill(x, y, desktop::MENU_WIDTH, 1, colour::MENU_EDGE);
-        screen.fill(x, y + height - 1, desktop::MENU_WIDTH, 1, colour::MENU_EDGE);
-        screen.fill(x, y, 1, height, colour::MENU_EDGE);
-        screen.fill(x + desktop::MENU_WIDTH - 1, y, 1, height, colour::MENU_EDGE);
+        screen.fill(x, y, desktop::MENU_WIDTH, 2, colour::MENU_EDGE);
+        screen.fill(x, y + height - 2, desktop::MENU_WIDTH, 2, colour::MENU_EDGE);
+        screen.fill(x, y, 2, height, colour::MENU_EDGE);
+        screen.fill(x + desktop::MENU_WIDTH - 2, y, 2, height, colour::MENU_EDGE);
 
         for (index, item) in desktop::MENU_ITEMS.iter().enumerate() {
             let row = y + index as u64 * desktop::MENU_ITEM_HEIGHT;
-            screen.text(x + 12, row + 7, item, colour::MENU_TEXT);
+            screen.fill(x + 12, row + 9, 7, 7, colour::START);
+            screen.text(x + 30, row + 7, item, colour::MENU_TEXT);
         }
     }
 }
