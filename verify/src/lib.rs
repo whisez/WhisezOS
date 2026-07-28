@@ -88,6 +88,9 @@ pub mod blake3;
 #[path = "../../fs/spectrefs/src/layout.rs"]
 pub mod layout;
 
+#[path = "../../fs/spectrefs/src/dir.rs"]
+pub mod dir;
+
 #[path = "../../boot/spectre-boot/src/glitch.rs"]
 pub mod glitch;
 

@@ -33,6 +33,11 @@ pub const ROWS: usize = 15;
 /// Longest command that can be typed.
 pub const INPUT_LIMIT: usize = COLUMNS - 2;
 
+/// Longest name `mkdir` will carry. The directory table has its own limit and
+/// this must not be under it, or the shell would refuse names the disk accepts —
+/// a restriction with no reason behind it and nothing to point at.
+pub const NAME_LIMIT: usize = 64;
+
 /// What the session should do after a command ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -48,6 +53,18 @@ pub enum Action {
     /// no syscalls, and the one that stops the machine is the last one it
     /// should be given.
     Shutdown,
+    /// Make a folder with this name.
+    ///
+    /// The name is carried rather than a borrow because the buffer it was typed
+    /// into is about to be reused. The length comes with it: the array is fixed
+    /// and the name is not, and a name padded with spaces is a different name.
+    ///
+    /// Nothing here checks whether the name is allowed. The directory table
+    /// decides that, so the shell and the desktop menu cannot come to different
+    /// conclusions about what a folder may be called.
+    MakeFolder([u8; NAME_LIMIT], usize),
+    /// List what is in the root.
+    List,
     /// Print how long the session has been up.
     ///
     /// The console has no clock, and giving it one would mean giving it a
@@ -176,6 +193,8 @@ impl Console {
                 self.print(b"clear             empty the screen");
                 self.print(b"devices           what the kernel found");
                 self.print(b"uptime            since the session started");
+                self.print(b"ls                what is on the disk");
+                self.print(b"mkdir <name>      make a folder");
                 self.print(b"read <sector>     read one 512-byte sector");
                 self.print(b"echo <text>       print it back");
                 self.print(b"shutdown          turn the machine off");
@@ -205,6 +224,21 @@ impl Console {
                     Action::None
                 }
             },
+            b"ls" | b"dir" => Action::List,
+            b"mkdir" | b"md" => {
+                let name = trim(rest);
+                if name.is_empty() {
+                    self.print(b"mkdir: expected a name");
+                    Action::None
+                } else if name.len() > NAME_LIMIT {
+                    self.print(b"mkdir: that name is too long");
+                    Action::None
+                } else {
+                    let mut buffer = [0u8; NAME_LIMIT];
+                    buffer[..name.len()].copy_from_slice(name);
+                    Action::MakeFolder(buffer, name.len())
+                }
+            }
             b"uptime" => Action::Uptime,
             b"shutdown" | b"poweroff" | b"halt" => {
                 // Three names because this is the command somebody reaches for
@@ -466,6 +500,80 @@ mod tests {
         let mut console = Console::new();
         assert_eq!(type_line(&mut console, ""), Action::None);
         assert_eq!(type_line(&mut console, "     "), Action::None);
+    }
+
+    #[test]
+    fn mkdir_carries_the_name_and_its_length() {
+        // The length matters as much as the bytes: the buffer is fixed and the
+        // name is not, and a name padded out with zeros is a different name.
+        let mut console = Console::new();
+        let Action::MakeFolder(name, length) = type_line(&mut console, "mkdir NOTES") else {
+            panic!("mkdir did not ask for a folder");
+        };
+        assert_eq!(length, 5);
+        assert_eq!(&name[..length], b"NOTES");
+    }
+
+    #[test]
+    fn mkdir_does_not_take_the_spaces_around_the_name() {
+        let mut console = Console::new();
+        let Action::MakeFolder(name, length) = type_line(&mut console, "mkdir   NOTES   ") else {
+            panic!("mkdir did not ask for a folder");
+        };
+        assert_eq!(&name[..length], b"NOTES");
+    }
+
+    #[test]
+    fn mkdir_without_a_name_asks_for_one() {
+        let mut console = Console::new();
+        assert_eq!(type_line(&mut console, "mkdir"), Action::None);
+        assert_eq!(type_line(&mut console, "mkdir    "), Action::None);
+    }
+
+    #[test]
+    fn mkdir_does_not_decide_what_a_name_may_be() {
+        // A name with a separator in it is refused, but by the directory table
+        // and not here. If the shell rejected it first the two would have their
+        // own rules, and the one somebody hits would depend on how they asked.
+        let mut console = Console::new();
+        let Action::MakeFolder(name, length) = type_line(&mut console, "mkdir A/B") else {
+            panic!("the shell decided a name question that is not its own");
+        };
+        assert_eq!(&name[..length], b"A/B");
+    }
+
+    #[test]
+    fn ls_and_dir_are_the_same_command() {
+        let mut console = Console::new();
+        assert_eq!(type_line(&mut console, "ls"), Action::List);
+        assert_eq!(type_line(&mut console, "dir"), Action::List);
+    }
+
+    #[test]
+    fn help_names_every_command_that_exists() {
+        // The list drifted before: `read` was in the shell and not in `help`,
+        // which is a command nobody finds.
+        let mut console = Console::new();
+        type_line(&mut console, "help");
+        for command in [
+            &b"help"[..],
+            b"clear",
+            b"devices",
+            b"uptime",
+            b"ls",
+            b"mkdir",
+            b"read",
+            b"echo",
+            b"shutdown",
+        ] {
+            let mut found = false;
+            console.each_line(|_, row| {
+                if row.starts_with(command) {
+                    found = true;
+                }
+            });
+            assert!(found, "help does not mention a command that works");
+        }
     }
 
     #[test]

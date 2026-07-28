@@ -527,6 +527,10 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // and the session is what is left. It is deterministic because the session
     // is started after the last of them has been reaped — an exited process is
     // not live, so a slow reap would not change the count either.
+    // The filesystem, which the session mounts before it says anything about
+    // processes. A blank disk is formatted and a formatted one is read back,
+    // and both land here.
+    "[init 9] directory mounted, entries",
     "[init 9] live processes: 1",
     "[init 9] session is drawing the desktop",
 ];
@@ -717,9 +721,42 @@ fn blank_disk_sector() -> Result<()> {
         return Ok(());
     }
     let mut file = std::fs::OpenOptions::new().write(true).open(DISK_IMAGE)?;
+    // Sector zero only. The directory table starts at sector one, and blanking
+    // it here would reformat the disk before every boot test — which would hide
+    // exactly the bug this file is meant to catch, a filesystem that does not
+    // survive a restart.
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&[0u8; SECTOR_BYTES])?;
     file.sync_all()?;
+    Ok(())
+}
+
+/// Where the directory table lives, and what marks it. Duplicated from
+/// `fs/spectrefs/src/dir.rs` on purpose: a check that imports the constant it
+/// is checking passes whatever the guest decides to write. These have to be
+/// changed in two places, which is the point — the second place is a test that
+/// fails until somebody agrees the move was intended.
+const DIRECTORY_SECTOR: u64 = 1;
+const DIRECTORY_MAGIC: &[u8] = b"WHISEZD1";
+
+/// Checks that a filesystem landed on the disk, from outside the guest.
+///
+/// The serial line says the session mounted a directory. This says the bytes
+/// are on the host's copy of the disk — which is the difference between a
+/// process that believes it wrote a filesystem and one that did.
+fn verify_directory_written() -> Result<()> {
+    let contents = std::fs::read(DISK_IMAGE).context("reading back the virtio disk")?;
+    let at = (DIRECTORY_SECTOR as usize) * SECTOR_BYTES;
+    if contents.len() < at + DIRECTORY_MAGIC.len() {
+        bail!("the disk image is too short to hold a directory");
+    }
+    let found = &contents[at..at + DIRECTORY_MAGIC.len()];
+    if found != DIRECTORY_MAGIC {
+        bail!(
+            "sector {DIRECTORY_SECTOR} begins {found:?}, not the directory magic — \
+             the session reported mounting something it did not write"
+        );
+    }
     Ok(())
 }
 
@@ -761,7 +798,8 @@ fn check_log(captured: &str) -> Result<()> {
 
     check_preemption(captured)?;
     check_frame_balance(captured)?;
-    verify_disk_pattern()
+    verify_disk_pattern()?;
+    verify_directory_written()
 }
 
 /// Checks that `lines` appear, in the order given.

@@ -25,6 +25,12 @@ mod abi;
 
 /// The glyph table, compiled from the same file the kernel and the UEFI preview
 /// compile. A second copy would be a second thing to keep in step for no gain.
+#[path = "../../../fs/spectrefs/src/blake3.rs"]
+mod blake3;
+
+#[path = "../../../fs/spectrefs/src/dir.rs"]
+mod dir;
+
 #[path = "../../../kernel/spectre-kernel/src/font.rs"]
 mod font;
 
@@ -412,12 +418,21 @@ const USED_OFFSET: u64 = 8192;
 /// Descriptors this driver uses per request: header, data, status.
 const DESCRIPTORS_PER_REQUEST: u16 = 3;
 
-/// Bytes of DMA for one request: a 16-byte header, a sector, a status byte.
-const REQUEST_BYTES: u64 = 4096;
+/// Bytes of DMA for one request: a 16-byte header, the data, a status byte.
+///
+/// Sized for the largest transfer rather than for a sector, because the
+/// directory table is read and written whole — a table split across requests
+/// can be half-written, and half a directory is worse than none.
+const REQUEST_BYTES: u64 = 8192;
 /// Offsets within that buffer.
 const HEADER_OFFSET: u64 = 0;
 const DATA_OFFSET: u64 = 512;
-const STATUS_OFFSET: u64 = 2048;
+const STATUS_OFFSET: u64 = 6144;
+
+// The data area has to hold a whole table without reaching the status byte,
+// which the device writes. Overlapping them would corrupt the last entries with
+// a status code and look like a torn write.
+const _: () = assert!(DATA_OFFSET as usize + dir::Table::BYTES <= STATUS_OFFSET as usize);
 
 /// How long to spin waiting for the device before giving up.
 ///
@@ -1195,6 +1210,7 @@ fn session(grant: u64) -> ! {
     let mut buttons = desktop::Buttons::default();
     let mut pending_click: Option<(u64, u64, bool)> = None;
     let mut last_tasks = u64::MAX;
+    let mut coined = 0u32;
 
     shell.print(b"WhisezOS session. Type help.");
 
@@ -1202,6 +1218,7 @@ fn session(grant: u64) -> ! {
     // here is not fatal: a session without a disk is a session with one fewer
     // command, and exiting is the one thing it must not do.
     let mut disk = attach_disk(&mut shell, grant);
+    let mut files = mount(&mut shell, disk.as_mut());
     boot_sound(&mut shell, grant);
     let mut pointer = Pointer {
         x: (screen.width / 2) as i64,
@@ -1287,6 +1304,21 @@ fn session(grant: u64) -> ! {
                                         console::Action::ReadSector(sector) => {
                                             read_sector(&mut shell, disk.as_mut(), sector);
                                         }
+                                        console::Action::MakeFolder(name, length) => {
+                                            make_folder(
+                                                &mut shell,
+                                                disk.as_mut(),
+                                                &mut files,
+                                                &name[..length],
+                                            );
+                                            // The FILES window, if it is showing,
+                                            // is now a picture of the disk as it
+                                            // was before the folder existed.
+                                            painted = false;
+                                        }
+                                        console::Action::List => {
+                                            list_folders(&mut shell, files.as_ref());
+                                        }
                                         console::Action::Uptime => {
                                             report_uptime(&mut shell, tick);
                                         }
@@ -1326,7 +1358,18 @@ fn session(grant: u64) -> ! {
         // used the answer.
         if let Some((x, y, right)) = pending_click.take() {
             let click = face.press(x, y, right, screen.width, screen.height);
-            if act_on_click(click, &mut shell, &mut face, disk.as_mut(), grant, tick) {
+            if act_on_click(
+                click,
+                Session {
+                    shell: &mut shell,
+                    face: &mut face,
+                    disk: disk.as_mut(),
+                    files: &mut files,
+                    coined: &mut coined,
+                    grant,
+                    tick,
+                },
+            ) {
                 painted = false;
             }
         }
@@ -1336,7 +1379,7 @@ fn session(grant: u64) -> ! {
         unsafe {
             if !painted {
                 painted = true;
-                draw_desktop(&screen, &face);
+                draw_desktop(&screen, &face, files.as_ref());
             }
             draw_status(&screen, tick, keys, &pointer);
             // Once a second rather than every tick. The states do change that
@@ -1585,7 +1628,7 @@ unsafe fn draw_icons(screen: &Screen, face: &desktop::Desktop) {
 ///
 /// # Safety
 /// `screen` must describe a framebuffer window this process holds.
-unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop) {
+unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop, files: Option<&dir::Table>) {
     // SAFETY: the caller guarantees the window; every call clips to geometry.
     unsafe {
         screen.gradient(
@@ -1621,6 +1664,43 @@ unsafe fn draw_desktop(screen: &Screen, face: &desktop::Desktop) {
             screen.text(96, 250, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
         }
 
+        if face.is_open(desktop::Window::Files) {
+            let (fx, fy, _, fh) = desktop::bounds(desktop::Window::Files);
+            screen.window(desktop::Window::Files, b"FILES", false);
+            match files {
+                // A disk with a directory and nothing in it says so. An empty
+                // list and a missing filesystem look identical otherwise, and
+                // they call for different things from whoever is reading.
+                Some(table) if table.is_empty() => {
+                    screen.text(fx + 16, fy + 44, b"THE DISK IS EMPTY", colour::DIM);
+                    screen.text(
+                        fx + 16,
+                        fy + 68,
+                        b"RIGHT CLICK FOR A NEW FOLDER",
+                        colour::DIM,
+                    );
+                }
+                Some(table) => {
+                    for (row, entry) in table.children(dir::ROOT).enumerate() {
+                        let at = fy + 44 + row as u64 * 22;
+                        if at > fy + fh - 40 {
+                            screen.text(fx + 16, at, b"...", colour::DIM);
+                            break;
+                        }
+                        let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
+                            b"[DIR] "
+                        } else {
+                            b"      "
+                        };
+                        screen.text(fx + 16, at, mark, colour::ACCENT);
+                        screen.text(fx + 92, at, entry.label(), colour::TEXT);
+                    }
+                }
+                None => {
+                    screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
+                }
+            }
+        }
         if face.is_open(desktop::Window::Tasks) {
             screen.window(desktop::Window::Tasks, b"TASK MANAGER", false);
         }
@@ -1780,6 +1860,188 @@ fn attach_disk(shell: &mut console::Console, grant: u64) -> Option<Disk> {
     })
 }
 
+/// Reads the directory table off the disk, formatting a blank one.
+///
+/// # A blank disk and a broken disk are not the same thing
+///
+/// The first is what every machine looks like once, and the answer is to write
+/// an empty table. The second means something was there and no longer reads
+/// back, and the answer is to say so and touch nothing — formatting on a bad
+/// checksum would turn one unreadable directory into no directory at all, which
+/// is the difference between a problem and a loss.
+fn mount(shell: &mut console::Console, disk: Option<&mut Disk>) -> Option<dir::Table> {
+    let disk = disk?;
+    if disk.sectors < dir::TABLE_START + dir::TABLE_SECTORS {
+        shell.print(b"disk too small for a directory");
+        return None;
+    }
+
+    if !submit_bytes(
+        SESSION_ROLE,
+        &mut disk.queue,
+        &disk.region,
+        blk::IN,
+        dir::TABLE_START,
+        dir::Table::BYTES as u32,
+    ) {
+        shell.print(b"the disk would not read the directory");
+        return None;
+    }
+
+    // SAFETY: the device just filled this range, which is inside the request
+    // buffer this process owns, and the constant above proves the length fits.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (disk.region.virt + DATA_OFFSET) as *const u8,
+            dir::Table::BYTES,
+        )
+    };
+
+    match dir::Table::decode(bytes) {
+        Ok(table) => {
+            report_mount(shell, b"directory: ", table.len());
+            // To the serial line as well, because this is the one thing about
+            // the filesystem a headless boot test can see.
+            let mut count = *b"00";
+            count[0] = b'0' + ((table.len() / 10) % 10) as u8;
+            count[1] = b'0' + (table.len() % 10) as u8;
+            say(SESSION_ROLE, &[b"directory mounted, entries ", &count]);
+            Some(table)
+        }
+        Err(dir::Error::NotFormatted) => {
+            let table = dir::Table::new();
+            if store(shell, Some(disk), &table) {
+                shell.print(b"blank disk; wrote an empty directory");
+                say(SESSION_ROLE, &[b"directory mounted, entries 00"]);
+                Some(table)
+            } else {
+                None
+            }
+        }
+        Err(dir::Error::WrongVersion) => {
+            shell.print(b"the directory was written by a newer system");
+            None
+        }
+        Err(_) => {
+            // Deliberately not formatted. See above.
+            shell.print(b"the directory did not check out; leaving it alone");
+            None
+        }
+    }
+}
+
+/// Writes the table back. Every change goes through here.
+fn store(shell: &mut console::Console, disk: Option<&mut Disk>, table: &dir::Table) -> bool {
+    let Some(disk) = disk else {
+        shell.print(b"no disk to save the directory to");
+        return false;
+    };
+
+    // SAFETY: inside this process's own request buffer, and the length is the
+    // one the constant beside `STATUS_OFFSET` was checked against.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (disk.region.virt + DATA_OFFSET) as *mut u8,
+            dir::Table::BYTES,
+        )
+    };
+    if table.encode(bytes).is_err() {
+        shell.print(b"the directory would not encode");
+        return false;
+    }
+
+    if !submit_bytes(
+        SESSION_ROLE,
+        &mut disk.queue,
+        &disk.region,
+        blk::OUT,
+        dir::TABLE_START,
+        dir::Table::BYTES as u32,
+    ) {
+        shell.print(b"the disk would not save the directory");
+        return false;
+    }
+    true
+}
+
+/// Prints what is in the root, for the shell.
+///
+/// The same table the FILES window draws from. Two readers of one table rather
+/// than two lists that have to be kept in step.
+fn list_folders(shell: &mut console::Console, table: Option<&dir::Table>) {
+    let Some(table) = table else {
+        shell.print(b"ls: no directory on this disk");
+        return;
+    };
+    let mut any = false;
+    for entry in table.children(dir::ROOT) {
+        let mut line = [b' '; console::COLUMNS];
+        let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
+            b"[dir] "
+        } else {
+            b"      "
+        };
+        line[..mark.len()].copy_from_slice(mark);
+        let label = entry.label();
+        let take = label.len().min(console::COLUMNS - mark.len());
+        line[mark.len()..mark.len() + take].copy_from_slice(&label[..take]);
+        shell.print(&line[..mark.len() + take]);
+        any = true;
+    }
+    if !any {
+        shell.print(b"the disk is empty");
+    }
+}
+
+/// Prints a count with a label.
+fn report_mount(shell: &mut console::Console, prefix: &[u8], count: usize) {
+    let mut line = [b' '; console::COLUMNS];
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 20];
+    let rendered = console::decimal(count as u64, &mut digits);
+    let mut at = prefix.len();
+    line[at..at + rendered.len()].copy_from_slice(rendered);
+    at += rendered.len();
+    let tail = b" entries";
+    line[at..at + tail.len()].copy_from_slice(tail);
+    at += tail.len();
+    shell.print(&line[..at]);
+}
+
+/// Makes a folder in the root and saves the table.
+///
+/// The name is checked by the table rather than here, so the shell and the menu
+/// cannot disagree about what a name may be.
+fn make_folder(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    table: &mut Option<dir::Table>,
+    name: &[u8],
+) {
+    let Some(open) = table.as_mut() else {
+        shell.print(b"no directory on this disk");
+        return;
+    };
+    // Kept so the change can be undone. The screen must not show a folder the
+    // next boot will not have, and the disk is what the next boot reads.
+    let before = *open;
+    match open.create(dir::ROOT, name, dir::Kind::Directory) {
+        Ok(_) => {
+            let after = *open;
+            if store(shell, disk, &after) {
+                shell.print(b"folder created");
+            } else {
+                *open = before;
+                shell.print(b"the folder was not saved, so it was not made");
+            }
+        }
+        Err(dir::Error::Exists) => shell.print(b"there is already one of those"),
+        Err(dir::Error::BadName) => shell.print(b"that is not a name a folder can have"),
+        Err(dir::Error::Full) => shell.print(b"the directory is full"),
+        Err(_) => shell.print(b"the folder could not be made"),
+    }
+}
+
 /// Reads one sector and prints the first bytes of it.
 fn read_sector(shell: &mut console::Console, disk: Option<&mut Disk>, sector: u64) {
     let Some(disk) = disk else {
@@ -1863,14 +2125,33 @@ fn report_uptime(shell: &mut console::Console, tick: u64) {
 /// Every menu entry does something real. A menu whose items are greyed out or
 /// silently do nothing is worse than no menu: it tells somebody the system can
 /// do things it cannot.
-fn act_on_click(
-    click: desktop::Click,
-    shell: &mut console::Console,
-    face: &mut desktop::Desktop,
-    disk: Option<&mut Disk>,
+/// What a click needs to reach: the machine, and what is on the screen.
+///
+/// Gathered into one place because the handler had grown to eight parameters,
+/// which is the point at which the next one gets added without anybody asking
+/// what it is doing there. The grouping is not cosmetic: `Session` is the state
+/// a click can change, and everything not in it is something a click must not.
+struct Session<'a> {
+    shell: &'a mut console::Console,
+    face: &'a mut desktop::Desktop,
+    disk: Option<&'a mut Disk>,
+    files: &'a mut Option<dir::Table>,
+    /// How many folders the menu has named, so the next one gets a new name.
+    coined: &'a mut u32,
     grant: u64,
     tick: u64,
-) -> bool {
+}
+
+fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
+    let Session {
+        shell,
+        face,
+        disk,
+        files,
+        coined,
+        grant,
+        tick,
+    } = session;
     match click {
         desktop::Click::Select(index) => {
             let mut line = [b' '; console::COLUMNS];
@@ -1889,19 +2170,24 @@ fn act_on_click(
         desktop::Click::CloseMenu => true,
         desktop::Click::OpenMenu(_, _) => false,
         desktop::Click::Menu(item) => {
+            // The entries that only open a window take it from the same table
+            // the labels come from, so a reordering cannot make an entry do
+            // what the one above it says.
+            if let Some(window) = desktop::Desktop::menu_window(item) {
+                face.open(window);
+                return true;
+            }
             match item {
                 0 => {
-                    face.open(desktop::Window::Shell);
-                }
-                1 => {
-                    face.open(desktop::Window::Devices);
-                }
-                2 => {
-                    face.open(desktop::Window::Tasks);
-                }
-                3 => {
-                    face.open(desktop::Window::Shell);
-                    read_sector(shell, disk, 0);
+                    // The menu has no way to ask for a name — there is no text
+                    // field and nothing to build one out of yet — so it coins
+                    // one. `mkdir` in the shell is where a chosen name goes.
+                    *coined += 1;
+                    let mut name = *b"FOLDER 00";
+                    name[7] = b'0' + ((*coined / 10) % 10) as u8;
+                    name[8] = b'0' + (*coined % 10) as u8;
+                    face.open(desktop::Window::Files);
+                    make_folder(shell, disk, files, &name);
                 }
                 _ => {
                     shell.print(b"shutting down");
@@ -1994,6 +2280,7 @@ unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop) {
             (desktop::Window::Shell, b"SHELL   ".as_slice()),
             (desktop::Window::Devices, b"DEVICES ".as_slice()),
             (desktop::Window::Tasks, b"TASKS   ".as_slice()),
+            (desktop::Window::Files, b"FILES   ".as_slice()),
         ] {
             if !face.is_open(window) {
                 continue;
@@ -3133,6 +3420,22 @@ fn exercise_disk(pid: u64, queue: &mut Queue) {
 /// getting it backwards produces no complaint from anything — the device simply
 /// does the other operation.
 fn submit(pid: u64, queue: &mut Queue, region: &DmaRegion, kind: u32, sector: u64) -> bool {
+    submit_bytes(pid, queue, region, kind, sector, SECTOR_BYTES as u32)
+}
+
+/// As `submit`, for a transfer longer than one sector.
+///
+/// virtio-blk takes the length from the descriptor, so a multi-sector request
+/// is one request with a longer buffer rather than several requests — which is
+/// what makes the directory table an all-or-nothing write.
+fn submit_bytes(
+    pid: u64,
+    queue: &mut Queue,
+    region: &DmaRegion,
+    kind: u32,
+    sector: u64,
+    bytes: u32,
+) -> bool {
     use core::sync::atomic::{fence, Ordering};
 
     let header = region.virt + HEADER_OFFSET;
@@ -3169,7 +3472,7 @@ fn submit(pid: u64, queue: &mut Queue, region: &DmaRegion, kind: u32, sector: u6
             queue.desc,
             1,
             region.bus + DATA_OFFSET,
-            SECTOR_BYTES as u32,
+            bytes,
             data_flags,
             2,
         );

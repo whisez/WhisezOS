@@ -19,7 +19,7 @@
 pub const ICON_COUNT: usize = 4;
 
 /// What each icon is called and what opening it does.
-pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"DISK", b"SOUND", b"SHELL", b"TASKS"];
+pub const ICON_LABELS: [&[u8]; ICON_COUNT] = [b"FILES", b"SOUND", b"SHELL", b"TASKS"];
 
 /// Icon geometry. The session draws with these and so does the hit test, which
 /// is the only way the two can agree.
@@ -40,6 +40,7 @@ pub enum Window {
     Shell,
     Devices,
     Tasks,
+    Files,
 }
 
 /// How tall the bar across the bottom is.
@@ -62,6 +63,9 @@ pub const fn bounds(window: Window) -> (u64, u64, u64, u64) {
         // window that has to be moved before anything else can be opened, and
         // nothing here can be moved.
         Window::Tasks => (620, 90, 480, 300),
+        // Where DEVICES sits, one step down and across. They overlap, which is
+        // what windows do; what they must not do is share a close box.
+        Window::Files => (110, 130, 520, 300),
         Window::Shell => (80, 430, 1120, 330),
     }
 }
@@ -90,11 +94,12 @@ pub const fn on_close(window: Window, x: u64, y: u64) -> bool {
 /// exists to be clicked once and then never again. A menu whose items are
 /// greyed out, or say something instead of doing something, is worse than no
 /// menu: it tells somebody the system can do things it cannot.
-pub const MENU_ITEMS: [&[u8]; 5] = [
+pub const MENU_ITEMS: [&[u8]; 6] = [
+    b"New folder",
+    b"Open files",
     b"Open shell",
     b"Show devices",
     b"Task manager",
-    b"Read sector 0",
     b"Shut down",
 ];
 
@@ -191,6 +196,7 @@ pub struct Desktop {
     pub shell_open: bool,
     pub devices_open: bool,
     pub tasks_open: bool,
+    pub files_open: bool,
 }
 
 impl Desktop {
@@ -202,6 +208,7 @@ impl Desktop {
             shell_open: false,
             devices_open: false,
             tasks_open: false,
+            files_open: false,
         }
     }
 
@@ -212,6 +219,7 @@ impl Desktop {
             Window::Shell => self.shell_open,
             Window::Devices => self.devices_open,
             Window::Tasks => self.tasks_open,
+            Window::Files => self.files_open,
         }
     }
 
@@ -221,6 +229,7 @@ impl Desktop {
             Window::Shell => self.shell_open = true,
             Window::Devices => self.devices_open = true,
             Window::Tasks => self.tasks_open = true,
+            Window::Files => self.files_open = true,
         }
         Click::Open(window)
     }
@@ -231,15 +240,32 @@ impl Desktop {
             Window::Shell => self.shell_open = false,
             Window::Devices => self.devices_open = false,
             Window::Tasks => self.tasks_open = false,
+            Window::Files => self.files_open = false,
         }
         Click::Close(window)
+    }
+
+    /// Which window a menu entry opens, if it opens one.
+    ///
+    /// Beside the labels, so the test below can hold the two against each
+    /// other. An entry whose words promise a window and whose action opens
+    /// nothing is the failure this whole menu started with.
+    #[must_use]
+    pub const fn menu_window(index: usize) -> Option<Window> {
+        match index {
+            1 => Some(Window::Files),
+            2 => Some(Window::Shell),
+            3 => Some(Window::Devices),
+            4 => Some(Window::Tasks),
+            _ => None,
+        }
     }
 
     /// Which window an icon opens, if it opens one.
     #[must_use]
     pub const fn icon_window(index: usize) -> Option<Window> {
         match index {
-            0 => Some(Window::Devices),
+            0 => Some(Window::Files),
             2 => Some(Window::Shell),
             3 => Some(Window::Tasks),
             _ => None,
@@ -308,7 +334,7 @@ impl Desktop {
 
         // A window is above the desktop, so its close box is checked before
         // anything underneath. Shell first: it is drawn last and so is on top.
-        for window in [Window::Shell, Window::Tasks, Window::Devices] {
+        for window in [Window::Shell, Window::Tasks, Window::Files, Window::Devices] {
             if self.is_open(window) && on_close(window, x, y) {
                 return self.close(window);
             }
@@ -427,7 +453,7 @@ mod tests {
         // They overlap on screen by design; two close boxes at the same point
         // would mean the top one is unclosable, because the scan finds the
         // other first.
-        let all = [Window::Shell, Window::Devices, Window::Tasks];
+        let all = [Window::Shell, Window::Devices, Window::Tasks, Window::Files];
         for (index, window) in all.iter().enumerate() {
             for other in &all[index + 1..] {
                 let (cx, cy) = close_at(*window);
@@ -451,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_close_box_sits_inside_its_own_title_bar() {
-        for window in [Window::Shell, Window::Devices, Window::Tasks] {
+        for window in [Window::Shell, Window::Devices, Window::Tasks, Window::Files] {
             let (x, y, w, _) = bounds(window);
             let (cx, cy) = close_at(window);
             assert!(cx >= x && cx + CLOSE_SIZE <= x + w, "past the window edge");
@@ -488,7 +514,7 @@ mod tests {
 
     #[test]
     fn no_window_hides_the_taskbar() {
-        for window in [Window::Shell, Window::Devices, Window::Tasks] {
+        for window in [Window::Shell, Window::Devices, Window::Tasks, Window::Files] {
             let (_, y, _, h) = bounds(window);
             assert!(y + h <= 800 - TASKBAR_HEIGHT, "a window covers the taskbar");
         }
@@ -631,15 +657,47 @@ mod tests {
 
     #[test]
     fn an_entry_that_promises_to_open_something_opens_something() {
-        // This test used to forbid the word entirely, because "Open shell"
-        // answered "the shell is already open below" — the shell was always
-        // open and the entry was decoration. Windows start closed now, so the
-        // word is honest again, and the rule becomes the one it should have
-        // been: an entry may say "Open" as long as it does.
-        assert!(MENU_ITEMS[0].starts_with(b"Open"));
-        let mut desktop = Desktop::new();
-        assert!(!desktop.is_open(Window::Shell));
-        desktop.open(Window::Shell);
-        assert!(desktop.is_open(Window::Shell));
+        // This test used to forbid the word "Open" entirely, because "Open
+        // shell" answered "the shell is already open below" — the shell was
+        // always open and the entry was decoration. Windows start closed now,
+        // so the word is honest again, and the rule becomes the one it should
+        // have been: an entry may promise a window as long as it names one.
+        //
+        // One direction only. The reverse — that anything which opens a window
+        // must be worded "Open" — is a naming rule rather than a truthfulness
+        // one, and it fails on "Task manager", which is the clearest name for
+        // an entry that opens the task manager.
+        for (index, label) in MENU_ITEMS.iter().enumerate() {
+            if label.starts_with(b"Open") || label.starts_with(b"Show") {
+                assert!(
+                    Desktop::menu_window(index).is_some(),
+                    "entry {index} promises a window and names none"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_menu_entry_that_opens_a_window_actually_opens_it() {
+        for index in 0..MENU_ITEMS.len() {
+            let Some(window) = Desktop::menu_window(index) else {
+                continue;
+            };
+            let mut desktop = Desktop::new();
+            assert!(!desktop.is_open(window));
+            desktop.open(window);
+            assert!(desktop.is_open(window), "entry {index} opened nothing");
+        }
+    }
+
+    #[test]
+    fn no_two_menu_entries_open_the_same_window() {
+        for a in 0..MENU_ITEMS.len() {
+            for b in a + 1..MENU_ITEMS.len() {
+                if let (Some(x), Some(y)) = (Desktop::menu_window(a), Desktop::menu_window(b)) {
+                    assert_ne!(x, y, "two entries for one window");
+                }
+            }
+        }
     }
 }
