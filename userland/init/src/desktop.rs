@@ -113,6 +113,26 @@ pub const fn inside(window: Window, x: u64, y: u64) -> bool {
     x >= wx && x < wx + w && y >= wy && y < wy + h
 }
 
+/// Rows the FILES window shows, and where the first one starts.
+///
+/// The first row is the way out — `..` when somewhere other than the root. A
+/// folder that can be entered and not left is a trap, and the way out belongs
+/// in the list rather than in a gesture somebody has to already know.
+pub const FILE_ROW_HEIGHT: u64 = 22;
+pub const FILE_ROW_TOP: u64 = 40;
+
+/// Which row of the FILES window a point is on, if any.
+#[must_use]
+pub fn file_row_under(y: u64, rows: usize) -> Option<usize> {
+    let (_, wy, _, wh) = bounds(Window::Files);
+    let top = wy + FILE_ROW_TOP;
+    if y < top || y >= wy + wh - 12 {
+        return None;
+    }
+    let row = ((y - top) / FILE_ROW_HEIGHT) as usize;
+    (row < rows).then_some(row)
+}
+
 /// The order to draw open windows in, back to front.
 ///
 /// Everything else first and the front window last, so the one somebody just
@@ -215,6 +235,8 @@ pub enum Click {
     Open(Window),
     /// A window was closed.
     Close(Window),
+    /// This row of the FILES window was clicked.
+    File(usize),
 }
 
 /// Which buttons are down, and which were down last time.
@@ -406,7 +428,17 @@ impl Desktop {
     }
 
     /// Handles a press at a point. `width` and `height` are the screen's.
-    pub fn press(&mut self, x: u64, y: u64, right: bool, width: u64, height: u64) -> Click {
+    /// Handles a press at a point. `rows` is how many the FILES window shows,
+    /// which the session knows and this does not — the table lives on the disk.
+    pub fn press(
+        &mut self,
+        x: u64,
+        y: u64,
+        right: bool,
+        width: u64,
+        height: u64,
+        rows: usize,
+    ) -> Click {
         // The menu is checked first and always: while it is open it is on top
         // of everything, so a click anywhere else closes it rather than
         // reaching what is underneath. Anything else lets somebody select an
@@ -442,9 +474,22 @@ impl Desktop {
         // no way to move a window, overlap is permanent, and a window that can
         // be covered with no way to raise it is a window that is gone.
         for window in ALL_WINDOWS {
-            if self.is_open(window) && inside(window, x, y) {
+            if !self.is_open(window) || !inside(window, x, y) {
+                continue;
+            }
+            // A click that raises a window does not also act inside it. The
+            // window was covered, so whoever clicked could not see what they
+            // were clicking on — treating the raise as a choice picks a row on
+            // their behalf out of something they had not read yet.
+            if self.front != Some(window) {
                 return self.open(window);
             }
+            if window == Window::Files {
+                if let Some(row) = file_row_under(y, rows) {
+                    return Click::File(row);
+                }
+            }
+            return self.open(window);
         }
 
         match Self::icon_under(x, y, width) {
@@ -506,7 +551,7 @@ mod tests {
         assert!(!desktop.shell_open);
         let (x, y) = icon_centre(2);
         assert_eq!(
-            desktop.press(x, y, false, WIDTH, HEIGHT),
+            desktop.press(x, y, false, WIDTH, HEIGHT, 0),
             Click::Open(Window::Shell)
         );
         assert!(desktop.shell_open);
@@ -527,7 +572,7 @@ mod tests {
             let mut desktop = Desktop::new();
             let (x, y) = icon_centre(index);
             assert_eq!(
-                desktop.press(x, y, false, WIDTH, HEIGHT),
+                desktop.press(x, y, false, WIDTH, HEIGHT, 0),
                 Click::Open(window)
             );
             assert!(desktop.is_open(window));
@@ -557,6 +602,48 @@ mod tests {
     }
 
     #[test]
+    fn a_click_that_raises_a_window_does_not_also_choose_inside_it() {
+        // The window was covered, so whoever clicked could not read what they
+        // were clicking on. Acting on it picks a row on their behalf out of
+        // something they had not seen.
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Files);
+        desktop.open(Window::Shell);
+        let (fx, fy, _, _) = bounds(Window::Files);
+        let at = fy + FILE_ROW_TOP + 4;
+        assert_eq!(
+            desktop.press(fx + 40, at, false, WIDTH, HEIGHT, 4),
+            Click::Open(Window::Files)
+        );
+        // And now that it is in front, the same click chooses.
+        assert_eq!(
+            desktop.press(fx + 40, at, false, WIDTH, HEIGHT, 4),
+            Click::File(0)
+        );
+    }
+
+    #[test]
+    fn each_row_of_the_files_window_is_its_own() {
+        // Off-by-one here opens the name above or below the one that was
+        // clicked, which looks like the filesystem being wrong.
+        let (_, fy, _, _) = bounds(Window::Files);
+        for row in 0..5usize {
+            let top = fy + FILE_ROW_TOP + row as u64 * FILE_ROW_HEIGHT;
+            assert_eq!(file_row_under(top, 5), Some(row));
+            assert_eq!(file_row_under(top + FILE_ROW_HEIGHT - 1, 5), Some(row));
+        }
+    }
+
+    #[test]
+    fn a_click_below_the_last_row_is_not_a_row() {
+        // Empty space under a short listing must not choose the last name.
+        let (_, fy, _, _) = bounds(Window::Files);
+        let below = fy + FILE_ROW_TOP + 2 * FILE_ROW_HEIGHT;
+        assert_eq!(file_row_under(below, 2), None);
+        assert_eq!(file_row_under(fy, 5), None, "the title bar is not a row");
+    }
+
+    #[test]
     fn clicking_a_window_brings_it_forward() {
         // With no way to move a window, a window that can be covered and not
         // raised is a window that is gone.
@@ -567,7 +654,7 @@ mod tests {
 
         let (sx, sy, _, _) = bounds(Window::Shell);
         assert_eq!(
-            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT),
+            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT, 0),
             Click::Open(Window::Shell)
         );
         assert_eq!(desktop.front, Some(Window::Shell));
@@ -580,7 +667,7 @@ mod tests {
         let mut desktop = Desktop::new();
         let (sx, sy, _, _) = bounds(Window::Shell);
         assert_ne!(
-            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT),
+            desktop.press(sx + 40, sy + 60, false, WIDTH, HEIGHT, 0),
             Click::Open(Window::Shell)
         );
     }
@@ -711,7 +798,7 @@ mod tests {
         desktop.open(Window::Shell);
         let (cx, cy) = close_at(Window::Shell);
         assert_eq!(
-            desktop.press(cx + 2, cy + 2, false, 1280, 800),
+            desktop.press(cx + 2, cy + 2, false, 1280, 800, 0),
             Click::Close(Window::Shell)
         );
         assert!(!desktop.is_open(Window::Shell));
@@ -724,7 +811,7 @@ mod tests {
         let mut desktop = Desktop::new();
         let (cx, cy) = close_at(Window::Devices);
         assert_ne!(
-            desktop.press(cx + 2, cy + 2, false, 1280, 800),
+            desktop.press(cx + 2, cy + 2, false, 1280, 800, 0),
             Click::Close(Window::Devices)
         );
     }
@@ -760,8 +847,8 @@ mod tests {
     fn clicking_the_background_clears_the_selection() {
         let mut desktop = Desktop::new();
         let (x, y) = icon_centre(0);
-        desktop.press(x, y, false, WIDTH, HEIGHT);
-        assert_eq!(desktop.press(10, 700, false, WIDTH, HEIGHT), Click::None);
+        desktop.press(x, y, false, WIDTH, HEIGHT, 0);
+        assert_eq!(desktop.press(10, 700, false, WIDTH, HEIGHT, 0), Click::None);
         assert_eq!(desktop.selected, None);
     }
 
@@ -784,7 +871,7 @@ mod tests {
     fn right_clicking_opens_a_menu_where_the_pointer_is() {
         let mut desktop = Desktop::new();
         assert_eq!(
-            desktop.press(400, 300, true, WIDTH, HEIGHT),
+            desktop.press(400, 300, true, WIDTH, HEIGHT, 0),
             Click::OpenMenu(400, 300)
         );
         assert_eq!(desktop.menu, Some((400, 300)));
@@ -796,7 +883,7 @@ mod tests {
         // reached, which is worse than one that is not quite where the pointer
         // was.
         let mut desktop = Desktop::new();
-        let click = desktop.press(WIDTH - 5, HEIGHT - 5, true, WIDTH, HEIGHT);
+        let click = desktop.press(WIDTH - 5, HEIGHT - 5, true, WIDTH, HEIGHT, 0);
         let Click::OpenMenu(x, y) = click else {
             panic!("expected a menu, got {click:?}");
         };
@@ -807,8 +894,15 @@ mod tests {
     #[test]
     fn choosing_a_menu_entry_reports_it_and_closes_the_menu() {
         let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT);
-        let click = desktop.press(400 + 10, 300 + MENU_ITEM_HEIGHT + 5, false, WIDTH, HEIGHT);
+        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
+        let click = desktop.press(
+            400 + 10,
+            300 + MENU_ITEM_HEIGHT + 5,
+            false,
+            WIDTH,
+            HEIGHT,
+            0,
+        );
         assert_eq!(click, Click::Menu(1));
         assert_eq!(desktop.menu, None);
     }
@@ -819,9 +913,12 @@ mod tests {
         // dismisses it rather than reaching what is underneath — otherwise an
         // icon can be selected through an open menu.
         let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT);
+        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
         let (x, y) = icon_centre(0);
-        assert_eq!(desktop.press(x, y, false, WIDTH, HEIGHT), Click::CloseMenu);
+        assert_eq!(
+            desktop.press(x, y, false, WIDTH, HEIGHT, 0),
+            Click::CloseMenu
+        );
         assert_eq!(
             desktop.selected, None,
             "an icon was selected through a menu"
@@ -832,9 +929,9 @@ mod tests {
     #[test]
     fn a_second_right_click_while_the_menu_is_open_closes_it() {
         let mut desktop = Desktop::new();
-        desktop.press(400, 300, true, WIDTH, HEIGHT);
+        desktop.press(400, 300, true, WIDTH, HEIGHT, 0);
         assert_eq!(
-            desktop.press(700, 500, true, WIDTH, HEIGHT),
+            desktop.press(700, 500, true, WIDTH, HEIGHT, 0),
             Click::CloseMenu
         );
     }
@@ -843,7 +940,7 @@ mod tests {
     fn every_menu_entry_is_reachable() {
         // An entry whose row cannot be hit is an entry that does not exist.
         let mut desktop = Desktop::new();
-        desktop.press(300, 200, true, WIDTH, HEIGHT);
+        desktop.press(300, 200, true, WIDTH, HEIGHT, 0);
         for index in 0..MENU_ITEMS.len() {
             let y = 200 + index as u64 * MENU_ITEM_HEIGHT + MENU_ITEM_HEIGHT / 2;
             assert_eq!(desktop.menu_under(300 + 5, y), Some(index), "entry {index}");
@@ -856,7 +953,7 @@ mod tests {
     #[test]
     fn a_point_left_of_the_menu_is_not_in_it() {
         let mut desktop = Desktop::new();
-        desktop.press(300, 200, true, WIDTH, HEIGHT);
+        desktop.press(300, 200, true, WIDTH, HEIGHT, 0);
         assert_eq!(desktop.menu_under(299, 210), None);
         assert_eq!(desktop.menu_under(300 + MENU_WIDTH, 210), None);
         assert_eq!(desktop.menu_under(305, 199), None);

@@ -1335,6 +1335,7 @@ fn session(grant: u64) -> ! {
                                             disk.as_mut(),
                                             &mut files,
                                             &name[..length],
+                                            face.cwd,
                                         );
                                         // The FILES window, if it is showing,
                                         // is now a picture of the disk as it
@@ -1342,7 +1343,7 @@ fn session(grant: u64) -> ! {
                                         painted = false;
                                     }
                                     console::Action::List => {
-                                        list_folders(&mut shell, files.as_ref());
+                                        list_folders(&mut shell, files.as_ref(), face.cwd);
                                     }
                                     console::Action::Uptime => {
                                         report_uptime(&mut shell, tick);
@@ -1380,7 +1381,11 @@ fn session(grant: u64) -> ! {
         // the button reached the driver, the edge was detected, and nothing
         // used the answer.
         if let Some((x, y, right)) = pending_click.take() {
-            let click = face.press(x, y, right, screen.width, screen.height);
+            // The row count comes from here because the table is on the disk
+            // and the hit test is not allowed to reach it.
+            let rows = files.as_ref().map_or(0, |table| file_rows(table, face.cwd));
+            let click = face.press(x, y, right, screen.width, screen.height, rows);
+
             if act_on_click(
                 click,
                 Session {
@@ -1734,40 +1739,50 @@ unsafe fn draw_window(
                 screen.text(dx + 16, dy + 160, b"ALL DRIVEN FROM RING 3", colour::ACCENT);
             }
             desktop::Window::Files => {
-                let (fx, fy, _, fh) = desktop::bounds(window);
+                let (fx, fy, _, _) = desktop::bounds(window);
                 screen.window(window, b"FILES", focused);
-                match files {
-                    // A disk with a directory and nothing in it says so. An empty
-                    // list and a missing filesystem look identical otherwise, and
-                    // they call for different things from whoever is reading.
-                    Some(table) if table.is_empty() => {
-                        screen.text(fx + 16, fy + 44, b"THE DISK IS EMPTY", colour::DIM);
-                        screen.text(
-                            fx + 16,
-                            fy + 68,
-                            b"RIGHT CLICK FOR A NEW FOLDER",
-                            colour::DIM,
-                        );
-                    }
-                    Some(table) => {
-                        for (row, entry) in table.children(dir::ROOT).enumerate() {
-                            let at = fy + 44 + row as u64 * 22;
-                            if at > fy + fh - 40 {
-                                screen.text(fx + 16, at, b"...", colour::DIM);
-                                break;
-                            }
-                            let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
-                                b"[DIR] "
+                let Some(table) = files else {
+                    // A missing filesystem and an empty one look identical
+                    // otherwise, and they call for different things from
+                    // whoever is reading.
+                    screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
+                    return;
+                };
+
+                // The listing and the hit test walk the same rows in the same
+                // order, through the same two functions. Two walks would be two
+                // ideas of which row is which, and clicking one name would open
+                // the one above or below it.
+                let rows = file_rows(table, face.cwd);
+                // Whether the folder is empty is about what is in it, not about
+                // how many rows there are: the way out is a row and it is not a
+                // thing the folder holds. Counting rows left a folder holding
+                // nothing looking like a folder holding one thing.
+                if table.children(face.cwd).next().is_none() {
+                    screen.text(fx + 16, fy + 44, b"THIS FOLDER IS EMPTY", colour::DIM);
+                    screen.text(
+                        fx + 16,
+                        fy + 68,
+                        b"RIGHT CLICK FOR A NEW FOLDER",
+                        colour::DIM,
+                    );
+                }
+                for row in 0..rows {
+                    let at = fy + desktop::FILE_ROW_TOP + row as u64 * desktop::FILE_ROW_HEIGHT;
+                    let (mark, label) = match file_row(table, face.cwd, row) {
+                        Some(Row::Up) => (&b"[UP] "[..], &b".."[..]),
+                        Some(Row::Entry(entry)) => (
+                            if entry.kind == dir::Kind::Directory.code() {
+                                &b"[DIR]"[..]
                             } else {
-                                b"      "
-                            };
-                            screen.text(fx + 16, at, mark, colour::ACCENT);
-                            screen.text(fx + 92, at, entry.label(), colour::TEXT);
-                        }
-                    }
-                    None => {
-                        screen.text(fx + 16, fy + 44, b"NO DIRECTORY ON THIS DISK", colour::DIM);
-                    }
+                                &b"     "[..]
+                            },
+                            entry.label(),
+                        ),
+                        None => break,
+                    };
+                    screen.text(fx + 16, at, mark, colour::ACCENT);
+                    screen.text(fx + 92, at, label, colour::TEXT);
                 }
             }
             desktop::Window::Tasks => screen.window(window, b"TASK MANAGER", focused),
@@ -2084,7 +2099,7 @@ fn answer(
             }
         }
         assistant::Answer::Uptime => report_uptime(helper, tick),
-        assistant::Answer::Files => list_folders(helper, files.as_ref()),
+        assistant::Answer::Files => list_folders(helper, files.as_ref(), dir::ROOT),
         assistant::Answer::Processes => {
             let mut list = abi::TaskList::EMPTY;
             let size = core::mem::size_of::<abi::TaskList>() as u64;
@@ -2317,6 +2332,35 @@ fn recall(helper: &mut console::Console, disk: Option<&mut Disk>, files: &mut Op
     }
 }
 
+/// A row of the FILES window.
+#[derive(Debug, Clone, Copy)]
+enum Row<'a> {
+    /// The way out of the folder. Always first when there is one.
+    Up,
+    Entry(&'a dir::Entry),
+}
+
+/// How many rows the FILES window shows for a folder.
+fn file_rows(table: &dir::Table, cwd: u16) -> usize {
+    let up = usize::from(cwd != dir::ROOT);
+    up + table.children(cwd).count()
+}
+
+/// What is on a row.
+///
+/// One function for both the drawing and the hit test, because a row that is
+/// drawn from one walk and clicked from another is a row that opens the name
+/// above or below the one it shows.
+fn file_row(table: &dir::Table, cwd: u16, row: usize) -> Option<Row<'_>> {
+    if cwd != dir::ROOT {
+        if row == 0 {
+            return Some(Row::Up);
+        }
+        return table.children(cwd).nth(row - 1).map(Row::Entry);
+    }
+    table.children(cwd).nth(row).map(Row::Entry)
+}
+
 /// Finds an entry by name in the root, whatever its kind.
 fn find_in_root(table: &dir::Table, name: &[u8]) -> Option<u16> {
     table
@@ -2329,13 +2373,13 @@ fn find_in_root(table: &dir::Table, name: &[u8]) -> Option<u16> {
 ///
 /// The same table the FILES window draws from. Two readers of one table rather
 /// than two lists that have to be kept in step.
-fn list_folders(shell: &mut console::Console, table: Option<&dir::Table>) {
+fn list_folders(shell: &mut console::Console, table: Option<&dir::Table>, cwd: u16) {
     let Some(table) = table else {
         shell.print(b"ls: no directory on this disk");
         return;
     };
     let mut any = false;
-    for entry in table.children(dir::ROOT) {
+    for entry in table.children(cwd) {
         let mut line = [b' '; console::COLUMNS];
         let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
             b"[dir] "
@@ -2378,6 +2422,7 @@ fn make_folder(
     disk: Option<&mut Disk>,
     table: &mut Option<dir::Table>,
     name: &[u8],
+    parent: u16,
 ) {
     let Some(open) = table.as_mut() else {
         shell.print(b"no directory on this disk");
@@ -2386,7 +2431,7 @@ fn make_folder(
     // Kept so the change can be undone. The screen must not show a folder the
     // next boot will not have, and the disk is what the next boot reads.
     let before = *open;
-    match open.create(dir::ROOT, name, dir::Kind::Directory) {
+    match open.create(parent, name, dir::Kind::Directory) {
         Ok(_) => {
             let after = *open;
             if store(shell, disk, &after) {
@@ -2399,6 +2444,7 @@ fn make_folder(
         Err(dir::Error::Exists) => shell.print(b"there is already one of those"),
         Err(dir::Error::BadName) => shell.print(b"that is not a name a folder can have"),
         Err(dir::Error::Full) => shell.print(b"the directory is full"),
+        Err(dir::Error::NoParent) => shell.print(b"that folder is not there any more"),
         Err(_) => shell.print(b"the folder could not be made"),
     }
 }
@@ -2548,7 +2594,7 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
                     name[7] = b'0' + ((*coined / 10) % 10) as u8;
                     name[8] = b'0' + (*coined % 10) as u8;
                     face.open(desktop::Window::Files);
-                    make_folder(shell, disk, files, &name);
+                    make_folder(shell, disk, files, &name, face.cwd);
                 }
                 _ => {
                     shell.print(b"shutting down");
@@ -2561,6 +2607,44 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
             let _ = tick;
             face.selected = None;
             true
+        }
+        desktop::Click::File(row) => {
+            let Some(table) = files.as_ref() else {
+                return false;
+            };
+            match file_row(table, face.cwd, row) {
+                Some(Row::Up) => {
+                    // To the parent of the folder being shown. The root's
+                    // parent is itself, which is why the row is not drawn there.
+                    face.cwd = table
+                        .entry(face.cwd)
+                        .map_or(dir::ROOT, |entry| entry.parent);
+                    true
+                }
+                Some(Row::Entry(entry)) if entry.kind == dir::Kind::Directory.code() => {
+                    face.cwd = entry.id;
+                    true
+                }
+                Some(Row::Entry(entry)) => {
+                    // A file. There is nothing to open it with, so its size is
+                    // what there is to say — and saying that is better than a
+                    // click that does nothing and leaves somebody wondering
+                    // whether the click worked.
+                    let mut line = [b' '; console::COLUMNS];
+                    let label = entry.label();
+                    let take = label.len().min(console::COLUMNS - 20);
+                    line[..take].copy_from_slice(&label[..take]);
+                    let tail = b" bytes: ";
+                    line[take..take + tail.len()].copy_from_slice(tail);
+                    let mut digits = [0u8; 20];
+                    let rendered = console::decimal(entry.length, &mut digits);
+                    let at = take + tail.len();
+                    line[at..at + rendered.len()].copy_from_slice(rendered);
+                    shell.print(&line[..at + rendered.len()]);
+                    false
+                }
+                None => false,
+            }
         }
         // Opening or closing a window changes what the static layer holds.
         desktop::Click::Open(_) | desktop::Click::Close(_) => true,
