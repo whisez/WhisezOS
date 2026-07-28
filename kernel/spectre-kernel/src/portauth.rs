@@ -56,7 +56,12 @@ pub const PORT_SPACE: usize = 1024;
 pub const BITMAP_BYTES: usize = PORT_SPACE / 8;
 
 /// Port ranges one process may hold at once.
-pub const MAX_PORT_GRANTS: usize = 2;
+///
+/// Four, because the session drives two devices and one of them needs two
+/// ranges. The i8042's registers are 0x60 and 0x64, and the range between them
+/// contains the PIT gate, which `FORBIDDEN` refuses — so the controller is two
+/// one-port grants. With the RTC's pair that is three.
+pub const MAX_PORT_GRANTS: usize = 4;
 
 /// A contiguous run of ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

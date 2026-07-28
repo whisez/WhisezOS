@@ -107,6 +107,32 @@ pub const SYS_IRQ_WAIT: u64 = 9;
 /// including for what the kernel will not hand over at any price.
 pub const SYS_GRANT_PORTS: u64 = 10;
 
+/// Wait for any interrupt this process is entitled to. `(grant) -> packed`.
+///
+/// The result is `(line << 32) | count`. A driver with several devices cannot
+/// use `SYS_IRQ_WAIT`: it names one line, so blocking on the keyboard means
+/// missing the mouse, and polling instead loses bytes — the i8042 holds one at
+/// a time and a dropped byte desynchronises a movement packet.
+///
+/// The line number is not a device index. It is the kernel's own numbering,
+/// and a process learns which line belongs to which of its devices by waiting
+/// on them individually once, or by not caring — a driver that services
+/// whatever answered needs no map at all.
+pub const SYS_IRQ_WAIT_ANY: u64 = 11;
+
+/// Take a granted device's interrupt line without waiting on it.
+/// `(grant, index) -> line`.
+///
+/// `SYS_IRQ_WAIT` used to be the only way to claim a line, on the argument that
+/// a process able to wait for a device's interrupt is exactly a process that
+/// owns it, so a separate claim would be a second name for the same authority.
+/// That was true of a driver with one device and false of one with several: the
+/// lines all have to be live before anything blocks, and claiming by waiting
+/// means blocking on the first device until it interrupts. A keyboard does not
+/// interrupt until somebody presses a key, so the session stopped there —
+/// having claimed the clock, holding the mouse unclaimed, and waiting forever.
+pub const SYS_IRQ_CLAIM: u64 = 12;
+
 /// What a device is, so a driver can tell what it was handed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -121,6 +147,10 @@ pub enum DeviceKind {
     Block = 3,
     /// A virtio sound device: playback and capture, same transport as the disk.
     Sound = 4,
+    /// The keyboard half of the i8042.
+    Keyboard = 5,
+    /// The mouse half of the same chip, on its own interrupt.
+    Mouse = 6,
 }
 
 /// What `SYS_DEVICE_INFO` writes.
@@ -449,6 +479,7 @@ mod tests {
         assert_eq!((SYS_CALL, SYS_RECEIVE, SYS_REPLY), (3, 4, 5));
         assert_eq!((SYS_DEVICE_INFO, SYS_MAP_DEVICE), (6, 7));
         assert_eq!((SYS_ALLOC_DMA, SYS_IRQ_WAIT, SYS_GRANT_PORTS), (8, 9, 10));
+        assert_eq!((SYS_IRQ_WAIT_ANY, SYS_IRQ_CLAIM), (11, 12));
     }
 
     #[test]

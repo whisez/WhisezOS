@@ -329,8 +329,8 @@ pub unsafe fn run(boot_info: *const BootInfo) -> ! {
     // was never armed waits forever rather than being told.
     // SAFETY: the IDT gave every device vector a gate, the LAPIC is up, and
     // interrupts are still disabled.
-    match unsafe { arch::start_device_interrupt(device::TICKER_LINE) } {
-        Ok(_) => {}
+    match unsafe { arch::start_device_interrupts() } {
+        Ok(()) => {}
         Err(error) => {
             // Not fatal, and for the same reason the timer is not: the system
             // runs, with one capability missing, and says so.

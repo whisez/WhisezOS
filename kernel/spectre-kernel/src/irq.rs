@@ -97,7 +97,8 @@ static LINES: Mutex<Table> = Mutex::new([Line::EMPTY; MAX_LINES]);
 /// What the caller of `wait` should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
-    /// Interrupts were already waiting. This many; return it.
+    /// Interrupts were already waiting. The value is `encode_line`: which line
+    /// answered in the high half, how many times in the low half.
     Ready(u64),
     /// Nothing yet. Block the process; `on_interrupt` will wake it.
     Block,
@@ -173,10 +174,67 @@ fn wait_in(lines: &mut Table, line: usize, pid: u64) -> Result<Wait, SyscallErro
     let count = lines[line].pending;
     if count > 0 {
         lines[line].pending = 0;
-        return Ok(Wait::Ready(count));
+        // Encoded like `wait_any`, so both calls and the wake path all speak
+        // one format. They did not, briefly: the handler encoded and this
+        // returned a bare count, and the two agreed only for line zero — which
+        // encodes to itself, so every existing test passed and the bug would
+        // have surfaced on the first driver that used a second line.
+        return Ok(Wait::Ready(encode_line(line, count)));
     }
     lines[line].waiting = true;
     Ok(Wait::Block)
+}
+
+/// Collects from whichever of a process''s lines has something.
+///
+/// A driver with several devices cannot use `wait`: it names one line, and
+/// blocking on the keyboard means missing the mouse. Polling instead loses
+/// bytes — the i8042 holds one at a time, and a dropped byte desynchronises a
+/// three-byte movement packet, which shows up as a cursor that jumps.
+///
+/// So this blocks on all of them at once and reports which one answered. The
+/// line comes back in the high half of the result and the count in the low
+/// half, because the ABI has one register and a process that is told how many
+/// interrupts arrived but not from where cannot act on either.
+pub fn wait_any(pid: u64) -> Result<Wait, SyscallError> {
+    wait_any_in(&mut LINES.lock(), pid)
+}
+
+fn wait_any_in(lines: &mut Table, pid: u64) -> Result<Wait, SyscallError> {
+    if pid == 0 {
+        return Err(SyscallError::NotPermitted);
+    }
+    let owned = lines.iter().filter(|line| line.owner == pid).count();
+    if owned == 0 {
+        return Err(SyscallError::NotPermitted);
+    }
+
+    // Lowest line first, and deliberately so: the order decides which device is
+    // serviced when two interrupt at once, and an order that depends on
+    // iteration details is one that changes when the table does.
+    for (index, line) in lines.iter_mut().enumerate() {
+        if line.owner == pid && line.pending > 0 {
+            let count = line.pending;
+            line.pending = 0;
+            return Ok(Wait::Ready(encode_line(index, count)));
+        }
+    }
+
+    for line in lines.iter_mut() {
+        if line.owner == pid {
+            if line.waiting {
+                return Err(SyscallError::Busy);
+            }
+            line.waiting = true;
+        }
+    }
+    Ok(Wait::Block)
+}
+
+/// Packs which line answered and how many times into one register.
+#[must_use]
+pub const fn encode_line(line: usize, count: u64) -> u64 {
+    ((line as u64) << 32) | (count & 0xFFFF_FFFF)
 }
 
 /// Records an interrupt and says whether it woke anybody.
@@ -201,14 +259,25 @@ fn on_interrupt_in(lines: &mut Table, line: usize) -> Delivery {
     lines[line].total = lines[line].total.saturating_add(1);
 
     if lines[line].waiting {
-        lines[line].waiting = false;
         // The pending count is folded into what the waiter is told, so an
         // interrupt that arrived just before it blocked is not left behind.
         let count = lines[line].pending.saturating_add(1);
+        let pid = lines[line].owner;
         lines[line].pending = 0;
+
+        // Clear the flag on every line this process was waiting on, not just
+        // this one. A `wait_any` armed all of them, and a process woken once
+        // is no longer waiting on any — leaving the others armed would make its
+        // next `wait_any` report `Busy` against a wait that already returned.
+        for other in lines.iter_mut() {
+            if other.owner == pid {
+                other.waiting = false;
+            }
+        }
+
         return Delivery::Wake {
-            pid: lines[line].owner,
-            count,
+            pid,
+            count: encode_line(line, count),
         };
     }
 
@@ -480,6 +549,72 @@ mod tests {
         wait_in(&mut t, 0, OWNER).unwrap();
         on_interrupt_in(&mut t, 0);
         assert_eq!(t[0].total, 4);
+    }
+
+    #[test]
+    fn a_wake_says_which_line_answered_as_well_as_how_many() {
+        // Line zero encodes to itself, so a format mismatch is invisible until
+        // a driver uses a second line. This asserts on one that is not zero.
+        let mut t = fresh();
+        claim_in(&mut t, 2, OWNER).unwrap();
+        on_interrupt_in(&mut t, 2);
+        assert_eq!(
+            wait_in(&mut t, 2, OWNER),
+            Ok(Wait::Ready(encode_line(2, 1)))
+        );
+        assert_eq!(encode_line(2, 1) >> 32, 2);
+        assert_eq!(encode_line(2, 1) & 0xFFFF_FFFF, 1);
+    }
+
+    #[test]
+    fn waiting_on_any_line_reports_whichever_answered() {
+        let mut t = fresh();
+        claim_in(&mut t, 0, OWNER).unwrap();
+        claim_in(&mut t, 2, OWNER).unwrap();
+        assert_eq!(wait_any_in(&mut t, OWNER), Ok(Wait::Block));
+
+        // The mouse, not the clock.
+        assert_eq!(
+            on_interrupt_in(&mut t, 2),
+            Delivery::Wake {
+                pid: OWNER,
+                count: encode_line(2, 1)
+            }
+        );
+    }
+
+    #[test]
+    fn one_wake_disarms_every_line_the_waiter_was_on() {
+        // `wait_any` arms all of them. A process woken by one is no longer
+        // waiting on any, and leaving the others armed makes its next
+        // `wait_any` report `Busy` against a wait that already returned — a
+        // driver that stops responding after its first event.
+        let mut t = fresh();
+        claim_in(&mut t, 0, OWNER).unwrap();
+        claim_in(&mut t, 1, OWNER).unwrap();
+        wait_any_in(&mut t, OWNER).unwrap();
+        on_interrupt_in(&mut t, 1);
+        assert_eq!(wait_any_in(&mut t, OWNER), Ok(Wait::Block));
+    }
+
+    #[test]
+    fn waiting_on_any_line_without_holding_one_is_refused() {
+        let mut t = fresh();
+        assert_eq!(wait_any_in(&mut t, OWNER), Err(SyscallError::NotPermitted));
+        assert_eq!(wait_any_in(&mut t, 0), Err(SyscallError::NotPermitted));
+    }
+
+    #[test]
+    fn a_pending_count_is_collected_before_anything_blocks() {
+        let mut t = fresh();
+        claim_in(&mut t, 0, OWNER).unwrap();
+        claim_in(&mut t, 3, OWNER).unwrap();
+        on_interrupt_in(&mut t, 3);
+        on_interrupt_in(&mut t, 3);
+        assert_eq!(
+            wait_any_in(&mut t, OWNER),
+            Ok(Wait::Ready(encode_line(3, 2)))
+        );
     }
 
     #[test]

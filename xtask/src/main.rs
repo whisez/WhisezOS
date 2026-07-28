@@ -478,7 +478,7 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // from a hang — the screen simply stopped on "nothing left to schedule".
     // The session starts after the frame accounting, because it holds frames.
     "[kernel] session started as pid",
-    "[init 9] session owns the display and the clock",
+    "[init 9] session owns the display, the clock, and input",
     "[init 9] session is drawing the desktop",
 ];
 
@@ -573,7 +573,7 @@ const REQUIRED_LINES: &[&str] = &[
     // the device itself. The kernel no longer reads register C for anybody, so
     // the second and third interrupts exist only because ring 3 acknowledged
     // the first — three wakes is the proof, one would not have been.
-    "[kernel] pid 1 granted 2 port(s) from 0x70",
+    "[kernel] pid 1 granted 2 port(s) for device 1",
     "[init 1] granted the rtc's ports, driving it from ring 3",
     "[init 1] woken by hardware 3 time(s)",
     // A real PCI device, found by walking the bus and driven from ring 3. The
@@ -581,8 +581,8 @@ const REQUIRED_LINES: &[&str] = &[
     // configuration structure, at an offset the kernel took out of PCI
     // capability space, and 0x8000 sectors of 512 bytes is exactly the 16 MiB
     // file this file attaches — a number neither side hardcodes twice.
-    "[kernel] virtio-block is device 2",
-    "[kernel] virtio-sound is device 3",
+    "[kernel] virtio-block is device 4",
+    "[kernel] virtio-sound is device 5",
     "[init 1] disk ready from ring 3: 0x0000000000008000 sectors",
     // A virtqueue, and a real block transfer through it. The write-then-read
     // is what makes the comparison mean anything: the disk image is a fresh

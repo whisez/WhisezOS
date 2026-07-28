@@ -30,8 +30,8 @@ mod font;
 
 use abi::{
     decode, DeviceInfo, DeviceKind, DmaRegion, SyscallError, MAX_LOG_BYTES, PING_COOKIE,
-    SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG,
-    SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT, SYS_GRANT_PORTS, SYS_IRQ_CLAIM,
+    SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 
 /// An address inside the kernel's identity map. User space must never be able
@@ -276,8 +276,8 @@ const SERVER_ROLE: u64 = 1;
 /// The device index of the ticker, which is the second entry the kernel lists.
 const TICKER_DEVICE: u64 = 1;
 
-/// The device index of the virtio disk, which the PCI scan appends third.
-const BLOCK_DEVICE: u64 = 2;
+/// The device index of the virtio disk, the first the PCI scan appends.
+const BLOCK_DEVICE: u64 = 4;
 
 /// Offsets in the virtio common configuration structure (virtio 1.0 §4.1.4.3).
 mod common {
@@ -514,7 +514,7 @@ fn probe_disk(pid: u64, grant: u64) {
     }
 
     if info.kind != DeviceKind::Block as u32 {
-        say(pid, &[b"device 2 is not a block device"]);
+        say(pid, &[b"the disk device is not a block device"]);
         exit(21);
     }
 
@@ -656,8 +656,258 @@ fn probe_disk(pid: u64, grant: u64) {
     exercise_disk(pid, &mut queue);
 }
 
-/// The device index of the sound card, which the PCI scan appends fourth.
-const SOUND_DEVICE: u64 = 3;
+/// The device index of the sound card, the second the PCI scan appends.
+const SOUND_DEVICE: u64 = 5;
+
+/// The kernel's line numbers. Not device indices — a device index is what a
+/// process names when asking for hardware, and a line is what the kernel calls
+/// the wire. `SYS_IRQ_WAIT_ANY` reports the second, so a driver that services
+/// several devices needs both.
+const TICKER_LINE: u64 = 0;
+const KEYBOARD_LINE: u64 = 1;
+const MOUSE_LINE: u64 = 2;
+
+/// The device indices of the two halves of the input controller.
+///
+/// The kernel lists what the firmware and the hardware give it, in that order:
+/// framebuffer, ticker, keyboard, mouse, then whatever the PCI scan appends.
+/// Inserting the input controller ahead of the scan moved the disk and the
+/// sound card two places, and these constants were not updated with them — the
+/// disk driver asked for device 2, got the keyboard, and the process that was
+/// also the IPC server exited, which took the rest of the boot with it.
+const KEYBOARD_DEVICE: u64 = 2;
+const MOUSE_DEVICE: u64 = 3;
+
+/// The i8042's registers, granted as two separate ports.
+const I8042_DATA: u16 = 0x60;
+const I8042_COMMAND: u16 = 0x64;
+
+/// Status register bits (read from `I8042_COMMAND`).
+mod i8042_status {
+    /// A byte is waiting in the data register.
+    pub const OUTPUT_FULL: u8 = 1 << 0;
+    /// The controller has not consumed the last byte written to it.
+    pub const INPUT_FULL: u8 = 1 << 1;
+    /// The waiting byte came from the auxiliary port — the mouse — rather than
+    /// the keyboard. Belt and braces: the interrupt already says which, and
+    /// this says it again from the other side.
+    pub const FROM_MOUSE: u8 = 1 << 5;
+}
+
+/// Controller commands (written to `I8042_COMMAND`).
+mod i8042_command {
+    pub const READ_CONFIG: u8 = 0x20;
+    pub const WRITE_CONFIG: u8 = 0x60;
+    /// Enable the auxiliary port, which is where the mouse is.
+    pub const ENABLE_AUX: u8 = 0xA8;
+    /// The next byte written to the data port goes to the mouse, not the
+    /// keyboard.
+    pub const TO_MOUSE: u8 = 0xD4;
+}
+
+/// Configuration byte bits.
+mod i8042_config {
+    pub const KEYBOARD_INTERRUPT: u8 = 1 << 0;
+    pub const MOUSE_INTERRUPT: u8 = 1 << 1;
+    /// Translate set 2 scancodes to set 1. Left as the firmware set it —
+    /// changing it would mean decoding whichever set results, and this driver
+    /// only needs to know that a key moved.
+    pub const TRANSLATE: u8 = 1 << 6;
+}
+
+/// Mouse commands, sent through `TO_MOUSE`.
+mod mouse_command {
+    /// Start sending movement packets.
+    pub const ENABLE_REPORTING: u8 = 0xF4;
+    /// Restore defaults. The device answers `ACK` to both.
+    pub const SET_DEFAULTS: u8 = 0xF6;
+    pub const ACK: u8 = 0xFA;
+}
+
+/// How long to spin waiting for the controller.
+///
+/// The i8042 is slow by modern standards and a status bit that never changes
+/// means the chip is not there — a bound turns that into a report rather than a
+/// hang, in a process that must not exit.
+const I8042_SPINS: u32 = 100_000;
+
+/// # Safety
+/// The process must hold a port grant covering `port`.
+unsafe fn port_out(port: u16, value: u8) {
+    // SAFETY: the caller guarantees the grant. Without it the CPU raises `#GP`
+    // on the instruction itself, which is the mechanism working.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value,
+                         options(nostack, preserves_flags));
+    }
+}
+
+/// # Safety
+/// As `port_out`.
+unsafe fn port_in(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: as `port_out`.
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") value,
+                         options(nostack, preserves_flags));
+    }
+    value
+}
+
+/// Waits until the controller has room for a byte.
+///
+/// # Safety
+/// As `port_out`.
+unsafe fn i8042_wait_writable() -> bool {
+    for _ in 0..I8042_SPINS {
+        // SAFETY: as `port_out`.
+        if unsafe { port_in(I8042_COMMAND) } & i8042_status::INPUT_FULL == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Waits until the controller has a byte, and takes it.
+///
+/// # Safety
+/// As `port_out`.
+unsafe fn i8042_read() -> Option<u8> {
+    for _ in 0..I8042_SPINS {
+        // SAFETY: as `port_out`.
+        unsafe {
+            if port_in(I8042_COMMAND) & i8042_status::OUTPUT_FULL != 0 {
+                return Some(port_in(I8042_DATA));
+            }
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Sends one command to the controller.
+///
+/// # Safety
+/// As `port_out`.
+unsafe fn i8042_command(command: u8) -> bool {
+    // SAFETY: as `port_out`.
+    unsafe {
+        if !i8042_wait_writable() {
+            return false;
+        }
+        port_out(I8042_COMMAND, command);
+    }
+    true
+}
+
+/// Sends one byte to the mouse and waits for its acknowledgement.
+///
+/// # Safety
+/// As `port_out`.
+unsafe fn mouse_send(byte: u8) -> bool {
+    // SAFETY: as `port_out`.
+    unsafe {
+        if !i8042_command(i8042_command::TO_MOUSE) || !i8042_wait_writable() {
+            return false;
+        }
+        port_out(I8042_DATA, byte);
+        i8042_read() == Some(mouse_command::ACK)
+    }
+}
+
+/// Brings the controller up so both devices report.
+///
+/// # Why the configuration byte is read before it is written
+///
+/// It holds the translation bit, which decides which scancode set arrives, and
+/// whatever the firmware chose is what the keyboard is currently speaking.
+/// Writing a whole byte would change that as a side effect of enabling two
+/// interrupts, and the driver would then decode the wrong set — which looks
+/// like a keyboard that produces plausible but wrong keys.
+///
+/// # Safety
+/// The process must hold grants for both controller ports.
+unsafe fn i8042_init(pid: u64) -> bool {
+    // SAFETY: the caller guarantees the grants.
+    unsafe {
+        // Drain anything the firmware left. A byte still waiting means the
+        // controller raises no further interrupt, and the first real keystroke
+        // would never arrive.
+        while port_in(I8042_COMMAND) & i8042_status::OUTPUT_FULL != 0 {
+            let _ = port_in(I8042_DATA);
+        }
+
+        if !i8042_command(i8042_command::ENABLE_AUX) {
+            say(pid, &[b"i8042 did not accept the aux enable"]);
+            return false;
+        }
+
+        if !i8042_command(i8042_command::READ_CONFIG) {
+            say(pid, &[b"i8042 did not accept the config read"]);
+            return false;
+        }
+        let Some(config) = i8042_read() else {
+            say(pid, &[b"i8042 never returned its config byte"]);
+            return false;
+        };
+
+        let wanted = config | i8042_config::KEYBOARD_INTERRUPT | i8042_config::MOUSE_INTERRUPT;
+        if !i8042_command(i8042_command::WRITE_CONFIG) || !i8042_wait_writable() {
+            say(pid, &[b"i8042 did not accept the config write"]);
+            return false;
+        }
+        port_out(I8042_DATA, wanted);
+
+        // The mouse defaults to not reporting. Both commands are acknowledged,
+        // and a missing acknowledgement means there is no mouse behind the
+        // auxiliary port — worth saying rather than discovering as a cursor
+        // that never moves.
+        if !mouse_send(mouse_command::SET_DEFAULTS) {
+            say(pid, &[b"no mouse answered on the aux port"]);
+            return false;
+        }
+        if !mouse_send(mouse_command::ENABLE_REPORTING) {
+            say(pid, &[b"mouse refused to start reporting"]);
+            return false;
+        }
+
+        let translated = config & i8042_config::TRANSLATE != 0;
+        say(
+            pid,
+            &[
+                b"input controller up, scancode translation ",
+                if translated { b"on" } else { b"off" },
+            ],
+        );
+    }
+    true
+}
+
+/// The pointer's bounding box, in pixels. The cross is drawn inside it.
+const POINTER_SIZE: usize = 13;
+
+/// Where the pointer is, what it is doing, and what is underneath it.
+struct Pointer {
+    x: i64,
+    y: i64,
+    /// Bytes of the current three-byte movement packet.
+    packet: [u8; 3],
+    have: usize,
+    left: bool,
+    /// The desktop the cursor is currently covering, and where it was taken
+    /// from.
+    ///
+    /// Saved before the cursor is drawn and put back before it moves. Without
+    /// it the cursor leaves a trail of every position it has ever been in,
+    /// which is what the first version did — a screen capture after a diagonal
+    /// move showed eight crosses.
+    ///
+    /// The alternative is redrawing the desktop each frame, which tears and
+    /// costs four megabytes to move a cursor. This costs 169 words.
+    saved: [u32; POINTER_SIZE * POINTER_SIZE],
+    saved_at: Option<(u64, u64)>,
+}
 
 /// A screen the session draws into, and the pixel arithmetic to do it.
 ///
@@ -702,6 +952,18 @@ impl Screen {
         }
         // SAFETY: bounds checked against the geometry the kernel reported.
         unsafe { ((self.base + (y * self.stride + x) * 4) as *mut u32).write_volatile(colour) }
+    }
+
+    /// Reads a pixel back, for saving what a cursor is about to cover.
+    ///
+    /// # Safety
+    /// As `put`.
+    unsafe fn get(&self, x: u64, y: u64) -> u32 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        // SAFETY: bounds checked against the geometry the kernel reported.
+        unsafe { ((self.base + (y * self.stride + x) * 4) as *const u32).read_volatile() }
     }
 
     /// # Safety
@@ -833,18 +1095,38 @@ fn session(grant: u64) -> ! {
         }
     };
 
-    // The ports, then the line. Same order as the demonstration used, and for
-    // the same reason: a driver that waits before it can service the device
-    // gets one interrupt and then waits forever.
-    if let Err(error) = call(SYS_GRANT_PORTS, grant, TICKER_DEVICE) {
-        say(
-            pid,
-            &[b"session port grant failed: ", error.name().as_bytes()],
-        );
-        idle_forever(pid);
+    // Ports before lines, for every device. A driver that waits before it can
+    // service the hardware gets one interrupt and then waits forever.
+    for device in [TICKER_DEVICE, KEYBOARD_DEVICE, MOUSE_DEVICE] {
+        if let Err(error) = call(SYS_GRANT_PORTS, grant, device) {
+            say(
+                pid,
+                &[b"session port grant failed: ", error.name().as_bytes()],
+            );
+            idle_forever(pid);
+        }
     }
 
-    say(pid, &[b"session owns the display and the clock"]);
+    // SAFETY: the grants above cover both controller registers.
+    if !unsafe { i8042_init(pid) } {
+        say(pid, &[b"session has no input, running without it"]);
+    }
+
+    // Claim, do not wait. Every line has to be live before anything blocks:
+    // claiming by waiting means stopping on the first device until it
+    // interrupts, and a keyboard does not interrupt until somebody presses a
+    // key — which is exactly where this stopped before `SYS_IRQ_CLAIM` existed.
+    for device in [TICKER_DEVICE, KEYBOARD_DEVICE, MOUSE_DEVICE] {
+        if let Err(error) = call(SYS_IRQ_CLAIM, grant, device) {
+            say(
+                pid,
+                &[b"session could not claim a line: ", error.name().as_bytes()],
+            );
+            idle_forever(pid);
+        }
+    }
+
+    say(pid, &[b"session owns the display, the clock, and input"]);
 
     let screen = Screen {
         base,
@@ -854,31 +1136,69 @@ fn session(grant: u64) -> ! {
     };
 
     let mut tick = 0u64;
+    let mut keys = 0u64;
     let mut reported = false;
     let mut painted = false;
+    let mut pointer = Pointer {
+        x: (screen.width / 2) as i64,
+        y: (screen.height / 2) as i64,
+        packet: [0; 3],
+        have: 0,
+        left: false,
+        saved: [0; POINTER_SIZE * POINTER_SIZE],
+        saved_at: None,
+    };
 
     loop {
-        match call(SYS_IRQ_WAIT, grant, TICKER_DEVICE) {
-            Ok(count) => tick = tick.wrapping_add(count),
+        // One wait for three devices. Blocking on the clock alone would drop
+        // every keystroke; polling the controller from the clock would drop
+        // mouse bytes, because it holds one at a time and a lost byte
+        // desynchronises a three-byte packet into a cursor that jumps.
+        let packed = match call(SYS_IRQ_WAIT_ANY, grant, 0) {
+            Ok(packed) => packed,
             Err(error) => {
-                say(pid, &[b"session clock failed: ", error.name().as_bytes()]);
+                say(pid, &[b"session wait failed: ", error.name().as_bytes()]);
                 idle_forever(pid);
             }
-        }
-        // SAFETY: the port grant above covers these, which is what makes the
-        // instructions legal from ring 3 at all.
-        unsafe {
-            cmos_read(CMOS_REG_C);
+        };
+        let line = packed >> 32;
+        let count = packed & 0xFFFF_FFFF;
+
+        match line {
+            TICKER_LINE => {
+                tick = tick.wrapping_add(count);
+                // SAFETY: the port grant covers the CMOS registers, and the
+                // read is what permits the device's next interrupt.
+                unsafe {
+                    cmos_read(CMOS_REG_C);
+                }
+            }
+            KEYBOARD_LINE | MOUSE_LINE => {
+                // Drain rather than read once. Several bytes can arrive between
+                // two wakes, and the controller reports only that it has one —
+                // stopping after a single read leaves the rest to be read by
+                // the next interrupt, one behind forever.
+                // SAFETY: the grants above cover both registers.
+                unsafe {
+                    while port_in(I8042_COMMAND) & i8042_status::OUTPUT_FULL != 0 {
+                        let from_mouse = port_in(I8042_COMMAND) & i8042_status::FROM_MOUSE != 0;
+                        let byte = port_in(I8042_DATA);
+                        if from_mouse {
+                            pointer.feed(byte, &screen);
+                        } else if byte < 0x80 && byte != 0xE0 {
+                            // Presses only. In scancode set 1 a release is the
+                            // press with the top bit set, so counting every
+                            // byte counts each key twice — the readout said ten
+                            // for five keystrokes. 0xE0 is the prefix for the
+                            // extended keys and is not a key of its own.
+                            keys = keys.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
 
-        // The static parts once, the moving parts every frame.
-        //
-        // Redrawing everything at 64 Hz was the first version and it tore: a
-        // screen capture caught the desktop mid-redraw, with the panel drawn
-        // and the window text not. Four megabytes of writes per frame to change
-        // a clock is also simply wasteful. This is the smallest damage
-        // tracking that works — two regions, both known statically — and it
-        // needs no bookkeeping to be right.
         // SAFETY: `screen` describes the framebuffer window this process was
         // granted, and every draw below is clipped to its geometry.
         unsafe {
@@ -886,8 +1206,9 @@ fn session(grant: u64) -> ! {
                 painted = true;
                 draw_desktop(&screen);
             }
-            draw_clock(&screen, tick);
+            draw_status(&screen, tick, keys, &pointer);
             draw_sweep(&screen, tick);
+            draw_pointer(&screen, &mut pointer);
         }
 
         if !reported && tick >= 3 {
@@ -897,6 +1218,92 @@ fn session(grant: u64) -> ! {
     }
 }
 
+impl Pointer {
+    /// Copies the desktop under where the cursor is about to go.
+    ///
+    /// # Safety
+    /// As `Screen::put`.
+    unsafe fn save(&mut self, screen: &Screen, x: u64, y: u64) {
+        let left = x.saturating_sub(6);
+        let top = y.saturating_sub(6);
+        for row in 0..POINTER_SIZE as u64 {
+            for column in 0..POINTER_SIZE as u64 {
+                // SAFETY: `get` clips to the screen and answers zero outside.
+                self.saved[(row * POINTER_SIZE as u64 + column) as usize] =
+                    unsafe { screen.get(left + column, top + row) };
+            }
+        }
+        self.saved_at = Some((left, top));
+    }
+
+    /// Puts back what `save` took.
+    ///
+    /// # Safety
+    /// As `Screen::put`.
+    unsafe fn restore(&self, screen: &Screen) {
+        let Some((left, top)) = self.saved_at else {
+            return;
+        };
+        for row in 0..POINTER_SIZE as u64 {
+            for column in 0..POINTER_SIZE as u64 {
+                // SAFETY: `put` clips to the screen.
+                unsafe {
+                    screen.put(
+                        left + column,
+                        top + row,
+                        self.saved[(row * POINTER_SIZE as u64 + column) as usize],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Takes one byte of a movement packet, applying it once all three arrive.
+    ///
+    /// # The first byte is the only one that can be checked
+    ///
+    /// Bit 3 of it is always set. Nothing marks the second or third, so a
+    /// stream that has lost a byte cannot be resynchronised by looking at them
+    /// — the only recovery is to notice the first byte is wrong and start
+    /// again, which is what the check below does. Without it a single dropped
+    /// byte turns every later packet into nonsense permanently.
+    fn feed(&mut self, byte: u8, screen: &Screen) {
+        const ALWAYS_ONE: u8 = 1 << 3;
+        const LEFT_BUTTON: u8 = 1 << 0;
+        const X_SIGN: u8 = 1 << 4;
+        const Y_SIGN: u8 = 1 << 5;
+        // Movement larger than this means the packet is not a packet.
+        const OVERFLOW: u8 = (1 << 6) | (1 << 7);
+
+        if self.have == 0 && (byte & ALWAYS_ONE == 0 || byte & OVERFLOW != 0) {
+            return;
+        }
+        self.packet[self.have] = byte;
+        self.have += 1;
+        if self.have < 3 {
+            return;
+        }
+        self.have = 0;
+
+        let flags = self.packet[0];
+        // The deltas are nine-bit two's complement: eight bits in the byte and
+        // the sign in the flags. Sign-extending by hand because the sign bit is
+        // not where the value is.
+        let mut dx = i64::from(self.packet[1]);
+        let mut dy = i64::from(self.packet[2]);
+        if flags & X_SIGN != 0 {
+            dx -= 256;
+        }
+        if flags & Y_SIGN != 0 {
+            dy -= 256;
+        }
+
+        self.left = flags & LEFT_BUTTON != 0;
+        // The mouse's y grows upward and the screen's grows downward.
+        self.x = (self.x + dx).clamp(0, screen.width as i64 - 1);
+        self.y = (self.y - dy).clamp(0, screen.height as i64 - 1);
+    }
+}
 /// Everything on the desktop that does not change.
 ///
 /// # Safety
@@ -943,15 +1350,16 @@ unsafe fn draw_desktop(screen: &Screen) {
     }
 }
 
-/// The uptime, redrawn each frame.
+/// The panel's live half: uptime, keystroke count, and pointer position.
 ///
-/// The ticker is the only source of time this process has: 64 interrupts to the
-/// second, counted. A number that advances is proof the machine is running,
-/// which no still image can be.
+/// The ticker is the only source of time this process has — 64 interrupts to
+/// the second, counted. The other two numbers are there because they are the
+/// cheapest proof that input works: a count that rises when a key is pressed
+/// and coordinates that follow the mouse cannot be produced by a still image.
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_clock(screen: &Screen, tick: u64) {
+unsafe fn draw_status(screen: &Screen, tick: u64, keys: u64, pointer: &Pointer) {
     let seconds = tick / 64;
     let mut stamp = *b"UP 00:00:00";
     let hours = (seconds / 3600) % 100;
@@ -964,13 +1372,59 @@ unsafe fn draw_clock(screen: &Screen, tick: u64) {
     stamp[9] = b'0' + (secs / 10) as u8;
     stamp[10] = b'0' + (secs % 10) as u8;
 
+    let mut readout = *b"KEYS 000  X 0000 Y 0000  ";
+    let k = keys % 1000;
+    readout[5] = b'0' + (k / 100) as u8;
+    readout[6] = b'0' + (k / 10 % 10) as u8;
+    readout[7] = b'0' + (k % 10) as u8;
+    let px = pointer.x.clamp(0, 9999) as u64;
+    let py = pointer.y.clamp(0, 9999) as u64;
+    for (offset, value) in [(12u64, px), (19, py)] {
+        for digit in 0..4u64 {
+            let place = 10u64.pow(3 - digit as u32);
+            readout[(offset + digit) as usize] = b'0' + (value / place % 10) as u8;
+        }
+    }
+    if pointer.left {
+        readout[24] = b'*';
+    }
+
     let x = screen.width.saturating_sub(160);
     // SAFETY: the caller guarantees the window.
     unsafe {
-        // The panel behind it first: glyphs are drawn as set pixels only, so
+        // The panel behind each first: glyphs are drawn as set pixels only, so
         // without this the previous digit stays underneath the new one.
         screen.fill(x, 4, 150, 24, colour::PANEL);
         screen.text(x, 9, &stamp, colour::TEXT);
+        screen.fill(260, 4, 400, 24, colour::PANEL);
+        screen.text(260, 9, &readout, colour::DIM);
+    }
+}
+
+/// Puts back what the cursor was covering, then draws it in its new place.
+///
+/// Drawn as a small cross rather than an arrow: an arrow needs a mask to avoid
+/// a rectangle of background around it, and a cross is legible against both the
+/// desktop and a window, which is the whole requirement.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_pointer(screen: &Screen, pointer: &mut Pointer) {
+    // SAFETY: the caller guarantees the window; every access clips.
+    unsafe {
+        pointer.restore(screen);
+
+        let x = pointer.x.clamp(0, screen.width as i64 - 1) as u64;
+        let y = pointer.y.clamp(0, screen.height as i64 - 1) as u64;
+        pointer.save(screen, x, y);
+
+        let colour = if pointer.left {
+            colour::ACCENT
+        } else {
+            colour::TEXT
+        };
+        screen.fill(x.saturating_sub(6), y, 13, 2, colour);
+        screen.fill(x, y.saturating_sub(6), 2, 13, colour);
     }
 }
 
@@ -1092,7 +1546,7 @@ fn probe_sound(pid: u64, grant: u64) {
     }
 
     if info.kind != DeviceKind::Sound as u32 {
-        say(pid, &[b"device 3 is not a sound card"]);
+        say(pid, &[b"the sound device is not a sound card"]);
         exit(41);
     }
 

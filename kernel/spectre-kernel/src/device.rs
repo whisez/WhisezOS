@@ -60,7 +60,9 @@ struct Entry {
     /// Kernel-side like the rest: a process asks for its device, not for a port
     /// number, so it cannot express a request for ports belonging to anything
     /// else. What it gets is decided here.
-    ports: Option<PortRange>,
+    /// Up to two, because the i8042 needs two: its registers are 0x60 and 0x64
+    /// and the range between them holds a port the kernel keeps.
+    ports: [Option<PortRange>; MAX_DEVICE_PORT_RANGES],
     /// The interrupt line this device raises, if it raises one.
     ///
     /// Kernel-side like `phys`, and for the same reason: a line number is a
@@ -73,7 +75,7 @@ impl Entry {
     const EMPTY: Self = Self {
         info: DeviceInfo::EMPTY,
         phys: 0,
-        ports: None,
+        ports: [None; MAX_DEVICE_PORT_RANGES],
         line: None,
     };
 
@@ -120,7 +122,7 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
                     ..DeviceInfo::EMPTY
                 },
                 phys: boot.framebuffer.base,
-                ports: None,
+                ports: [None; MAX_DEVICE_PORT_RANGES],
                 line: None,
             };
             table.len = 1;
@@ -141,13 +143,57 @@ pub fn init(boot: &BootInfo, grant: u64) -> usize {
             ..DeviceInfo::EMPTY
         },
         phys: 0,
-        ports: Some(TICKER_PORTS),
+        ports: [Some(TICKER_PORTS), None],
         line: Some(TICKER_LINE),
     };
     table.len = slot + 1;
 
+    // The keyboard and the mouse: one chip, two interrupts, and the same pair
+    // of ports listed twice. They are two devices here because a driver has to
+    // know which interrupt announced a byte — the data register does not say —
+    // and one device with two lines would need a syscall shape that does not
+    // exist.
+    for (kind, line) in [
+        (DeviceKind::Keyboard, KEYBOARD_LINE),
+        (DeviceKind::Mouse, MOUSE_LINE),
+    ] {
+        let slot = table.len;
+        if slot >= MAX_DEVICES {
+            break;
+        }
+        table.entries[slot] = Entry {
+            info: DeviceInfo {
+                kind: kind as u32,
+                ..DeviceInfo::EMPTY
+            },
+            phys: 0,
+            ports: INPUT_PORTS,
+            line: Some(line),
+        };
+        table.len = slot + 1;
+    }
+
     table.len
 }
+
+/// Port ranges one device can need.
+pub const MAX_DEVICE_PORT_RANGES: usize = 2;
+
+/// The interrupt lines the input controller raises.
+pub const KEYBOARD_LINE: usize = 1;
+pub const MOUSE_LINE: usize = 2;
+
+/// The i8042's two registers, granted separately.
+///
+/// The data register and the command/status register, with three ports between
+/// them that are not the controller's — one of which is the PIT gate the kernel
+/// keeps. Asking for the range would be refused, so this is two grants.
+///
+/// Here rather than in `arch::i8042` because this file is compiled by the host
+/// test harness, which has no `arch`. The IRQ numbers stay there, where the
+/// routing table reads them.
+pub const INPUT_PORTS: [Option<PortRange>; MAX_DEVICE_PORT_RANGES] =
+    [Some(PortRange::new(0x60, 1)), Some(PortRange::new(0x64, 1))];
 
 /// The interrupt line the ticker is wired to.
 ///
@@ -196,7 +242,7 @@ pub fn add_virtio(
             ..DeviceInfo::EMPTY
         },
         phys: window,
-        ports: None,
+        ports: [None; MAX_DEVICE_PORT_RANGES],
         line: Some(line),
     };
     table.len = slot + 1;
@@ -206,10 +252,18 @@ pub fn add_virtio(
 /// The ports device `index` is driven through.
 ///
 /// Kernel-only, like `extent` and `line`.
-pub fn ports(grant: u64, index: u64) -> Result<PortRange, SyscallError> {
-    lookup(grant, index)?
-        .ports
-        .ok_or(SyscallError::NotPermitted)
+pub fn ports(
+    grant: u64,
+    index: u64,
+) -> Result<[Option<PortRange>; MAX_DEVICE_PORT_RANGES], SyscallError> {
+    let entry = lookup(grant, index)?;
+    // A device with no ports is refused rather than answered with an empty
+    // list: the caller goes on to grant whatever comes back, and granting
+    // nothing successfully is indistinguishable from granting something.
+    if entry.ports.iter().all(Option::is_none) {
+        return Err(SyscallError::NotPermitted);
+    }
+    Ok(entry.ports)
 }
 
 /// Checks a grant and an index together.
@@ -278,8 +332,9 @@ mod tests {
 
     #[test]
     fn a_framebuffer_in_the_handoff_becomes_the_first_device() {
-        // Two devices: the framebuffer, and the ticker that is always listed.
-        assert_eq!(init(&boot_with_framebuffer(), GRANT), 2);
+        // Four: the framebuffer, the ticker, and the two halves of the input
+        // controller. Only the first depends on what the firmware left behind.
+        assert_eq!(init(&boot_with_framebuffer(), GRANT), 4);
         let info = describe(GRANT, 0).unwrap();
         assert_eq!(info.kind, DeviceKind::Framebuffer as u32);
         assert_eq!(info.width, 1280);
@@ -291,7 +346,7 @@ mod tests {
         // Unlike the framebuffer it depends on nothing the firmware did, so it
         // is the one device a driver can always count on being there — and with
         // no framebuffer it moves to index zero rather than leaving a hole.
-        assert_eq!(init(&BootInfo::empty(), GRANT), 1);
+        assert_eq!(init(&BootInfo::empty(), GRANT), 3);
         let info = describe(GRANT, 0).unwrap();
         assert_eq!(info.kind, DeviceKind::Ticker as u32);
         assert_eq!(line(GRANT, 0), Ok(TICKER_LINE));
@@ -304,7 +359,37 @@ mod tests {
         // the ticker's, which is what a shared default would do.
         init(&boot_with_framebuffer(), GRANT);
         assert_eq!(ports(GRANT, 0), Err(SyscallError::NotPermitted));
-        assert_eq!(ports(GRANT, 1), Ok(TICKER_PORTS));
+        assert_eq!(ports(GRANT, 1), Ok([Some(TICKER_PORTS), None]));
+    }
+
+    #[test]
+    fn both_halves_of_the_input_controller_are_listed_with_separate_lines() {
+        // One chip, two interrupts. They are two devices because a driver has
+        // to know which interrupt announced a byte — the shared data register
+        // does not say — and a device with two lines has no syscall shape.
+        init(&boot_with_framebuffer(), GRANT);
+        assert_eq!(
+            describe(GRANT, 2).unwrap().kind,
+            DeviceKind::Keyboard as u32
+        );
+        assert_eq!(describe(GRANT, 3).unwrap().kind, DeviceKind::Mouse as u32);
+        assert_eq!(line(GRANT, 2), Ok(KEYBOARD_LINE));
+        assert_eq!(line(GRANT, 3), Ok(MOUSE_LINE));
+        assert_ne!(line(GRANT, 2), line(GRANT, 3));
+    }
+
+    #[test]
+    fn the_input_controller_is_two_grants_because_one_range_would_be_refused() {
+        // 0x60 to 0x64 contains the PIT gate, which `portauth` keeps. A single
+        // range would be rejected at the grant, so the device carries two.
+        use crate::portauth::forbidden_reason;
+        assert!(forbidden_reason(&PortRange::new(0x60, 5)).is_some());
+        for range in INPUT_PORTS.iter().flatten() {
+            assert_eq!(forbidden_reason(range), None, "{range:?} cannot be granted");
+        }
+
+        init(&boot_with_framebuffer(), GRANT);
+        assert_eq!(ports(GRANT, 2), Ok(INPUT_PORTS));
     }
 
     #[test]
@@ -360,7 +445,7 @@ mod tests {
     fn an_index_past_the_end_is_refused_the_same_way_as_a_bad_token() {
         // Distinguishing them would tell a process how many devices exist.
         init(&boot_with_framebuffer(), GRANT);
-        assert_eq!(describe(GRANT, 2), Err(SyscallError::NotPermitted));
+        assert_eq!(describe(GRANT, 4), Err(SyscallError::NotPermitted));
         assert_eq!(describe(GRANT, u64::MAX), Err(SyscallError::NotPermitted));
         assert_eq!(describe(GRANT ^ 1, 0), describe(GRANT, 99));
     }
@@ -389,9 +474,9 @@ mod tests {
         // from it would map less than the driver goes on to write.
         let mut boot = boot_with_framebuffer();
         boot.framebuffer.stride = 16;
-        // One device left, and it is the ticker rather than a framebuffer whose
-        // geometry does not add up.
-        assert_eq!(init(&boot, GRANT), 1);
+        // The framebuffer is dropped; everything that does not depend on the
+        // firmware stays.
+        assert_eq!(init(&boot, GRANT), 3);
         assert_eq!(describe(GRANT, 0).unwrap().kind, DeviceKind::Ticker as u32);
     }
 }

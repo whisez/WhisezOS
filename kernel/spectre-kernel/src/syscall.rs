@@ -18,7 +18,8 @@
 
 use crate::abi::{
     SyscallError, MAX_LOG_BYTES, PING_COOKIE, SYS_ALLOC_DMA, SYS_CALL, SYS_DEVICE_INFO, SYS_EXIT,
-    SYS_GRANT_PORTS, SYS_IRQ_WAIT, SYS_LOG, SYS_MAP_DEVICE, SYS_PING, SYS_RECEIVE, SYS_REPLY,
+    SYS_GRANT_PORTS, SYS_IRQ_CLAIM, SYS_IRQ_WAIT, SYS_IRQ_WAIT_ANY, SYS_LOG, SYS_MAP_DEVICE,
+    SYS_PING, SYS_RECEIVE, SYS_REPLY,
 };
 use crate::arch;
 use crate::arch::trap::TrapFrame;
@@ -71,6 +72,8 @@ pub fn handle(
         SYS_ALLOC_DMA => sys_alloc_dma(a0, a1, a2),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1, frame),
         SYS_GRANT_PORTS => sys_grant_ports(a0, a1),
+        SYS_IRQ_WAIT_ANY => sys_irq_wait_any(a0, frame),
+        SYS_IRQ_CLAIM => sys_irq_claim(a0, a1),
         // An unknown number is refused rather than ignored. Returning success
         // for a call the kernel did not make would let a process built against
         // a newer ABI believe something happened.
@@ -272,6 +275,51 @@ fn sys_irq_wait(grant: u64, index: u64, frame: &TrapFrame) -> Result<u64, Syscal
     }
 }
 
+/// `SYS_IRQ_CLAIM(grant, index) -> line`.
+///
+/// Claiming and waiting are separate calls because a driver with more than one
+/// device has to have every line live before it blocks on any of them. They
+/// were one call while there was one device, and the day there were three the
+/// session claimed the clock, blocked on the keyboard, and never reached the
+/// mouse — a keyboard does not interrupt until somebody presses a key.
+///
+/// The line number comes back so a process can tell which of its devices
+/// `SYS_IRQ_WAIT_ANY` is reporting.
+fn sys_irq_claim(grant: u64, index: u64) -> Result<u64, SyscallError> {
+    let line = device::line(grant, index)?;
+    let pid = task::current_pid();
+    let fresh = irq::claim(line, pid)?;
+
+    if fresh {
+        // SAFETY: the line was routed during bring-up, the claim above
+        // established that this process owns it, and a system call arrives with
+        // interrupts disabled, which the register accesses require.
+        if let Err(error) = unsafe { arch::unmask_device_line(line) } {
+            kprintln!("[kernel] could not unmask line {line}: {error:?}");
+            return Err(SyscallError::NotPermitted);
+        }
+    }
+    Ok(line as u64)
+}
+
+/// `SYS_IRQ_WAIT_ANY(grant) -> (line << 32) | count`.
+///
+/// The grant is checked even though the lines are already this process's: a
+/// process that lost its devices should be refused here for the same reason it
+/// is refused everywhere else, rather than told it owns nothing.
+fn sys_irq_wait_any(grant: u64, frame: &TrapFrame) -> Result<u64, SyscallError> {
+    // Any device at all. `describe` is the cheapest check that the token is the
+    // one the table was issued with.
+    device::describe(grant, 0)?;
+
+    match irq::wait_any(task::current_pid())? {
+        irq::Wait::Ready(packed) => Ok(packed),
+        // SAFETY: reached from a system call with interrupts disabled, on the
+        // syscall stack, and nothing on that stack is needed afterwards.
+        irq::Wait::Block => unsafe { task::block_current(frame) },
+    }
+}
+
 /// `SYS_GRANT_PORTS(grant, index) -> ports permitted`.
 ///
 /// The process names a device and receives whatever ports that device is
@@ -280,15 +328,28 @@ fn sys_irq_wait(grant: u64, index: u64, frame: &TrapFrame) -> Result<u64, Syscal
 /// would be a call whose safety depended on the kernel checking arithmetic
 /// against an argument chosen to defeat the check.
 fn sys_grant_ports(grant: u64, index: u64) -> Result<u64, SyscallError> {
-    let range = device::ports(grant, index)?;
-    task::grant_ports(range)?;
+    let ranges = device::ports(grant, index)?;
+
+    // Every range or none. A device granted half its registers is a driver that
+    // gets a fault partway through initialising it, with the hardware left in
+    // whatever state the successful half put it — so the whole set is validated
+    // before any of it is applied.
+    for range in ranges.iter().flatten() {
+        if crate::portauth::forbidden_reason(range).is_some() {
+            return Err(SyscallError::NotPermitted);
+        }
+    }
+
+    let mut granted = 0u64;
+    for range in ranges.iter().flatten() {
+        task::grant_ports(*range)?;
+        granted += u64::from(range.len);
+    }
     kprintln!(
-        "[kernel] pid {} granted {} port(s) from {:#x}",
-        task::current_pid(),
-        range.len,
-        range.base
+        "[kernel] pid {} granted {granted} port(s) for device {index}",
+        task::current_pid()
     );
-    Ok(u64::from(range.len))
+    Ok(granted)
 }
 
 /// `SYS_EXIT(code)`.
