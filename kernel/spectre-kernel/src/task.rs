@@ -171,6 +171,12 @@ struct Spawner {
 
 static SPAWNER: Mutex<Option<Spawner>> = Mutex::new(None);
 
+/// Whether the idle state has already been reported.
+///
+/// A machine with a resident driver is idle between every pair of interrupts,
+/// so the message is otherwise emitted at the interrupt rate.
+static IDLE_REPORTED: Mutex<bool> = Mutex::new(false);
+
 /// Free frames before any process existed, for the leak check at the end.
 static BASELINE_FREE_FRAMES: Mutex<u64> = Mutex::new(0);
 
@@ -526,7 +532,19 @@ fn no_runnable_process(states: &[Slot]) -> ! {
     // answers.
     let waiting_on_hardware = crate::irq::waiters();
     if waiting_on_hardware > 0 {
-        kprintln!("[kernel] idle: {waiting_on_hardware} process(es) waiting on hardware");
+        // Said once. This is the steady state of a machine with a resident
+        // driver — the session draws, blocks on its next interrupt, and lands
+        // here — so it is reached at the interrupt rate, sixty-four times a
+        // second. Printed every time it filled the screen and scrolled the boot
+        // log away, which is the one thing the screen is for.
+        //
+        // Entering an idle state is news; being in one is not.
+        let mut said = IDLE_REPORTED.lock();
+        if !*said {
+            *said = true;
+            kprintln!("[kernel] idle: {waiting_on_hardware} process(es) waiting on hardware");
+        }
+        drop(said);
         idle_until_interrupt();
     }
 
