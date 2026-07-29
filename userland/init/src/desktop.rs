@@ -67,6 +67,9 @@ pub const BUTTON_INSET: u64 = 3;
 pub const MENU_WIDTH: u64 = 200;
 pub const MENU_ITEM_HEIGHT: u64 = 26;
 
+/// Quick-question cards in the Assistant window.
+pub const ASSISTANT_SUGGESTION_COUNT: usize = 3;
+
 /// The windows the session can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
@@ -209,10 +212,10 @@ pub const fn default_rect(window: Window) -> Rect {
         // the answers ran off the right edge, past the rectangle the redraw
         // clears — so the tails of old answers stayed on the desktop.
         Window::Assistant => Rect {
-            x: 380,
-            y: 300,
-            w: 800,
-            h: 340,
+            x: 300,
+            y: 110,
+            w: 880,
+            h: 540,
         },
         Window::Shell => Rect {
             x: 180,
@@ -412,6 +415,9 @@ pub enum Click {
     /// Account controls in Settings.
     SettingsSubmit,
     SettingsLock,
+    /// Assistant chat controls.
+    AssistantSend,
+    AssistantSuggestion(usize),
     /// A window is being dragged. The session repaints and nothing else.
     Drag,
 }
@@ -547,7 +553,8 @@ impl Desktop {
             };
             let minimum_height = match window {
                 Window::Editor | Window::Files | Window::Settings => 380,
-                Window::Assistant | Window::Shell => 300,
+                Window::Assistant => 420,
+                Window::Shell => 300,
                 Window::Drivers | Window::Network => 340,
                 Window::Devices | Window::Tasks => 260,
             };
@@ -872,6 +879,41 @@ impl Desktop {
         }
     }
 
+    /// Text field at the bottom of Assistant.
+    #[must_use]
+    pub const fn assistant_prompt_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 10,
+            y: rect.y + rect.h - 62,
+            w: rect.w - 140,
+            h: 44,
+        }
+    }
+
+    /// Send button beside Assistant's text field.
+    #[must_use]
+    pub const fn assistant_send_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + rect.w - 122,
+            y: rect.y + rect.h - 62,
+            w: 112,
+            h: 44,
+        }
+    }
+
+    /// One of the three equal-width quick-question cards.
+    #[must_use]
+    pub const fn assistant_suggestion_rect(rect: Rect, index: usize) -> Rect {
+        let body_width = rect.w - 20;
+        let card_width = (body_width - 16) / ASSISTANT_SUGGESTION_COUNT as u64;
+        Rect {
+            x: rect.x + 10 + index as u64 * (card_width + 8),
+            y: rect.y + TITLE_HEIGHT + 70,
+            w: card_width,
+            h: 34,
+        }
+    }
+
     /// Handles a press at a point.
     ///
     /// `rows` is how many the FILES window shows, which the session knows and
@@ -1021,6 +1063,16 @@ impl Desktop {
                 }
                 if Self::settings_lock_rect(rect).holds(x, y) {
                     return Click::SettingsLock;
+                }
+            }
+            if window == Window::Assistant {
+                if Self::assistant_send_rect(rect).holds(x, y) {
+                    return Click::AssistantSend;
+                }
+                for index in 0..ASSISTANT_SUGGESTION_COUNT {
+                    if Self::assistant_suggestion_rect(rect, index).holds(x, y) {
+                        return Click::AssistantSuggestion(index);
+                    }
                 }
             }
             return self.open(window);
@@ -1660,6 +1712,42 @@ mod tests {
             );
             assert_eq!(window.takes_text(), expected, "{window:?}");
         }
+    }
+
+    #[test]
+    fn every_assistant_control_is_clickable_and_distinct() {
+        let mut desktop = Desktop::new();
+        desktop.open(Window::Assistant);
+        let rect = desktop.rect(Window::Assistant);
+
+        for index in 0..ASSISTANT_SUGGESTION_COUNT {
+            let card = Desktop::assistant_suggestion_rect(rect, index);
+            assert_eq!(
+                desktop.press(
+                    card.x + card.w / 2,
+                    card.y + card.h / 2,
+                    false,
+                    WIDTH,
+                    HEIGHT,
+                    0,
+                ),
+                Click::AssistantSuggestion(index)
+            );
+        }
+
+        let send = Desktop::assistant_send_rect(rect);
+        assert_eq!(
+            desktop.press(
+                send.x + send.w / 2,
+                send.y + send.h / 2,
+                false,
+                WIDTH,
+                HEIGHT,
+                0,
+            ),
+            Click::AssistantSend
+        );
+        assert!(!Desktop::assistant_prompt_rect(rect).holds(send.x, send.y));
     }
 
     #[test]

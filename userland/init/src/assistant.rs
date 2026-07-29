@@ -60,6 +60,7 @@ pub enum Answer {
     OpenEditor,
     OpenNetwork,
     OpenDrivers,
+    OpenSettings,
     NewText,
     /// Write what follows the keyword into the notes file.
     Remember,
@@ -73,6 +74,14 @@ pub enum Answer {
 /// format they can read: the assistant's memory is a file on their disk, not a
 /// private store they have to ask it about.
 pub const NOTES: &[u8] = b"NOTES.MD";
+
+/// One-click questions shown above the conversation. Their labels are short
+/// enough to fit the three equal-width cards even at the 640x480 layout.
+pub const SUGGESTIONS: [(&[u8], &[u8]); 3] = [
+    (b"AG DURUMU", b"ag baglantisi var mi"),
+    (b"DOSYALARI AC", b"dosyalari goster"),
+    (b"YARDIM", b"ne yapabilirsin"),
+];
 
 /// The words that mean the notes file.
 ///
@@ -151,6 +160,13 @@ struct Topic {
     answer: Answer,
 }
 
+const HELP_LINES: &[&[u8]] = &[
+    b"Dosyalari, Not Defteri'ni, agi ve suruculeri acabilirim.",
+    b"Sistem suresi, gorevler, donanim ve agi sorabilirsin.",
+    b"Not tutabilirim: 'hatirla yarin yedek al' yazabilirsin.",
+    b"English: files, network, devices, uptime, help.",
+];
+
 /// What it knows.
 ///
 /// Ordered by how specific the topic is, and matched in that order, so that a
@@ -158,6 +174,24 @@ struct Topic {
 /// free" names both storage and the machine; the storage answer is the one that
 /// was asked for.
 const TOPICS: &[Topic] = &[
+    Topic {
+        words: &[b"merhaba", b"selam", b"hello", b"hi", b"hey"],
+        answer: Answer::Say(&[
+            b"Merhaba! Ben WhisezOS sistem asistaniyim.",
+            b"Bir soru yazabilir veya yukaridaki kartlardan secebilirsin.",
+        ]),
+    },
+    Topic {
+        words: &[b"nasilsin", b"naber", b"howdy"],
+        answer: Answer::Say(&[
+            b"Calisiyorum ve sana yardim etmeye hazirim.",
+            b"Sistem, dosyalar, ag, suruculer veya gorevleri sorabilirsin.",
+        ]),
+    },
+    Topic {
+        words: &[b"tesekkur", b"tesekkurler", b"thanks", b"thank"],
+        answer: Answer::Say(&[b"Rica ederim. Baska neyi kontrol edelim?"]),
+    },
     Topic {
         words: &[b"uptime", b"long", b"running", b"sure", b"acik"],
         answer: Answer::Uptime,
@@ -196,15 +230,6 @@ const TOPICS: &[Topic] = &[
         answer: Answer::Devices,
     },
     Topic {
-        words: &[b"who", b"you", b"yourself", b"kimsin", b"nesin"],
-        answer: Answer::Say(&[
-            b"I am not a language model and there is none here.",
-            b"Ben yerel WhisezOS sistem asistaninin ilk surumuyum.",
-            b"Kernel, disk, ag ve surucu durumunu okuyabilirim.",
-            b"Sor: sistem, dosyalar, ag, suruculer, yardim.",
-        ]),
-    },
-    Topic {
         words: &[b"memory", b"ram", b"free", b"bellek", b"bos"],
         answer: Answer::Say(&[
             b"The kernel does not report free memory to ring 3 yet.",
@@ -232,10 +257,61 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         words: &[b"help", b"can", b"do", b"yardim", b"yapabilirsin"],
+        answer: Answer::Say(HELP_LINES),
+    },
+    Topic {
+        words: &[
+            b"who",
+            b"you",
+            b"yourself",
+            b"kimsin",
+            b"nesin",
+            b"yapay",
+            b"zeka",
+            b"model",
+        ],
         answer: Answer::Say(&[
-            b"Dosyalari, Not Defteri'ni, agi ve suruculeri acabilirim.",
-            b"Sistem suresi, gorevler, donanim ve agi sorabilirsin.",
-            b"English: files, network, devices, uptime, help.",
+            b"I am not a language model and there is none here.",
+            b"Ben yerel WhisezOS sistem asistaninin ilk surumuyum.",
+            b"Kernel, disk, ag ve surucu durumunu okuyabilirim.",
+            b"Sor: sistem, dosyalar, ag, suruculer, yardim.",
+        ]),
+    },
+    Topic {
+        words: &[
+            b"ayar",
+            b"ayarlar",
+            b"ayarlari",
+            b"settings",
+            b"sifre",
+            b"sifremi",
+            b"parola",
+            b"account",
+            b"hesap",
+        ],
+        answer: Answer::Say(&[
+            b"Hesap ve parola islemleri Ayarlar uygulamasindadir.",
+            b"'Ayarlari ac' yazarak dogrudan acabilirsin.",
+        ]),
+    },
+    Topic {
+        words: &[
+            b"uygulama",
+            b"uygulamalar",
+            b"apps",
+            b"program",
+            b"programlar",
+        ],
+        answer: Answer::Say(&[
+            b"Dosyalar, Not Defteri, Asistan, Ag, Suruculer,",
+            b"Ayarlar, Shell, Gorev Yoneticisi ve Aygitlar kullanilabilir.",
+        ]),
+    },
+    Topic {
+        words: &[b"version", b"surum", b"whisezos", b"system", b"sistem"],
+        answer: Answer::Say(&[
+            b"Bu WhisezOS gelistirici onizlemesidir.",
+            b"Rust mikrocekirdek ve ring 3 masaustu QEMU'da calisiyor.",
         ]),
     },
 ];
@@ -300,6 +376,24 @@ pub fn ask(question: &[u8]) -> Answer {
         )
     {
         return Answer::OpenDrivers;
+    }
+    if open
+        && has_any(
+            question,
+            &[
+                b"settings",
+                b"ayar",
+                b"ayarlar",
+                b"ayarlari",
+                b"account",
+                b"hesap",
+                b"sifre",
+                b"sifremi",
+                b"parola",
+            ],
+        )
+    {
+        return Answer::OpenSettings;
     }
     if has_any(question, &[b"new", b"create", b"yeni", b"olustur"])
         && has_any(question, &[b"text", b"txt", b"metin", b"dosya"])
@@ -428,6 +522,30 @@ mod tests {
         assert_eq!(ask(b"not defterini ac"), Answer::OpenEditor);
         assert_eq!(ask(b"suruculeri goster"), Answer::OpenDrivers);
         assert_eq!(ask(b"yeni metin dosyasi olustur"), Answer::NewText);
+        assert_eq!(ask(b"ayarlari ac"), Answer::OpenSettings);
+    }
+
+    #[test]
+    fn ordinary_conversation_always_gets_a_useful_reply() {
+        for question in [
+            &b"merhaba"[..],
+            b"nasilsin",
+            b"tesekkurler",
+            b"hangi uygulamalar var",
+            b"bu hangi surum",
+            b"sifremi nasil degistiririm",
+            b"what can you do",
+        ] {
+            assert!(matches!(ask(question), Answer::Say(_)), "{question:?}");
+        }
+    }
+
+    #[test]
+    fn every_suggestion_is_a_real_question() {
+        for (label, question) in SUGGESTIONS {
+            assert!(!label.is_empty());
+            assert!(!matches!(ask(question), Answer::Unknown), "{question:?}");
+        }
     }
 
     #[test]

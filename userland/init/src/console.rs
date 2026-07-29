@@ -156,6 +156,15 @@ impl Console {
         &self.input[..self.input_len]
     }
 
+    /// Replaces the current prompt text, truncating at the same limit as
+    /// ordinary typing. Used by clickable assistant suggestions so a click
+    /// travels through the exact same Enter/answer path as a typed question.
+    pub fn replace_input(&mut self, text: &[u8]) {
+        self.input.fill(0);
+        self.input_len = text.len().min(INPUT_LIMIT);
+        self.input[..self.input_len].copy_from_slice(&text[..self.input_len]);
+    }
+
     /// Appends a line, dropping the oldest if the buffer is full.
     pub fn print(&mut self, text: &[u8]) {
         let row = if self.used < ROWS {
@@ -387,6 +396,18 @@ mod tests {
         console.backspace();
         console.type_char(b'p');
         assert_eq!(console.input(), b"help");
+    }
+
+    #[test]
+    fn a_suggestion_replaces_half_typed_input() {
+        let mut console = Console::for_questions();
+        console.type_char(b'x');
+        console.replace_input(b"ag baglantisi var mi");
+        assert_eq!(console.input(), b"ag baglantisi var mi");
+        let Action::Ask(line, length) = console.enter() else {
+            panic!("suggestion did not use the question path");
+        };
+        assert_eq!(&line[..length], b"ag baglantisi var mi");
     }
 
     #[test]

@@ -31,7 +31,7 @@ defensive utility named **Whisez Guard**.
 | Setup screen | ✅ Working | A staged installation rehearsal with progress bars; it touches no disk |
 | Whisez Guard | ✅ Working | Windows security audit, offline scan, SHA3-256 baseline verification, and monitoring |
 | Build and packaging | ✅ Working | Produces an EFI application, Guard binary, and 4K wallpaper package with one command |
-| Automated tests | ✅ 624 tests | Kernel, file-system, account security, desktop, boot, and Guard tests |
+| Automated tests | ✅ 628 tests | Kernel, file-system, account security, desktop, boot, and Guard tests |
 | Production loader | ✅ Working | Reads, validates, and loads the kernel ELF, then exits boot services and hands off |
 | Kernel screen console | ✅ Working | The kernel draws its own log to the framebuffer the firmware left running; `cargo xtask boot-run` shows it in a window |
 | Production kernel | ✅ Boots in QEMU | GDT, IDT, serial console, frame allocator, and its own page tables; `cargo xtask boot-test` proves it from the serial log |
@@ -165,7 +165,7 @@ The output is written to `dist/WhisezOS`. Run every supported check with:
 cargo xtask test
 ```
 
-This command runs 624 tests, Clippy checks, release builds, and a real QEMU boot
+This command runs 628 tests, Clippy checks, release builds, and a real QEMU boot
 test.
 
 ## Repository layout

@@ -1261,10 +1261,8 @@ fn session(grant: u64) -> ! {
     shell.print(b"WhisezOS session. Type help.");
     // Said here rather than only in the module comment, because the person who
     // needs to read it is the one looking at the window.
-    helper.print(b"WhisezOS Assistant / Sistem Asistani");
-    helper.print(b"Turkce ve English sistem komutlarini anlarim.");
-    helper.print(b"Sor: dosyalar, not defteri, ag, suruculer, gorevler.");
-    helper.print(b"Or ask: files, network, drivers, tasks, uptime.");
+    helper.print(b"Merhaba! Ben WhisezOS sistem asistaniyim.");
+    helper.print(b"Bir soru yaz, GONDER'e bas veya hazir bir kart sec.");
 
     // The disk, so `read` reads rather than reporting that it cannot. Failure
     // here is not fatal: a session without a disk is a session with one fewer
@@ -1423,6 +1421,7 @@ fn session(grant: u64) -> ! {
                                                 shell: &mut shell,
                                                 coined: &mut coined,
                                                 network: network.as_ref(),
+                                                account: &mut account,
                                             },
                                         );
                                         // The notes may have grown, and the
@@ -1518,6 +1517,8 @@ fn session(grant: u64) -> ! {
                         files: &mut files,
                         notepad: &mut notepad,
                         account: &mut account,
+                        helper: &mut helper,
+                        network: network.as_ref(),
                         coined: &mut coined,
                         grant,
                         tick,
@@ -2987,6 +2988,7 @@ struct AnswerContext<'a> {
     shell: &'a mut console::Console,
     coined: &'a mut u32,
     network: Option<&'a Network>,
+    account: &'a mut account::State,
 }
 
 fn answer(helper: &mut console::Console, question: &[u8], context: AnswerContext<'_>) {
@@ -2999,6 +3001,7 @@ fn answer(helper: &mut console::Console, question: &[u8], context: AnswerContext
         shell,
         coined,
         network,
+        account,
     } = context;
     match assistant::ask(question) {
         assistant::Answer::Remember => {
@@ -3067,6 +3070,11 @@ fn answer(helper: &mut console::Console, question: &[u8], context: AnswerContext
             face.open(desktop::Window::Drivers);
             helper.print(b"Surucu Yoneticisi'ni actim.");
         }
+        assistant::Answer::OpenSettings => {
+            account.begin_settings();
+            face.open(desktop::Window::Settings);
+            helper.print(b"Ayarlar ve Hesaplar sayfasini actim.");
+        }
         assistant::Answer::NewText => {
             create_new_text(shell, disk, files, notepad, face, coined);
             helper.print(b"Yeni metin belgesini olusturdum.");
@@ -3077,6 +3085,29 @@ fn answer(helper: &mut console::Console, question: &[u8], context: AnswerContext
             helper.print(b"English commands are supported too.");
         }
     }
+}
+
+/// Sends the current assistant prompt, optionally replacing it with a quick
+/// question first. Keyboard Enter, the Send button, and suggestion cards all
+/// meet here, so none of the three can silently skip the answer path.
+fn submit_assistant(
+    helper: &mut console::Console,
+    suggestion: Option<&[u8]>,
+    context: AnswerContext<'_>,
+) -> bool {
+    if let Some(question) = suggestion {
+        helper.replace_input(question);
+    }
+    if helper.input().is_empty() {
+        helper.print(b"Bir soru yaz veya yukaridaki hazir kartlardan birini sec.");
+        return true;
+    }
+    let console::Action::Ask(line, length) = helper.enter() else {
+        helper.print(b"Mesaj gonderilemedi; yeniden deneyebilirsin.");
+        return true;
+    };
+    answer(helper, &line[..length], context);
+    true
 }
 
 /// Writes a file's bytes and records its length.
@@ -3703,11 +3734,13 @@ fn report_uptime(shell: &mut console::Console, tick: u64) {
 /// a click can change, and everything not in it is something a click must not.
 struct Session<'a> {
     shell: &'a mut console::Console,
+    helper: &'a mut console::Console,
     face: &'a mut desktop::Desktop,
     disk: Option<&'a mut Disk>,
     files: &'a mut Option<dir::Table>,
     notepad: &'a mut editor::Editor,
     account: &'a mut account::State,
+    network: Option<&'a Network>,
     /// How many folders the menu has named, so the next one gets a new name.
     coined: &'a mut u32,
     grant: u64,
@@ -3717,11 +3750,13 @@ struct Session<'a> {
 fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
     let Session {
         shell,
+        helper,
         face,
         disk,
         files,
         notepad,
         account,
+        network,
         coined,
         grant,
         tick,
@@ -3819,6 +3854,41 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
             *face = desktop::Desktop::new();
             *notepad = editor::Editor::new();
             true
+        }
+        desktop::Click::AssistantSend => submit_assistant(
+            helper,
+            None,
+            AnswerContext {
+                tick,
+                files,
+                disk,
+                face,
+                notepad,
+                shell,
+                coined,
+                network,
+                account,
+            },
+        ),
+        desktop::Click::AssistantSuggestion(index) => {
+            let Some((_, question)) = assistant::SUGGESTIONS.get(index) else {
+                return false;
+            };
+            submit_assistant(
+                helper,
+                Some(question),
+                AnswerContext {
+                    tick,
+                    files,
+                    disk,
+                    face,
+                    notepad,
+                    shell,
+                    coined,
+                    network,
+                    account,
+                },
+            )
         }
         desktop::Click::File(row) => {
             let Some(table) = files.as_ref() else {
@@ -4355,17 +4425,19 @@ unsafe fn draw_assistant(screen: &Screen, assistant: &console::Console, rect: de
     let body_x = rect.x + 10;
     let body_y = rect.y + desktop::TITLE_HEIGHT + 8;
     let body_w = rect.w.saturating_sub(20);
-    let prompt_y = rect.y + rect.h.saturating_sub(54);
-    let history_y = body_y + 58;
-    let history_height = prompt_y.saturating_sub(history_y + 8);
+    let prompt = desktop::Desktop::assistant_prompt_rect(rect);
+    let send = desktop::Desktop::assistant_send_rect(rect);
+    let first_card = desktop::Desktop::assistant_suggestion_rect(rect, 0);
+    let history_y = first_card.y + first_card.h + 18;
+    let history_height = prompt.y.saturating_sub(history_y + 10);
     let rows = (history_height / CELL_H).max(1) as usize;
-    let columns = (body_w.saturating_sub(20) / CELL_W) as usize;
+    let columns = (body_w.saturating_sub(32) / CELL_W) as usize;
     let skip = assistant.line_count().saturating_sub(rows);
 
     // SAFETY: the caller guarantees the window; every operation clips.
     unsafe {
-        screen.fill(body_x, body_y, body_w, 48, colour::PANEL);
-        screen.fill(body_x, body_y, 4, 48, colour::ICON_ASSISTANT);
+        screen.fill(body_x, body_y, body_w, 52, colour::PANEL);
+        screen.fill(body_x, body_y, 4, 52, colour::ICON_ASSISTANT);
         // Four-point Whisez spark.
         let cx = body_x + 28;
         let cy = body_y + 24;
@@ -4390,9 +4462,24 @@ unsafe fn draw_assistant(screen: &Screen, assistant: &console::Console, rect: de
         screen.text(
             body_x + 52,
             body_y + 28,
-            b"TURKCE + ENGLISH  /  LOCAL SYSTEM ENGINE",
+            b"TURKCE + ENGLISH  /  SISTEM ASISTANI",
             colour::DIM,
         );
+        screen.fill(body_x + body_w - 92, body_y + 18, 7, 7, colour::ICON_TASKS);
+        screen.text(body_x + body_w - 76, body_y + 15, b"HAZIR", colour::DIM);
+
+        for (index, (label, _)) in assistant::SUGGESTIONS.iter().enumerate() {
+            let card = desktop::Desktop::assistant_suggestion_rect(rect, index);
+            screen.fill(card.x, card.y, card.w, card.h, colour::PANEL_BUTTON);
+            screen.fill(card.x, card.y + card.h - 2, card.w, 2, colour::PANEL_EDGE);
+            let label_width = label.len() as u64 * CELL_W;
+            screen.text(
+                card.x + card.w.saturating_sub(label_width) / 2,
+                card.y + 10,
+                label,
+                colour::TEXT,
+            );
+        }
 
         screen.fill(
             body_x,
@@ -4406,33 +4493,61 @@ unsafe fn draw_assistant(screen: &Screen, assistant: &console::Console, rect: de
                 return;
             }
             let take = line.len().min(columns);
+            let user = line.starts_with(b">");
+            if user {
+                screen.fill(
+                    body_x + 2,
+                    history_y + (index - skip) as u64 * CELL_H,
+                    3,
+                    CELL_H - 2,
+                    colour::START,
+                );
+            }
             screen.text(
-                body_x + 8,
+                body_x + 12,
                 history_y + (index - skip) as u64 * CELL_H,
                 &line[..take],
-                if line.starts_with(b">") {
-                    colour::TEXT
-                } else {
-                    colour::DIM
-                },
+                if user { colour::ACCENT } else { colour::TEXT },
             );
         });
 
-        let prompt_w = body_w;
-        screen.fill(body_x, prompt_y, prompt_w, 42, 0x0019_2636);
-        screen.fill(body_x, prompt_y + 40, prompt_w, 2, colour::ACCENT);
-        screen.text(body_x + 12, prompt_y + 13, b">", colour::ACCENT);
-        let typed = assistant.input();
-        let available = ((prompt_w.saturating_sub(48)) / CELL_W) as usize;
-        let shown = &typed[typed.len().saturating_sub(available)..];
-        screen.text(body_x + 32, prompt_y + 13, shown, colour::TEXT);
+        screen.fill(prompt.x, prompt.y, prompt.w, prompt.h, 0x0019_2636);
         screen.fill(
-            body_x + 32 + shown.len() as u64 * CELL_W,
-            prompt_y + 11,
+            prompt.x,
+            prompt.y + prompt.h - 2,
+            prompt.w,
             2,
-            20,
             colour::ACCENT,
         );
+        screen.text(prompt.x + 12, prompt.y + 14, b">", colour::ACCENT);
+        let typed = assistant.input();
+        let available = ((prompt.w.saturating_sub(48)) / CELL_W) as usize;
+        let shown = &typed[typed.len().saturating_sub(available)..];
+        if shown.is_empty() {
+            screen.text(
+                prompt.x + 44,
+                prompt.y + 14,
+                b"MESAJINI YAZ...",
+                colour::DIM,
+            );
+        } else {
+            screen.text(prompt.x + 32, prompt.y + 14, shown, colour::TEXT);
+        }
+        screen.fill(
+            if shown.is_empty() {
+                prompt.x + 30
+            } else {
+                prompt.x + 32 + shown.len() as u64 * CELL_W
+            },
+            prompt.y + 11,
+            2,
+            22,
+            colour::ACCENT,
+        );
+
+        screen.fill(send.x, send.y, send.w, send.h, colour::START);
+        screen.fill(send.x, send.y + send.h - 3, send.w, 3, colour::ACCENT);
+        screen.text(send.x + 20, send.y + 14, b"GONDER", colour::BAR_TEXT_ON);
     }
 }
 

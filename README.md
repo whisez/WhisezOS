@@ -31,7 +31,7 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Kurulum ekranı | ✅ Çalışıyor | Aşamalı, ilerleme çubuklu kurulum provası; hiçbir diske dokunmaz |
 | Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
 | Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
-| Otomatik testler | ✅ 624 test | Çekirdek, dosya sistemi, hesap güvenliği, masaüstü, önyükleme ve Guard testleri |
+| Otomatik testler | ✅ 628 test | Çekirdek, dosya sistemi, hesap güvenliği, masaüstü, önyükleme ve Guard testleri |
 | Üretim yükleyicisi | ✅ Çalışıyor | Çekirdek ELF'ini okur, doğrular, yükler ve boot servislerinden çıkıp devreder |
 | Çekirdek ekran konsolu | ✅ Çalışıyor | Çekirdek kendi günlüğünü firmware'in bıraktığı framebuffer'a da basar; `cargo xtask boot-run` bir pencerede gösterir |
 | Üretim çekirdeği | ✅ QEMU'da açılıyor | GDT, IDT, seri konsol, çerçeve ayırıcı ve kendi sayfa tabloları; `cargo xtask boot-test` seri günlükle kanıtlar |
@@ -162,7 +162,7 @@ için:
 cargo xtask test
 ```
 
-Bu komut 624 testi, Clippy denetimlerini, release derlemelerini ve gerçek QEMU
+Bu komut 628 testi, Clippy denetimlerini, release derlemelerini ve gerçek QEMU
 önyükleme testini çalıştırır.
 
 ## Depo yapısı
