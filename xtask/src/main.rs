@@ -541,7 +541,7 @@ const EXPECTED_BOOT_LINES: &[&str] = &[
     // and both land here.
     "[init 9] directory mounted, entries",
     "[init 9] live processes: 1",
-    "[init 9] session is drawing the desktop",
+    "[init 9] secure session display is live",
 ];
 
 /// The IPC chain. Which client is served first is a race; that a client is

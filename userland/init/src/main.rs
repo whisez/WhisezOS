@@ -31,6 +31,7 @@ mod blake3;
 #[path = "../../../fs/spectrefs/src/dir.rs"]
 mod dir;
 
+mod account;
 mod assistant;
 
 #[path = "../../../kernel/spectre-kernel/src/font.rs"]
@@ -1251,6 +1252,7 @@ fn session(grant: u64) -> ! {
     let mut helper = console::Console::for_questions();
     let mut notepad = editor::Editor::new();
     let mut face = desktop::Desktop::new();
+    face.fit_to_screen(screen.width, screen.height);
     let mut buttons = desktop::Buttons::default();
     let mut pending_click: Option<(u64, u64, bool)> = None;
     let mut last_tasks = u64::MAX;
@@ -1269,6 +1271,7 @@ fn session(grant: u64) -> ! {
     // command, and exiting is the one thing it must not do.
     let mut disk = attach_disk(&mut shell, grant);
     let mut files = mount(&mut shell, disk.as_mut());
+    let mut account = load_account(&mut shell, disk.as_mut(), files.as_ref());
     boot_sound(&mut shell, grant);
     let network = attach_network(&mut shell, grant);
     let mut pointer = Pointer {
@@ -1369,6 +1372,20 @@ fn session(grant: u64) -> ! {
                             };
                             if !matches!(key, keymap::Key::None) {
                                 keys = keys.wrapping_add(1);
+                            }
+                            if !account.unlocked() || face.focus == Some(desktop::Window::Settings)
+                            {
+                                let action = account.apply(key, tick);
+                                if handle_account_action(
+                                    action,
+                                    &mut account,
+                                    &mut shell,
+                                    disk.as_mut(),
+                                    &mut files,
+                                ) {
+                                    painted = false;
+                                }
+                                continue;
                             }
                             if face.focus == Some(desktop::Window::Editor) {
                                 match notepad.apply(key) {
@@ -1473,24 +1490,49 @@ fn session(grant: u64) -> ! {
         // the button reached the driver, the edge was detected, and nothing
         // used the answer.
         if let Some((x, y, right)) = pending_click.take() {
-            // The row count comes from here because the table is on the disk
-            // and the hit test is not allowed to reach it.
-            let rows = files.as_ref().map_or(0, |table| file_rows(table, face.cwd));
-            let click = face.press(x, y, right, screen.width, screen.height, rows);
+            if !account.unlocked() {
+                if !right && account_submit_rect(screen.width, screen.height).holds(x, y) {
+                    let action = account.submit(tick);
+                    if handle_account_action(
+                        action,
+                        &mut account,
+                        &mut shell,
+                        disk.as_mut(),
+                        &mut files,
+                    ) {
+                        painted = false;
+                    }
+                }
+            } else {
+                // The row count comes from here because the table is on the
+                // disk and the hit test is not allowed to reach it.
+                let rows = files.as_ref().map_or(0, |table| file_rows(table, face.cwd));
+                let click = face.press(x, y, right, screen.width, screen.height, rows);
 
-            if act_on_click(
-                click,
-                Session {
-                    shell: &mut shell,
-                    face: &mut face,
-                    disk: disk.as_mut(),
-                    files: &mut files,
-                    notepad: &mut notepad,
-                    coined: &mut coined,
-                    grant,
-                    tick,
-                },
-            ) {
+                if act_on_click(
+                    click,
+                    Session {
+                        shell: &mut shell,
+                        face: &mut face,
+                        disk: disk.as_mut(),
+                        files: &mut files,
+                        notepad: &mut notepad,
+                        account: &mut account,
+                        coined: &mut coined,
+                        grant,
+                        tick,
+                    },
+                ) {
+                    painted = false;
+                }
+            }
+            if !account.unlocked() {
+                // A locked desktop owns no windows or keyboard focus. Resetting
+                // both here also prevents the previous frame from flashing
+                // through after the lock button is used.
+                face = desktop::Desktop::new();
+                face.fit_to_screen(screen.width, screen.height);
+                notepad = editor::Editor::new();
                 painted = false;
             }
         }
@@ -1506,14 +1548,19 @@ fn session(grant: u64) -> ! {
                 // closed underneath it.
                 pointer.forget();
                 painted = true;
-                draw_desktop(
-                    &screen,
-                    &face,
-                    files.as_ref(),
-                    &notepad,
-                    network.as_ref(),
-                    tick,
-                );
+                if account.unlocked() {
+                    draw_desktop(
+                        &screen,
+                        &face,
+                        files.as_ref(),
+                        &notepad,
+                        network.as_ref(),
+                        &account,
+                        tick,
+                    );
+                } else {
+                    draw_account_gate(&screen, &account, tick);
+                }
             }
             // Once a second rather than every tick. The states do change that
             // fast, but a table redrawn sixty-four times a second is unreadable
@@ -1522,25 +1569,27 @@ fn session(grant: u64) -> ! {
             // different order from the frames it belongs to is text on top of
             // the wrong window — the contents of a window that is behind,
             // painted over the one in front.
-            for window in face.order() {
-                if !face.is_visible(window) {
-                    continue;
+            if account.unlocked() {
+                for window in face.order() {
+                    if !face.is_visible(window) {
+                        continue;
+                    }
+                    match window {
+                        desktop::Window::Shell => {
+                            draw_shell(&screen, &shell, face.rect(desktop::Window::Shell));
+                        }
+                        desktop::Window::Assistant => {
+                            draw_assistant(&screen, &helper, face.rect(desktop::Window::Assistant));
+                        }
+                        desktop::Window::Tasks if tick / 64 != last_tasks => {
+                            last_tasks = tick / 64;
+                            draw_tasks(&screen, face.rect(desktop::Window::Tasks));
+                        }
+                        _ => {}
+                    }
                 }
-                match window {
-                    desktop::Window::Shell => {
-                        draw_shell(&screen, &shell, face.rect(desktop::Window::Shell));
-                    }
-                    desktop::Window::Assistant => {
-                        draw_console(&screen, &helper, face.rect(desktop::Window::Assistant));
-                    }
-                    desktop::Window::Tasks if tick / 64 != last_tasks => {
-                        last_tasks = tick / 64;
-                        draw_tasks(&screen, face.rect(desktop::Window::Tasks));
-                    }
-                    _ => {}
-                }
+                draw_menu(&screen, &face);
             }
-            draw_menu(&screen, &face);
             draw_pointer(&screen, &mut pointer);
         }
 
@@ -1562,7 +1611,7 @@ fn session(grant: u64) -> ! {
                 }
             }
 
-            say(pid, &[b"session is drawing the desktop"]);
+            say(pid, &[b"secure session display is live"]);
         }
     }
 }
@@ -1801,6 +1850,7 @@ unsafe fn draw_desktop(
     files: Option<&dir::Table>,
     notepad: &editor::Editor,
     network: Option<&Network>,
+    account: &account::State,
     tick: u64,
 ) {
     // SAFETY: the caller guarantees the window; every call clips to geometry.
@@ -1819,11 +1869,11 @@ unsafe fn draw_desktop(
         // newly opened window underneath the one it was opened over.
         for window in face.order() {
             if face.is_visible(window) {
-                draw_window(screen, window, face, files, notepad, network);
+                draw_window(screen, window, face, files, notepad, network, account);
             }
         }
         draw_taskbar(screen, face, tick);
-        draw_start_menu(screen, face);
+        draw_start_menu(screen, face, account);
     }
 }
 
@@ -1838,6 +1888,7 @@ unsafe fn draw_window(
     files: Option<&dir::Table>,
     notepad: &editor::Editor,
     network: Option<&Network>,
+    account: &account::State,
 ) {
     // The window in front is the active one, whether or not it takes text. A
     // task manager on top with the shell's bar coloured says the shell is where
@@ -1943,7 +1994,11 @@ unsafe fn draw_window(
                 // how many rows there are: the way out is a row and it is not a
                 // thing the folder holds. Counting rows left a folder holding
                 // nothing looking like a folder holding one thing.
-                if table.children(face.cwd).next().is_none() {
+                if table
+                    .children(face.cwd)
+                    .find(|entry| visible_file_entry(entry))
+                    .is_none()
+                {
                     screen.text(
                         fx + 54,
                         fy + desktop::FILE_ROW_TOP + 12,
@@ -2005,10 +2060,304 @@ unsafe fn draw_window(
             desktop::Window::Editor => draw_editor(screen, rect, notepad),
             desktop::Window::Network => draw_network(screen, rect, network),
             desktop::Window::Drivers => draw_drivers(screen, rect, network),
+            desktop::Window::Settings => draw_settings(screen, rect, account),
             // Their contents are drawn by the live layer, which runs on a
             // different schedule: the frames here, the text there.
             desktop::Window::Tasks | desktop::Window::Assistant | desktop::Window::Shell => {}
         }
+    }
+}
+
+#[must_use]
+const fn account_panel_rect(width: u64, height: u64) -> desktop::Rect {
+    let w = if width < 552 {
+        width.saturating_sub(32)
+    } else {
+        520
+    };
+    let h = if height < 472 {
+        height.saturating_sub(32)
+    } else {
+        440
+    };
+    desktop::Rect {
+        x: width.saturating_sub(w) / 2,
+        y: height.saturating_sub(h) / 2,
+        w,
+        h,
+    }
+}
+
+#[must_use]
+const fn account_submit_rect(width: u64, height: u64) -> desktop::Rect {
+    let panel = account_panel_rect(width, height);
+    desktop::Rect {
+        x: panel.x + 70,
+        y: panel.y + panel.h - 76,
+        w: panel.w - 140,
+        h: 40,
+    }
+}
+
+fn account_status_text(status: account::Status) -> &'static [u8] {
+    match status {
+        account::Status::None => b"",
+        account::Status::NameInvalid => b"KULLANICI ADI GECERSIZ",
+        account::Status::PasswordShort => b"SIFRE EN AZ 6 KARAKTER OLMALI",
+        account::Status::PasswordMismatch => b"SIFRELER ESLESMIYOR",
+        account::Status::WrongPassword => b"SIFRE YANLIS - TEKRAR DENE",
+        account::Status::SignedIn => b"OTURUM ACILDI",
+        account::Status::PasswordChanged => b"SIFRE BASARIYLA DEGISTIRILDI",
+        account::Status::SaveFailed => b"HESAP DISKE KAYDEDILEMEDI",
+        account::Status::Locked => b"OTURUM KILITLENDI",
+    }
+}
+
+fn account_step_text(stage: account::Stage) -> (&'static [u8], &'static [u8], &'static [u8]) {
+    match stage {
+        account::Stage::SetupName => (b"WHISEZOS HESABINI OLUSTUR", b"KULLANICI ADI", b"DEVAM ET"),
+        account::Stage::SetupPassword => (b"WHISEZOS HESABINI OLUSTUR", b"YENI SIFRE", b"DEVAM ET"),
+        account::Stage::SetupConfirm => (
+            b"WHISEZOS HESABINI OLUSTUR",
+            b"SIFREYI TEKRAR YAZ",
+            b"HESAP OLUSTUR",
+        ),
+        account::Stage::LoginPassword => (b"TEKRAR HOS GELDIN", b"SIFRE", b"OTURUM AC"),
+        account::Stage::SavingSetup | account::Stage::SavingChange => (
+            b"WHISEZOS HESABI",
+            b"GUVENLI KAYIT YAPILIYOR",
+            b"KAYDEDILIYOR",
+        ),
+        account::Stage::Damaged => (
+            b"HESAP KAYDI HASARLI",
+            b"GUVENLIK NEDENIYLE OTURUM ACILMADI",
+            b"KURTARMA GEREKLI",
+        ),
+        _ => (b"WHISEZOS HESABI", b"SIFRE", b"DEVAM ET"),
+    }
+}
+
+/// Full-screen first-run and sign-in surface. The desktop is not drawn behind
+/// it, so locking a session never leaves a readable application in the frame.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_account_gate(screen: &Screen, account: &account::State, tick: u64) {
+    let panel = account_panel_rect(screen.width, screen.height);
+    let submit = account_submit_rect(screen.width, screen.height);
+    let (title, field_label, button_label) = account_step_text(account.stage());
+    // SAFETY: every operation clips to the framebuffer.
+    unsafe {
+        screen.gradient(
+            0,
+            screen.height,
+            colour::DESKTOP_TOP,
+            colour::DESKTOP_BOTTOM,
+        );
+        draw_wallpaper(screen);
+        screen.fill(
+            panel.x - 4,
+            panel.y - 4,
+            panel.w + 8,
+            panel.h + 8,
+            colour::SHADOW,
+        );
+        screen.fill(panel.x, panel.y, panel.w, panel.h, 0x000C_1420);
+        screen.fill(panel.x, panel.y, panel.w, 4, colour::ACCENT);
+        screen.text(
+            panel.x + 24,
+            panel.y + 20,
+            b"WHISEZOS SECURE SIGN-IN",
+            colour::DIM,
+        );
+
+        // User avatar.
+        let avatar_x = panel.x + panel.w / 2 - 36;
+        let avatar_y = panel.y + 58;
+        screen.fill(avatar_x, avatar_y, 72, 72, colour::START_DARK);
+        screen.fill(avatar_x + 26, avatar_y + 12, 20, 20, colour::ACCENT);
+        screen.fill(avatar_x + 17, avatar_y + 38, 38, 23, colour::ACCENT);
+        screen.text(
+            panel.x + (panel.w.saturating_sub(title.len() as u64 * CELL_W)) / 2,
+            panel.y + 148,
+            title,
+            colour::TEXT,
+        );
+        if !account.username().is_empty() && account.stage() == account::Stage::LoginPassword {
+            screen.text(
+                panel.x
+                    + (panel
+                        .w
+                        .saturating_sub(account.username().len() as u64 * CELL_W))
+                        / 2,
+                panel.y + 177,
+                account.username(),
+                colour::ACCENT,
+            );
+        }
+
+        screen.text(panel.x + 70, panel.y + 218, field_label, colour::DIM);
+        let field = desktop::Rect {
+            x: panel.x + 70,
+            y: panel.y + 244,
+            w: panel.w - 140,
+            h: 44,
+        };
+        screen.fill(field.x, field.y, field.w, field.h, 0x0014_2130);
+        screen.fill(field.x, field.y + field.h - 2, field.w, 2, colour::ACCENT);
+        let input = account.input();
+        if account.input_is_secret() {
+            let stars = [b'*'; account::PASSWORD_MAX];
+            screen.text(
+                field.x + 14,
+                field.y + 13,
+                &stars[..input.len()],
+                colour::TEXT,
+            );
+        } else {
+            screen.text(field.x + 14, field.y + 13, input, colour::TEXT);
+        }
+        if tick & 32 == 0 {
+            let cursor = field.x + 14 + input.len() as u64 * CELL_W;
+            screen.fill(cursor, field.y + 10, 2, 22, colour::ACCENT);
+        }
+
+        let status = account_status_text(account.status());
+        if !status.is_empty() {
+            screen.text(panel.x + 70, panel.y + 304, status, 0x00FF_7D7D);
+        } else if matches!(
+            account.stage(),
+            account::Stage::SetupPassword | account::Stage::SetupConfirm
+        ) {
+            screen.text(
+                panel.x + 70,
+                panel.y + 304,
+                b"EN AZ 6 KARAKTER",
+                colour::DIM,
+            );
+        }
+
+        screen.fill(submit.x, submit.y, submit.w, submit.h, colour::START);
+        screen.fill(
+            submit.x,
+            submit.y + submit.h - 3,
+            submit.w,
+            3,
+            colour::ACCENT,
+        );
+        screen.text(
+            submit.x + (submit.w.saturating_sub(button_label.len() as u64 * CELL_W)) / 2,
+            submit.y + 12,
+            button_label,
+            colour::BAR_TEXT_ON,
+        );
+        screen.text(
+            panel.x + 70,
+            panel.y + panel.h - 20,
+            b"ENTER ILE DEVAM EDEBILIRSIN",
+            colour::DIM,
+        );
+    }
+}
+
+fn settings_copy(stage: account::Stage) -> (&'static [u8], &'static [u8], &'static [u8]) {
+    match stage {
+        account::Stage::SettingsHome => (
+            b"OTURUM ACMA SECENEKLERI",
+            b"SIFRENI GUVENLI SEKILDE DEGISTIR",
+            b"SIFREYI DEGISTIR",
+        ),
+        account::Stage::ChangeCurrent => (b"MEVCUT SIFRE", b"ONCE KIMLIGINI DOGRULA", b"DEVAM ET"),
+        account::Stage::ChangeNew => (b"YENI SIFRE", b"EN AZ 6 KARAKTER", b"DEVAM ET"),
+        account::Stage::ChangeConfirm => (b"YENI SIFREYI ONAYLA", b"SIFREYI TEKRAR YAZ", b"UYGULA"),
+        account::Stage::SavingChange => (b"SIFRE", b"DISKE KAYDEDILIYOR", b"KAYDEDILIYOR"),
+        _ => (b"HESAP", b"YEREL WHISEZOS HESABI", b"SIFREYI DEGISTIR"),
+    }
+}
+
+/// Account page in Settings.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_settings(screen: &Screen, rect: desktop::Rect, account: &account::State) {
+    let x = rect.x;
+    let y = rect.y;
+    let submit = desktop::Desktop::settings_submit_rect(rect);
+    let lock = desktop::Desktop::settings_lock_rect(rect);
+    let (heading, help, button) = settings_copy(account.stage());
+    // SAFETY: every operation clips to the framebuffer.
+    unsafe {
+        screen.fill(
+            x + 1,
+            y + desktop::TITLE_HEIGHT,
+            180,
+            rect.h - desktop::TITLE_HEIGHT - 1,
+            0x000D_1622,
+        );
+        screen.fill(x + 16, y + 54, 148, 42, colour::START_DARK);
+        screen.fill(x + 16, y + 54, 4, 42, colour::ACCENT);
+        screen.text(x + 34, y + 67, b"ACCOUNTS", colour::TEXT);
+        screen.text(x + 34, y + 115, b"PERSONALIZATION", colour::DIM);
+        screen.text(x + 34, y + 151, b"NETWORK", colour::DIM);
+        screen.text(x + 34, y + 187, b"SYSTEM", colour::DIM);
+
+        let body_x = x + 210;
+        screen.text(body_x, y + 54, b"YOUR INFO", colour::DIM);
+        screen.fill(body_x, y + 82, 54, 54, colour::START_DARK);
+        screen.fill(body_x + 19, y + 91, 16, 16, colour::ACCENT);
+        screen.fill(body_x + 12, y + 112, 30, 17, colour::ACCENT);
+        screen.text(body_x + 72, y + 91, account.username(), colour::TEXT);
+        screen.text(body_x + 72, y + 116, b"LOCAL ACCOUNT", colour::DIM);
+
+        screen.fill(body_x, y + 158, rect.w - 236, 1, colour::PANEL_EDGE);
+        screen.text(body_x, y + 184, heading, colour::TEXT);
+        screen.text(body_x, y + 210, help, colour::DIM);
+
+        if matches!(
+            account.stage(),
+            account::Stage::ChangeCurrent
+                | account::Stage::ChangeNew
+                | account::Stage::ChangeConfirm
+                | account::Stage::SavingChange
+        ) {
+            screen.fill(body_x, y + 244, rect.w - 246, 42, 0x0014_2130);
+            screen.fill(body_x, y + 284, rect.w - 246, 2, colour::ACCENT);
+            let stars = [b'*'; account::PASSWORD_MAX];
+            screen.text(
+                body_x + 12,
+                y + 257,
+                &stars[..account.input().len()],
+                colour::TEXT,
+            );
+        }
+
+        let status = account_status_text(account.status());
+        if !status.is_empty() {
+            screen.text(
+                body_x,
+                y + 306,
+                status,
+                if account.status() == account::Status::PasswordChanged {
+                    colour::ACCENT
+                } else {
+                    0x00FF_7D7D
+                },
+            );
+        }
+
+        screen.fill(submit.x, submit.y, submit.w, submit.h, colour::START);
+        screen.fill(
+            submit.x,
+            submit.y + submit.h - 3,
+            submit.w,
+            3,
+            colour::ACCENT,
+        );
+        screen.text(submit.x + 12, submit.y + 10, button, colour::BAR_TEXT_ON);
+
+        screen.fill(lock.x, lock.y, lock.w, lock.h, 0x0032_1A22);
+        screen.fill(lock.x, lock.y + lock.h - 2, lock.w, 2, 0x00E8_4C5B);
+        screen.text(lock.x + 22, lock.y + 9, b"OTURUMU KILITLE", colour::TEXT);
     }
 }
 
@@ -2833,6 +3182,111 @@ fn read_file(
     Some(length)
 }
 
+/// Loads the one local account. An existing but invalid record fails closed:
+/// it opens the recovery screen instead of silently turning into first-run
+/// setup, which would let disk corruption become an account reset.
+fn load_account(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: Option<&dir::Table>,
+) -> account::State {
+    let Some(table) = files else {
+        shell.print(b"account: no filesystem; setup cannot be saved");
+        return account::State::new(None);
+    };
+    let Some(id) = find_in_root(table, account::FILE_NAME) else {
+        say(SESSION_ROLE, &[b"local account setup required"]);
+        return account::State::new(None);
+    };
+    if table
+        .entry(id)
+        .is_none_or(|entry| entry.kind != dir::Kind::File.code())
+    {
+        shell.print(b"account record is not a file");
+        say(SESSION_ROLE, &[b"local account record damaged"]);
+        return account::State::damaged();
+    }
+
+    let mut bytes = [0u8; account::RECORD_BYTES];
+    let Some(length) = read_file(shell, disk, table, id, &mut bytes) else {
+        say(SESSION_ROLE, &[b"local account could not be read"]);
+        return account::State::damaged();
+    };
+    if length != account::RECORD_BYTES {
+        shell.print(b"account record has the wrong length");
+        say(SESSION_ROLE, &[b"local account record damaged"]);
+        return account::State::damaged();
+    }
+    let Some(record) = account::Record::decode(&bytes) else {
+        shell.print(b"account record failed integrity checks");
+        say(SESSION_ROLE, &[b"local account record damaged"]);
+        return account::State::damaged();
+    };
+    say(SESSION_ROLE, &[b"local account loaded; sign-in required"]);
+    account::State::new(Some(record))
+}
+
+fn persist_account(
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: &mut Option<dir::Table>,
+    record: &account::Record,
+) -> bool {
+    let Some(table) = files.as_mut() else {
+        shell.print(b"account: no filesystem to save to");
+        return false;
+    };
+    let mut updated = *table;
+    let id = match find_in_root(&updated, account::FILE_NAME) {
+        Some(id)
+            if updated
+                .entry(id)
+                .is_some_and(|entry| entry.kind == dir::Kind::File.code()) =>
+        {
+            id
+        }
+        Some(_) => {
+            shell.print(b"account path is occupied by something else");
+            return false;
+        }
+        None => match updated.create(dir::ROOT, account::FILE_NAME, dir::Kind::File) {
+            Ok(id) => id,
+            Err(_) => {
+                shell.print(b"the account file could not be created");
+                return false;
+            }
+        },
+    };
+    let encoded = record.encode();
+    if !write_file(shell, disk, &mut updated, id, &encoded) {
+        shell.print(b"the account verifier was not saved");
+        return false;
+    }
+    *table = updated;
+    true
+}
+
+fn handle_account_action(
+    action: account::Action,
+    state: &mut account::State,
+    shell: &mut console::Console,
+    disk: Option<&mut Disk>,
+    files: &mut Option<dir::Table>,
+) -> bool {
+    match action {
+        account::Action::None => false,
+        account::Action::Redraw => true,
+        account::Action::Persist(record) => {
+            let saved = persist_account(shell, disk, files, &record);
+            state.persisted(saved);
+            if saved {
+                say(SESSION_ROLE, &[b"local account verifier saved"]);
+            }
+            true
+        }
+    }
+}
+
 /// Appends a line to the notes file, making it if it is not there.
 ///
 /// Read, append, write back. The file is small enough to hold whole, and a
@@ -2941,7 +3395,10 @@ enum Row<'a> {
 /// How many rows the FILES window shows for a folder.
 fn file_rows(table: &dir::Table, cwd: u16) -> usize {
     let up = usize::from(cwd != dir::ROOT);
-    up + table.children(cwd).count()
+    up + table
+        .children(cwd)
+        .filter(|entry| visible_file_entry(entry))
+        .count()
 }
 
 /// What is on a row.
@@ -2954,9 +3411,24 @@ fn file_row(table: &dir::Table, cwd: u16, row: usize) -> Option<Row<'_>> {
         if row == 0 {
             return Some(Row::Up);
         }
-        return table.children(cwd).nth(row - 1).map(Row::Entry);
+        return table
+            .children(cwd)
+            .filter(|entry| visible_file_entry(entry))
+            .nth(row - 1)
+            .map(Row::Entry);
     }
-    table.children(cwd).nth(row).map(Row::Entry)
+    table
+        .children(cwd)
+        .filter(|entry| visible_file_entry(entry))
+        .nth(row)
+        .map(Row::Entry)
+}
+
+/// System-owned account metadata is not a user document. It remains in the
+/// directory table so the boot session can find it, but Explorer and `ls` do
+/// not invite somebody to open a password verifier in Notepad.
+fn visible_file_entry(entry: &dir::Entry) -> bool {
+    entry.label() != account::FILE_NAME
 }
 
 /// Finds an entry by name in the root, whatever its kind.
@@ -2977,7 +3449,10 @@ fn list_folders(shell: &mut console::Console, table: Option<&dir::Table>, cwd: u
         return;
     };
     let mut any = false;
-    for entry in table.children(cwd) {
+    for entry in table
+        .children(cwd)
+        .filter(|entry| visible_file_entry(entry))
+    {
         let mut line = [b' '; console::COLUMNS];
         let mark: &[u8] = if entry.kind == dir::Kind::Directory.code() {
             b"[dir] "
@@ -3232,6 +3707,7 @@ struct Session<'a> {
     disk: Option<&'a mut Disk>,
     files: &'a mut Option<dir::Table>,
     notepad: &'a mut editor::Editor,
+    account: &'a mut account::State,
     /// How many folders the menu has named, so the next one gets a new name.
     coined: &'a mut u32,
     grant: u64,
@@ -3245,6 +3721,7 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
         disk,
         files,
         notepad,
+        account,
         coined,
         grant,
         tick,
@@ -3298,6 +3775,9 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
                 if window == desktop::Window::Editor && notepad.file_id().is_none() {
                     create_new_text(shell, disk, files, notepad, face, coined);
                 }
+                if window == desktop::Window::Settings {
+                    account.begin_settings();
+                }
                 face.open(window);
                 return true;
             }
@@ -3328,6 +3808,16 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
         desktop::Click::EditorCursor { row, column } => {
             notepad.place(row, column);
             face.open(desktop::Window::Editor);
+            true
+        }
+        desktop::Click::SettingsSubmit => {
+            let action = account.submit(tick);
+            handle_account_action(action, account, shell, disk, files)
+        }
+        desktop::Click::SettingsLock => {
+            account.lock();
+            *face = desktop::Desktop::new();
+            *notepad = editor::Editor::new();
             true
         }
         desktop::Click::File(row) => {
@@ -3368,10 +3858,18 @@ fn act_on_click(click: desktop::Click, session: Session<'_>) -> bool {
             }
             true
         }
+        desktop::Click::Close(desktop::Window::Settings) => {
+            account.leave_settings();
+            true
+        }
         desktop::Click::Open(desktop::Window::Editor) => {
             if notepad.file_id().is_none() {
                 create_new_text(shell, disk, files, notepad, face, coined);
             }
+            true
+        }
+        desktop::Click::Open(desktop::Window::Settings) => {
+            account.begin_settings();
             true
         }
         desktop::Click::Open(_) | desktop::Click::Close(_) => true,
@@ -3735,7 +4233,7 @@ unsafe fn draw_taskbar(screen: &Screen, face: &desktop::Desktop, tick: u64) {
 ///
 /// # Safety
 /// As `draw_desktop`.
-unsafe fn draw_start_menu(screen: &Screen, face: &desktop::Desktop) {
+unsafe fn draw_start_menu(screen: &Screen, face: &desktop::Desktop, account: &account::State) {
     if !face.start_open {
         return;
     }
@@ -3758,7 +4256,12 @@ unsafe fn draw_start_menu(screen: &Screen, face: &desktop::Desktop) {
             colour::START_DARK,
         );
         draw_shell_logo(screen, menu.x + 20, header + 17, 20, colour::ACCENT);
-        screen.text(menu.x + 56, header + 12, b"WHISEZOS", colour::BAR_TEXT_ON);
+        screen.text(
+            menu.x + 56,
+            header + 12,
+            account.username(),
+            colour::BAR_TEXT_ON,
+        );
         screen.text(menu.x + 56, header + 34, b"LOCAL DESKTOP", colour::MENU_DIM);
 
         for (index, item) in desktop::START_ITEMS.iter().enumerate() {
@@ -3838,6 +4341,99 @@ unsafe fn draw_menu(screen: &Screen, face: &desktop::Desktop) {
 unsafe fn draw_shell(screen: &Screen, shell: &console::Console, rect: desktop::Rect) {
     // SAFETY: as `draw_console`.
     unsafe { draw_console(screen, shell, rect) }
+}
+
+/// Windows-Copilot-style shell for the local system assistant.
+///
+/// The engine underneath remains deterministic and offline: every answer is
+/// tied to a real system action or observed device state. A future model
+/// runtime can replace the question interpreter without replacing this UI.
+///
+/// # Safety
+/// As `draw_desktop`.
+unsafe fn draw_assistant(screen: &Screen, assistant: &console::Console, rect: desktop::Rect) {
+    let body_x = rect.x + 10;
+    let body_y = rect.y + desktop::TITLE_HEIGHT + 8;
+    let body_w = rect.w.saturating_sub(20);
+    let prompt_y = rect.y + rect.h.saturating_sub(54);
+    let history_y = body_y + 58;
+    let history_height = prompt_y.saturating_sub(history_y + 8);
+    let rows = (history_height / CELL_H).max(1) as usize;
+    let columns = (body_w.saturating_sub(20) / CELL_W) as usize;
+    let skip = assistant.line_count().saturating_sub(rows);
+
+    // SAFETY: the caller guarantees the window; every operation clips.
+    unsafe {
+        screen.fill(body_x, body_y, body_w, 48, colour::PANEL);
+        screen.fill(body_x, body_y, 4, 48, colour::ICON_ASSISTANT);
+        // Four-point Whisez spark.
+        let cx = body_x + 28;
+        let cy = body_y + 24;
+        for step in 0..9u64 {
+            let half = 8 - step;
+            screen.fill(
+                cx - half,
+                cy - 1 + step / 4,
+                half * 2 + 1,
+                2,
+                colour::ACCENT,
+            );
+            screen.fill(
+                cx - 1 + step / 4,
+                cy - half,
+                2,
+                half * 2 + 1,
+                colour::ICON_ASSISTANT,
+            );
+        }
+        screen.text(body_x + 52, body_y + 9, b"WHISEZ ASSISTANT", colour::TEXT);
+        screen.text(
+            body_x + 52,
+            body_y + 28,
+            b"TURKCE + ENGLISH  /  LOCAL SYSTEM ENGINE",
+            colour::DIM,
+        );
+
+        screen.fill(
+            body_x,
+            history_y - 4,
+            body_w,
+            history_height + 8,
+            colour::WINDOW,
+        );
+        assistant.each_line(|index, line| {
+            if index < skip || index - skip >= rows {
+                return;
+            }
+            let take = line.len().min(columns);
+            screen.text(
+                body_x + 8,
+                history_y + (index - skip) as u64 * CELL_H,
+                &line[..take],
+                if line.starts_with(b">") {
+                    colour::TEXT
+                } else {
+                    colour::DIM
+                },
+            );
+        });
+
+        let prompt_w = body_w;
+        screen.fill(body_x, prompt_y, prompt_w, 42, 0x0019_2636);
+        screen.fill(body_x, prompt_y + 40, prompt_w, 2, colour::ACCENT);
+        screen.text(body_x + 12, prompt_y + 13, b">", colour::ACCENT);
+        let typed = assistant.input();
+        let available = ((prompt_w.saturating_sub(48)) / CELL_W) as usize;
+        let shown = &typed[typed.len().saturating_sub(available)..];
+        screen.text(body_x + 32, prompt_y + 13, shown, colour::TEXT);
+        screen.fill(
+            body_x + 32 + shown.len() as u64 * CELL_W,
+            prompt_y + 11,
+            2,
+            20,
+            colour::ACCENT,
+        );
+    }
 }
 
 /// A console inside its window: the history, then the line being typed.

@@ -31,7 +31,7 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Kurulum ekranı | ✅ Çalışıyor | Aşamalı, ilerleme çubuklu kurulum provası; hiçbir diske dokunmaz |
 | Whisez Guard | ✅ Çalışıyor | Windows güvenlik denetimi, çevrimdışı tarama, SHA3-256 temel doğrulaması ve izleme |
 | Derleme ve paketleme | ✅ Çalışıyor | Tek komutla EFI, Guard ve 4K duvar kâğıdı paketi üretir |
-| Otomatik testler | ✅ 402 test | Çekirdek, dosya sistemi, önyükleme mantığı ve Guard testleri |
+| Otomatik testler | ✅ 624 test | Çekirdek, dosya sistemi, hesap güvenliği, masaüstü, önyükleme ve Guard testleri |
 | Üretim yükleyicisi | ✅ Çalışıyor | Çekirdek ELF'ini okur, doğrular, yükler ve boot servislerinden çıkıp devreder |
 | Çekirdek ekran konsolu | ✅ Çalışıyor | Çekirdek kendi günlüğünü firmware'in bıraktığı framebuffer'a da basar; `cargo xtask boot-run` bir pencerede gösterir |
 | Üretim çekirdeği | ✅ QEMU'da açılıyor | GDT, IDT, seri konsol, çerçeve ayırıcı ve kendi sayfa tabloları; `cargo xtask boot-test` seri günlükle kanıtlar |
@@ -39,9 +39,12 @@ QEMU'da çalışan gerçek bir UEFI masaüstü önizlemesi ve yerel savunma arac
 | Kullanıcı alanı | ✅ İlk süreç çalışıyor | `init` kendi adres uzayında ring 3'te açılıyor, `syscall` ile çekirdeğe dönüyor ve sınır ihlalleri reddediliyor |
 | Süreç yönetimi | ✅ Çalışıyor | Önalımlı round-robin, süreç yıkımı ve slot geri kazanımı; çekirdek her açılışta çerçeve sızıntısı olmadığını doğruluyor |
 | Aygıt yetkisi | ✅ Çalışıyor | Süreç fiziksel adres adlandıramaz; çekirdeğin listelediği aygıtı indeksle ister. Ring 3'ten framebuffer eşlenip çiziliyor |
-| Depolama sürücüsü | ❌ Hazır değil | virtio-blk/NVMe yok; DMA tamponu ve kesme iletimi henüz yazılmadı |
+| Depolama sürücüsü | ✅ QEMU'da çalışıyor | Ring 3 VirtIO-blk sürücüsü; klasörler, metin dosyaları ve yerel hesap kaydı 16 MiB test diskinde kalıcıdır |
+| Ağ sürücüsü | ✅ QEMU'da çalışıyor | VirtIO-net, ARP ve DNS yoklaması QEMU kullanıcı ağı üzerinde gerçek bağlantı durumunu gösterir; genel HTTP/TLS istemcisi henüz yoktur |
 | IPC | ✅ Çalışıyor | Eşzamanlı randevu: `call`/`receive`/`reply`, engellenen süreçler ve uç nokta yetkisi. Tam tasarım (`ipc.rs`, sayfa devri, yetenek aktarımı) henüz bağlanmadı |
-| Masaüstü oturumu | 🚧 Yapılıyor | Önizleme var; gerçek çekirdekten masaüstüne geçiş henüz tamamlanmadı |
+| Masaüstü oturumu | ✅ QEMU'da çalışıyor | Ring 3 oturum; Windows benzeri görev çubuğu, Başlat menüsü, taşınabilir/büyütülebilir pencereler, Dosyalar, Not Defteri, Ayarlar ve asistan |
+| Yerel hesap | ✅ Çalışıyor | İlk açılışta tek yerel hesap, parolalı giriş, kilit ekranı ve Ayarlar'dan parola değiştirme; parola yerine tuzlu ve yinelenmiş doğrulayıcı saklanır |
+| Sistem asistanı | 🚧 Geliştiriliyor | Türkçe/İngilizce çevrimdışı sistem komutları ve gerçek aygıt durumları çalışır; LLM/model çalışma zamanı henüz bağlı değildir |
 | Fiziksel kurulum | ❌ Hazır değil | Disk kurucusu, donanım uyumluluğu ve kurtarma yolu tamamlanmadan kullanılamaz |
 
 Önyükleme önizlemesi, tamamlanmamış üretim yükleyicisinden özellikle ayrı
@@ -91,21 +94,18 @@ değiştirmez. Ayrıntılı anlatım ve sorun çözümleri için
 
 ## Kontroller
 
-Kurulum ekranında:
-
-- `Esc` ile kurulum provasını atlayıp doğrudan masaüstüne geçin.
+İlk açılışta kullanıcı adınızı ve en az altı karakterli parolanızı girin. Sonraki
+açılışlar güvenli giriş ekranında bu parolayı ister. Parola diske düz metin olarak
+yazılmaz. Test parolanızı kaynak koda, issue'ya veya commit'e eklemeyin.
 
 Masaüstünde:
 
-- Fareyi bir kartın veya dosya simgesinin üzerine getirerek seçin, sol tıkla açın.
-- Sağ tık veya `Esc` ile masaüstüne dönün.
-- `Yukarı` / `Aşağı` ya da `W` / `S` ile seçimi değiştirin.
-- `Tab` ile uygulama sütunu ile dosya ızgarası arasında geçiş yapın.
-- `Enter` ile seçili öğeyi açın.
-- `1`–`5` ile bir uygulamayı doğrudan açın.
-- Üst çubuktaki `POINTER` göstergesi kaç işaretçi aygıtının bağlandığını söyler.
-  `NO POINTER DEVICE` yazıyorsa firmware hiçbir fare sağlamıyor demektir;
-  bu durumda önizleme klavyeyle tam olarak kullanılabilir.
+- Bir simgeyi çift tıklayarak veya Başlat menüsünden seçerek uygulama açın.
+- Pencereleri başlık çubuğundan taşıyın; küçültme, büyütme ve kapatma düğmelerini kullanın.
+- **Dosyalar** içinde klasör veya metin belgesi oluşturun. Metin belgesi Not Defteri'nde açılır ve `Ctrl+S` ile kaydedilir.
+- **Ayarlar → Hesaplar** içinde parolanızı değiştirin veya oturumu kilitleyin.
+- **Asistan** içinde `dosyalar`, `ağ bağlantısı var mı`, `sürücüler`, `görevler` ya da İngilizce karşılıklarını sorun.
+- **Shell** içinde kullanılabilir komutları görmek için `help` yazın.
 
 ## Whisez Guard
 
@@ -135,9 +135,12 @@ Otomasyon için `audit`, `scan` veya `verify` komutuna `--json` ekleyebilirsiniz
 - [x] Animasyonlu masaüstü, fare ve klavye girdisi
 - [x] Whisez Guard savunma aracı
 - [x] Tek komutla derleme, test ve geliştirici paketi
+- [x] Ring 3 masaüstü, VirtIO disk/ağ sürücüleri ve kalıcı metin dosyaları
+- [x] Yerel hesap, giriş kilidi ve Ayarlar'dan parola değiştirme
 - [ ] Üretim yükleyicisinden Rust mikroçekirdeğine tam geçiş
-- [ ] Kesme, zamanlayıcı, depolama, ağ ve ekran sürücülerini tamamlama
-- [ ] Kullanıcı alanı servisleri ve gerçek masaüstü oturumu
+- [ ] Donanım kapsamını QEMU dışındaki disk, ağ, ses ve görüntü aygıtlarına genişletme
+- [ ] Çoklu kullanıcı, kurtarma, izinler ve güvenli kimlik bilgisi kasası
+- [ ] Asistan için isteğe bağlı yerel model çalışma zamanı ve güvenli ağ istemcisi
 - [ ] Güvenli güncelleme, kurtarma ve disk kurulum sistemi
 - [ ] Donanım uyumluluk matrisi ve kararlı sürüm
 
@@ -159,8 +162,8 @@ için:
 cargo xtask test
 ```
 
-Bu komut 234 testi, çalışır araçlar için Clippy denetimini ve UEFI önizlemesinin
-release derlemesini çalıştırır.
+Bu komut 624 testi, Clippy denetimlerini, release derlemelerini ve gerçek QEMU
+önyükleme testini çalıştırır.
 
 ## Depo yapısı
 
@@ -168,6 +171,7 @@ release derlemesini çalıştırır.
 boot/spectre-boot/       Üretim yükleyicisi tasarımı ve UEFI önizlemesi
 kernel/spectre-kernel/   Yetenekler, IPC, zamanlayıcı, vault ve platform kodu
 userland/prism/          Vulkan compositor ve animasyon motoru
+userland/init/           Ring 3 masaüstü, uygulamalar, hesap ve aygıt sürücüleri
 userland/whisez-guard/   Çalışan yerel savunma komut satırı aracı
 userland/winbridge/      PE yükleyicisi ve Windows uyumluluk çalışmaları
 userland/spectreshield/  Sezgisel süreç risk motoru

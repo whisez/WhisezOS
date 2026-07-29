@@ -78,11 +78,12 @@ pub enum Window {
     Editor,
     Network,
     Drivers,
+    Settings,
 }
 
 /// How many there are. Used to size every per-window array, so adding one to
 /// the enum fails to compile rather than silently going unhandled.
-pub const WINDOW_COUNT: usize = 8;
+pub const WINDOW_COUNT: usize = 9;
 
 /// Every window, in a fixed order. Not a stacking order any more — that is in
 /// `Desktop::order` and it changes.
@@ -95,6 +96,7 @@ pub const ALL_WINDOWS: [Window; WINDOW_COUNT] = [
     Window::Editor,
     Window::Network,
     Window::Drivers,
+    Window::Settings,
 ];
 
 impl Window {
@@ -110,6 +112,7 @@ impl Window {
             Self::Editor => 5,
             Self::Network => 6,
             Self::Drivers => 7,
+            Self::Settings => 8,
         }
     }
 
@@ -125,6 +128,7 @@ impl Window {
             Self::Editor => b"NOTEPAD",
             Self::Network => b"NETWORK & INTERNET",
             Self::Drivers => b"DRIVER MANAGER",
+            Self::Settings => b"SETTINGS",
         }
     }
 
@@ -140,6 +144,7 @@ impl Window {
             Self::Editor => b"NOTEPAD",
             Self::Network => b"NETWORK",
             Self::Drivers => b"DRIVERS",
+            Self::Settings => b"SETTINGS",
         }
     }
 
@@ -149,7 +154,10 @@ impl Window {
     /// with nowhere to go is better than one that goes somewhere invisible.
     #[must_use]
     pub const fn takes_text(self) -> bool {
-        matches!(self, Self::Shell | Self::Assistant | Self::Editor)
+        matches!(
+            self,
+            Self::Shell | Self::Assistant | Self::Editor | Self::Settings
+        )
     }
 }
 
@@ -167,6 +175,11 @@ impl Rect {
     pub const fn holds(&self, x: u64, y: u64) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
+}
+
+#[must_use]
+const fn scale(value: u64, numerator: u64, denominator: u64) -> u64 {
+    value.saturating_mul(numerator) / denominator
 }
 
 /// Where each window starts. Not where it stays — this is the layout somebody
@@ -225,6 +238,12 @@ pub const fn default_rect(window: Window) -> Rect {
             w: 700,
             h: 470,
         },
+        Window::Settings => Rect {
+            x: 300,
+            y: 90,
+            w: 680,
+            h: 500,
+        },
     }
 }
 
@@ -256,12 +275,13 @@ pub const fn title_button_rect(rect: Rect, button: TitleButton) -> Rect {
 }
 
 /// What the start menu offers, and what each entry opens.
-pub const START_ITEMS: [&[u8]; 9] = [
+pub const START_ITEMS: [&[u8]; 10] = [
     b"Files",
     b"Notepad",
     b"Assistant",
     b"Network & Internet",
     b"Driver Manager",
+    b"Settings",
     b"Shell",
     b"Task manager",
     b"Devices",
@@ -277,9 +297,10 @@ pub const fn start_window(index: usize) -> Option<Window> {
         2 => Some(Window::Assistant),
         3 => Some(Window::Network),
         4 => Some(Window::Drivers),
-        5 => Some(Window::Shell),
-        6 => Some(Window::Tasks),
-        7 => Some(Window::Devices),
+        5 => Some(Window::Settings),
+        6 => Some(Window::Shell),
+        7 => Some(Window::Tasks),
+        8 => Some(Window::Devices),
         _ => None,
     }
 }
@@ -388,6 +409,9 @@ pub enum Click {
         row: usize,
         column: usize,
     },
+    /// Account controls in Settings.
+    SettingsSubmit,
+    SettingsLock,
     /// A window is being dragged. The session repaints and nothing else.
     Drag,
 }
@@ -482,6 +506,7 @@ impl Desktop {
                 default_rect(Window::Editor),
                 default_rect(Window::Network),
                 default_rect(Window::Drivers),
+                default_rect(Window::Settings),
             ],
             restore: [
                 default_rect(Window::Shell),
@@ -492,12 +517,55 @@ impl Desktop {
                 default_rect(Window::Editor),
                 default_rect(Window::Network),
                 default_rect(Window::Drivers),
+                default_rect(Window::Settings),
             ],
             maximised: [false; WINDOW_COUNT],
             order: ALL_WINDOWS,
             drag: None,
             cwd: 0,
             focus: None,
+        }
+    }
+
+    /// Adapts every initial window rectangle to the framebuffer. The design
+    /// reference is 1280x800 with a 752-pixel desktop above the taskbar; both
+    /// positions and sizes scale from it, then clamp so the title bar and the
+    /// complete window remain reachable on smaller modes.
+    pub fn fit_to_screen(&mut self, width: u64, height: u64) {
+        const REFERENCE_WIDTH: u64 = 1280;
+        const REFERENCE_DESKTOP_HEIGHT: u64 = 752;
+        let usable_width = width.max(1);
+        let usable_height = height.saturating_sub(TASKBAR_HEIGHT).max(TITLE_HEIGHT);
+
+        for window in ALL_WINDOWS {
+            let base = default_rect(window);
+            let minimum_width = match window {
+                Window::Files | Window::Editor | Window::Assistant | Window::Settings => 560,
+                Window::Drivers | Window::Network => 500,
+                Window::Shell => 620,
+                Window::Devices | Window::Tasks => 420,
+            };
+            let minimum_height = match window {
+                Window::Editor | Window::Files | Window::Settings => 380,
+                Window::Assistant | Window::Shell => 300,
+                Window::Drivers | Window::Network => 340,
+                Window::Devices | Window::Tasks => 260,
+            };
+            let w = scale(base.w, usable_width, REFERENCE_WIDTH)
+                .max(minimum_width.min(usable_width))
+                .min(usable_width);
+            let h = scale(base.h, usable_height, REFERENCE_DESKTOP_HEIGHT)
+                .max(minimum_height.min(usable_height))
+                .min(usable_height);
+            let rect = Rect {
+                x: scale(base.x, usable_width, REFERENCE_WIDTH).min(usable_width.saturating_sub(w)),
+                y: scale(base.y, usable_height, REFERENCE_DESKTOP_HEIGHT)
+                    .min(usable_height.saturating_sub(h)),
+                w,
+                h,
+            };
+            self.rects[window.index()] = rect;
+            self.restore[window.index()] = rect;
         }
     }
 
@@ -681,7 +749,7 @@ impl Desktop {
             + START_MENU_PADDING * 2;
         Rect {
             x: 0,
-            y: height - TASKBAR_HEIGHT - tall,
+            y: height.saturating_sub(TASKBAR_HEIGHT).saturating_sub(tall),
             w: START_MENU_WIDTH,
             h: tall,
         }
@@ -781,6 +849,26 @@ impl Desktop {
             y: rect.y + EDITOR_TOOLBAR_TOP + 5,
             w: 76,
             h: EDITOR_TOOLBAR_HEIGHT - 10,
+        }
+    }
+
+    #[must_use]
+    pub const fn settings_submit_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 210,
+            y: rect.y + rect.h - 94,
+            w: 190,
+            h: 36,
+        }
+    }
+
+    #[must_use]
+    pub const fn settings_lock_rect(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + rect.w - 166,
+            y: rect.y + rect.h - 54,
+            w: 140,
+            h: 34,
         }
     }
 
@@ -925,6 +1013,14 @@ impl Desktop {
                         column: (x.saturating_sub(rect.x + EDITOR_TEXT_LEFT) / EDITOR_CELL_WIDTH)
                             as usize,
                     };
+                }
+            }
+            if window == Window::Settings {
+                if Self::settings_submit_rect(rect).holds(x, y) {
+                    return Click::SettingsSubmit;
+                }
+                if Self::settings_lock_rect(rect).holds(x, y) {
+                    return Click::SettingsLock;
                 }
             }
             return self.open(window);
@@ -1558,8 +1654,51 @@ mod tests {
     #[test]
     fn only_windows_with_a_prompt_take_text() {
         for window in ALL_WINDOWS {
-            let expected = matches!(window, Window::Shell | Window::Assistant | Window::Editor);
+            let expected = matches!(
+                window,
+                Window::Shell | Window::Assistant | Window::Editor | Window::Settings
+            );
             assert_eq!(window.takes_text(), expected, "{window:?}");
+        }
+    }
+
+    #[test]
+    fn fitted_windows_stay_reachable_at_common_resolutions() {
+        for (width, height) in [
+            (640, 480),
+            (800, 600),
+            (1024, 768),
+            (1280, 800),
+            (1920, 1080),
+        ] {
+            let mut desktop = Desktop::new();
+            desktop.fit_to_screen(width, height);
+            let usable_height = height - TASKBAR_HEIGHT;
+            for window in ALL_WINDOWS {
+                let rect = desktop.rect(window);
+                assert!(
+                    rect.w > 0 && rect.h > TITLE_HEIGHT,
+                    "{window:?} at {width}x{height}"
+                );
+                assert!(rect.x + rect.w <= width, "{window:?} exceeds {width}px");
+                assert!(
+                    rect.y + rect.h <= usable_height,
+                    "{window:?} is behind the taskbar at {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_restore_geometry_matches_the_first_open() {
+        let mut desktop = Desktop::new();
+        desktop.fit_to_screen(800, 600);
+        for window in ALL_WINDOWS {
+            let fitted = desktop.rect(window);
+            desktop.open(window);
+            desktop.maximise(window, 800, 600);
+            desktop.maximise(window, 800, 600);
+            assert_eq!(desktop.rect(window), fitted, "{window:?}");
         }
     }
 

@@ -31,7 +31,7 @@ defensive utility named **Whisez Guard**.
 | Setup screen | ✅ Working | A staged installation rehearsal with progress bars; it touches no disk |
 | Whisez Guard | ✅ Working | Windows security audit, offline scan, SHA3-256 baseline verification, and monitoring |
 | Build and packaging | ✅ Working | Produces an EFI application, Guard binary, and 4K wallpaper package with one command |
-| Automated tests | ✅ 402 tests | Kernel, file-system, boot-logic, and Guard tests |
+| Automated tests | ✅ 624 tests | Kernel, file-system, account security, desktop, boot, and Guard tests |
 | Production loader | ✅ Working | Reads, validates, and loads the kernel ELF, then exits boot services and hands off |
 | Kernel screen console | ✅ Working | The kernel draws its own log to the framebuffer the firmware left running; `cargo xtask boot-run` shows it in a window |
 | Production kernel | ✅ Boots in QEMU | GDT, IDT, serial console, frame allocator, and its own page tables; `cargo xtask boot-test` proves it from the serial log |
@@ -39,9 +39,12 @@ defensive utility named **Whisez Guard**.
 | User space | ✅ First process runs | `init` starts in ring 3 in its own address space, calls back through `syscall`, and has its boundary violations refused |
 | Process management | ✅ Working | Preemptive round-robin, process teardown, and slot reuse; the kernel verifies on every boot that no frames leaked |
 | Device authority | ✅ Working | A process cannot name a physical address; it asks for a device the kernel listed, by index. The framebuffer is mapped and drawn to from ring 3 |
-| Storage driver | ❌ Not ready | No virtio-blk or NVMe; DMA buffers and interrupt delivery are not written yet |
+| Storage driver | ✅ Working in QEMU | Ring 3 VirtIO-blk driver; folders, text files, and the local account record persist on the 16 MiB test disk |
+| Network driver | ✅ Working in QEMU | VirtIO-net with ARP and DNS probes reports real QEMU user-network state; a general HTTP/TLS client is not implemented yet |
 | IPC | ✅ Working | Synchronous rendezvous: `call`/`receive`/`reply`, blocking processes, and endpoint authority. The full design (`ipc.rs`, page grants, capability transfer) is not linked yet |
-| Desktop session | 🚧 In progress | A preview exists; the real kernel-to-desktop path is not complete |
+| Desktop session | ✅ Working in QEMU | Ring 3 session with a Windows-style taskbar, Start menu, movable/maximizable windows, Files, Notepad, Settings, and Assistant |
+| Local account | ✅ Working | First-run local account, password sign-in, lock screen, and password changes in Settings; a salted iterative verifier is stored instead of plaintext |
+| System assistant | 🚧 In progress | Offline Turkish/English system commands and real device-state answers work; no LLM/model runtime is connected yet |
 | Physical installation | ❌ Not ready | Requires a disk installer, hardware compatibility work, and a recovery path |
 
 The boot preview is deliberately kept separate from the unfinished production
@@ -93,21 +96,19 @@ full instructions and troubleshooting, or switch to the
 
 ## Controls
 
-On the setup screen:
-
-- Press `Esc` to skip the rehearsal and go straight to the desktop.
+On first boot, enter a username and a password of at least six characters.
+Later boots require that password on the secure sign-in screen. The password is
+not written to disk as plaintext. Never add a test password to source, an issue,
+or a commit.
 
 On the desktop:
 
-- Hover over a card or file icon to select it, then left-click to open it.
-- Right-click or press `Esc` to return to the desktop.
-- Use `Up` / `Down` or `W` / `S` to move the selection.
-- Press `Tab` to switch between the application column and the file grid.
-- Press `Enter` to open the selected item.
-- Press `1`–`5` to open an application directly.
-- The `POINTER` readout in the top bar reports how many pointing devices were
-  bound. `NO POINTER DEVICE` means the firmware provides none; the preview is
-  then fully usable from the keyboard.
+- Double-click an icon or use the Start menu to open an application.
+- Drag windows by their title bar and use the minimize, maximize, and close controls.
+- Create folders or text documents in **Files**. Text documents open in Notepad and save with `Ctrl+S`.
+- Use **Settings → Accounts** to change the password or lock the session.
+- Ask **Assistant** about `files`, `network`, `drivers`, `tasks`, or use their Turkish equivalents.
+- Type `help` in **Shell** to list the available commands.
 
 ## Whisez Guard
 
@@ -138,9 +139,12 @@ Add `--json` to the `audit`, `scan`, or `verify` command for automation.
 - [x] Animated desktop with mouse and keyboard input
 - [x] Whisez Guard defensive utility
 - [x] One-command build, test, and developer package workflow
+- [x] Ring 3 desktop, VirtIO disk/network drivers, and persistent text files
+- [x] Local account, sign-in lock, and password changes in Settings
 - [ ] Complete the transition from the production loader to the Rust microkernel
-- [ ] Complete interrupt, scheduler, storage, network, and display drivers
-- [ ] Add user-space services and a real desktop session
+- [ ] Expand beyond QEMU to additional disk, network, audio, and display devices
+- [ ] Add multiple users, recovery, permissions, and a secure credential vault
+- [ ] Add an optional local-model runtime and secure network client for Assistant
 - [ ] Build a secure update, recovery, and disk-installation system
 - [ ] Publish a hardware compatibility matrix and stable release
 
@@ -161,8 +165,8 @@ The output is written to `dist/WhisezOS`. Run every supported check with:
 cargo xtask test
 ```
 
-This command runs 234 tests, Clippy for executable host tools, and the release
-build of the UEFI preview.
+This command runs 624 tests, Clippy checks, release builds, and a real QEMU boot
+test.
 
 ## Repository layout
 
@@ -170,6 +174,7 @@ build of the UEFI preview.
 boot/spectre-boot/       Production loader design and UEFI preview
 kernel/spectre-kernel/   Capabilities, IPC, scheduler, vault, and platform code
 userland/prism/          Vulkan compositor and animation engine
+userland/init/           Ring 3 desktop, applications, account, and device drivers
 userland/whisez-guard/   Working local defensive command-line utility
 userland/winbridge/      PE loader and Windows compatibility research
 userland/spectreshield/  Heuristic process-risk engine

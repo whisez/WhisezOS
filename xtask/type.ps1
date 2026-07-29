@@ -48,9 +48,13 @@ foreach ($ch in $Line.ToCharArray()) {
     if (-not $key) { Write-Output "skipping '$ch': no qcode for it"; continue }
     Send-Qmp ('{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"' + $key + '"}}}]}}')
     Send-Qmp ('{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"' + $key + '"}}}]}}')
-    Start-Sleep -Milliseconds 25
+    # The emulated i8042 exposes a one-byte output register. Giving the guest
+    # time to drain each make/break pair prevents the next key from replacing
+    # it during slow password hashing or a full-screen repaint.
+    Start-Sleep -Milliseconds 90
 }
 
+Start-Sleep -Milliseconds 180
 Send-Qmp '{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ret"}}}]}}'
 Send-Qmp '{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"ret"}}}]}}'
 

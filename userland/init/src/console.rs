@@ -144,6 +144,12 @@ impl Console {
         }
     }
 
+    /// Number of history lines currently visible to a renderer.
+    #[must_use]
+    pub const fn line_count(&self) -> usize {
+        self.used
+    }
+
     /// What is being typed, including nothing.
     #[must_use]
     pub fn input(&self) -> &[u8] {
