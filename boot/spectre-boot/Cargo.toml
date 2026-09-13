@@ -9,7 +9,7 @@ autobins = false
 # Built with `cargo xtask boot`, installed to \EFI\BOOT\BOOTX64.EFI.
 
 [dependencies]
-uefi = { version = "0.39", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
+uefi = { version = "0.40", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
 sha3 = { workspace = true }
 bitflags = { workspace = true }
 heapless = "0.9"
